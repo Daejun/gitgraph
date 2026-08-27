@@ -23,6 +23,7 @@ gg 768 --hops 1           # #768 주변 1-hop (#768, owner/repo#768 도 됨)
 gg @someone               # 사람 기준
 gg show 748               # 노드 상세 (edge 전부 + 코멘트 + 본문)
 gg ask 4563 "왜 #3859를 언급해?"   # 그 항목(본문+코멘트 전체)을 context로 claude에게 단발 질문
+gg update                 # 설치 방식(git checkout / pipx / pip / 단일 파일)에 맞게 GitHub에서 갱신
 gg tui [768]              # curses 화면: home 목록(최근 N일 열린 항목 + 나를 mention한 항목) → Enter로 tree. 숫자를 주면 그 tree에서 시작
 ```
 

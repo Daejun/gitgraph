@@ -6,6 +6,7 @@ Usage:
   gg 777 [--hops 2]                       neighbourhood of one item (also #777, owner/repo#777, @login)
   gg show 777                             details of one node
   gg tui [777]                            interactive curses browser (cursor keys, mouse, fold, focus, search, ask)
+  gg update                               update this installation from GitHub
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
 """
@@ -21,7 +22,9 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
+REPO_URL = "https://github.com/Daejun/gitgraph"
+RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
 ENV_REPOS = [r.strip() for r in os.environ.get("GITGRAPH_REPOS", "").split(",") if r.strip()]
 PAGE = 50
@@ -2892,13 +2895,69 @@ def do_show(id_, repos=None, state="open", max_age_min=15, refresh=False, transl
 
 
 # --------------------------------------------------------------------------
+# self-update
+# --------------------------------------------------------------------------
+def _run(cmd, **kw):
+    log("$ " + " ".join(cmd))
+    return subprocess.run(cmd, **kw)
+
+
+def update():
+    """Refresh this installation from GitHub, whichever way it was installed."""
+    here = os.path.realpath(__file__)
+    d = os.path.dirname(here)
+    old = VERSION
+    if os.path.isdir(os.path.join(d, ".git")):
+        log(f"git checkout at {d}")
+        r = _run(["git", "-C", d, "pull", "--ff-only"])
+        if r.returncode:
+            return 1
+    elif "/pipx/venvs/" in here or "/pipx/" in here:
+        r = _run(["pipx", "upgrade", "gg-gitgraph"])
+        if r.returncode:
+            r = _run(["pipx", "install", "--force", f"git+{REPO_URL}"])
+            if r.returncode:
+                return 1
+    elif "site-packages" in here:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-deps", f"git+{REPO_URL}"]
+        if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+            cmd.insert(5, "--user")
+        r = _run(cmd)
+        if r.returncode:
+            return 1
+    else:
+        import urllib.request
+        log(f"single file at {here}: downloading {RAW_URL}")
+        try:
+            with urllib.request.urlopen(RAW_URL, timeout=60) as resp:
+                data = resp.read()
+        except Exception as e:  # noqa: BLE001
+            log(f"download failed: {e}")
+            return 1
+        tmp = here + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        chk = subprocess.run([sys.executable, "-m", "py_compile", tmp], capture_output=True, text=True)
+        if chk.returncode:
+            log(f"downloaded file does not compile, keeping the current one: {chk.stderr.strip()[:200]}")
+            os.remove(tmp)
+            return 1
+        os.chmod(tmp, os.stat(here).st_mode)
+        os.replace(tmp, here)
+    r = subprocess.run([sys.executable, here, "--version"], capture_output=True, text=True)
+    new = (r.stdout or r.stderr).strip().replace("gg ", "") or "?"
+    print(f"gg {old} -> {new}" + ("  (already up to date)" if new == old else ""))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="graph",
                     help="graph (default) | ROOT (777 / #777 / owner/repo#777 / @login) | tui [ROOT] | show ID | "
-                         "ask ID \"question\"")
+                         "ask ID \"question\" | update")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("--version", action="version", version=f"gg {VERSION}")
@@ -2930,8 +2989,10 @@ def main(argv=None):
     a = ap.parse_intermixed_args(argv)
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update") and ROOT_RE.match(a.cmd):
         a.root, a.cmd = a.cmd, "graph"   # `gg 777`
+    if a.cmd == "update":
+        return update()
     if a.cmd == "tui":
         try:
             repos = resolve_repos(a.repo, interactive=True)
