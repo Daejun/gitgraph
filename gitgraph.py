@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1890,7 +1890,10 @@ HELP = """gg tui — lazygit style layout
   c t s p h       comments mode · translation · summaries · people nodes · hops 1/2/3
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
   mouse           click = focus panel + select; double-click = Enter; right click = open in browser;
-                  wheel = scroll that panel without moving the cursor; back/forward buttons
+                  wheel = scroll that panel without moving the cursor; back/forward buttons;
+                  drag the border between the side column and main to resize (gg config side_width keeps it)
+  O               options menu (comments / translation / summaries / people / hops / theme / screen)
+  ?               key menu for the focused panel (Enter runs the action)     F1  this text
 
   legend          YYYY-MM-DD = when the issue/PR was opened, +Nd = a comment N days later; [I] issue [PR] pull request,
                   [draft]/[merged]/[closed] only when not open; → refs / ← cited-by; → closes / ← closed-by;
@@ -2018,7 +2021,8 @@ class Tui:
         except curses.error:
             pass
         self.apply_theme()
-        sys.stdout.write("\033[?1000h\033[?1006h")   # SGR mouse reports, parsed in read_key()
+        sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h")   # SGR mouse reports incl. drags, parsed in read_key()
+        self.dragging = False
         sys.stdout.flush()
         self.load(refresh=False)
 
@@ -2526,19 +2530,166 @@ class Tui:
         if nid and nid in self.g.nodes:
             self.pager(render_show(self.g, nid, width=200).splitlines(), f"details: {nid}")
 
-    def prompt_line(self, label, maxlen=400):
+    # ------------------------------------------------------------------ popups (centred boxes over the screen)
+    def popup_rect(self, want_h, want_w):
         h, w = self.scr.getmaxyx()
-        self.curses.echo()
-        self.curses.curs_set(1)
-        self.scr.timeout(-1)
+        bh, bw = min(want_h, h - 2), min(want_w, w - 2)
+        return (h - bh) // 2, (w - bw) // 2, bh, bw
+
+    def popup_frame(self, title, want_h, want_w):
+        """Draw the current screen, then a centred box; returns the content rect (y, x, h, w)."""
+        self.draw()
+        c = self.curses
+        by, bx, bh, bw = self.popup_rect(want_h, want_w)
+        tl, tr, bl, br, hz, vt = BORDERS["rounded"] if self.border == BORDERS["hidden"] else self.border
+        attr = self.style_attr("fold") | c.A_BOLD
+        top = f"{tl}{hz}{clip(title, 0, bw - 4)}"
+        self.put(by, bx, top + hz * max(0, bw - 1 - dw(top)) + tr, attr)
+        for i in range(1, bh - 1):
+            self.put(by + i, bx, vt + " " * (bw - 2) + vt, attr)
+        self.put(by + bh - 1, bx, bl + hz * (bw - 2) + br, attr)
+        return by + 1, bx + 1, bh - 2, bw - 2
+
+    def popup_text(self, title, lines, hint="j/k PgUp/PgDn scroll  H L sideways  Esc/q/⏎ close"):
+        c = self.curses
+        top, hs = 0, 0
+        while True:
+            y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2 if lines else 40)
+            body = hh - 1
+            for i in range(body):
+                if top + i >= len(lines):
+                    break
+                self.put(y + i, x, clip(lines[top + i], hs, ww))
+            self.put(y + hh - 1, x, clip(f"{top + 1}-{min(top + body, len(lines))}/{len(lines)}  {hint}", 0, ww), self.dim())
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            k = self.read_key()
+            if k in (ord("q"), 27, 10, 13, c.KEY_ENTER, ord("?"), ord("d"), ord("$")):
+                return
+            if k == c.KEY_MOUSE and self.mouse_ev:
+                b = self.mouse_ev[0] & ~28
+                if b == 64:
+                    top = max(top - 3, 0)
+                elif b == 65:
+                    top = min(top + 3, max(len(lines) - body, 0))
+                elif self.mouse_ev[3] and b == 0:
+                    return
+            elif k in (c.KEY_DOWN, ord("j")):
+                top = min(top + 1, max(len(lines) - body, 0))
+            elif k in (c.KEY_UP, ord("k")):
+                top = max(top - 1, 0)
+            elif k in (c.KEY_NPAGE, ord(" "), ord(".")):
+                top = min(top + body, max(len(lines) - body, 0))
+            elif k in (c.KEY_PPAGE, ord(",")):
+                top = max(top - body, 0)
+            elif k in (ord("g"), ord("<")):
+                top = 0
+            elif k in (ord("G"), ord(">")):
+                top = max(len(lines) - body, 0)
+            elif k == ord("L"):
+                hs += 20
+            elif k == ord("H"):
+                hs = max(hs - 20, 0)
+
+    def pager(self, lines, title):
+        self.popup_text(title, lines)
+
+    def popup_menu(self, title, items, cur=0):
+        """items: [(label, value)]; returns the chosen value or None. j/k/digits/mouse, Enter picks, Esc cancels."""
+        c = self.curses
+        top = 0
+        while True:
+            width = max(dw(l) for l, _ in items) + 6
+            y, x, hh, ww = self.popup_frame(title, len(items) + 2, width)
+            if cur < top:
+                top = cur
+            if cur >= top + hh:
+                top = cur - hh + 1
+            for i in range(hh):
+                j = top + i
+                if j >= len(items):
+                    break
+                label = f"{j + 1 if j < 9 else ' '} {items[j][0]}"
+                self.put(y + i, x, clip(label, 0, ww), c.A_REVERSE if j == cur else 0, fill=ww)
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            k = self.read_key()
+            if k in (27, ord("q")):
+                return None
+            if k in (10, 13, c.KEY_ENTER):
+                return items[cur][1]
+            if k in (c.KEY_DOWN, ord("j")):
+                cur = min(cur + 1, len(items) - 1)
+            elif k in (c.KEY_UP, ord("k")):
+                cur = max(cur - 1, 0)
+            elif k in (c.KEY_NPAGE, ord(".")):
+                cur = min(cur + hh, len(items) - 1)
+            elif k in (c.KEY_PPAGE, ord(",")):
+                cur = max(cur - hh, 0)
+            elif ord("1") <= k <= ord("9") and k - ord("1") < len(items):
+                return items[k - ord("1")][1]
+            elif k == c.KEY_MOUSE and self.mouse_ev:
+                b, mx, my, press = self.mouse_ev
+                b &= ~28
+                if b == 64:
+                    cur = max(cur - 1, 0)
+                elif b == 65:
+                    cur = min(cur + 1, len(items) - 1)
+                elif press and b == 0:
+                    if y <= my < y + hh and x <= mx < x + ww and top + (my - y) < len(items):
+                        if top + (my - y) == cur:
+                            return items[cur][1]
+                        cur = top + (my - y)
+                    else:
+                        return None
+
+    def popup_prompt(self, label, initial=""):
+        """Single-line input box. Returns the text, or "" when cancelled with Esc."""
+        c = self.curses
+        buf = list(initial)
+        c.curs_set(1)
         try:
-            self.scr.addstr(h - 1, 0, label.ljust(w - 1))
-            q = self.scr.getstr(h - 1, dw(label), maxlen).decode("utf-8", "replace").strip()
-        except Exception:  # noqa: BLE001
-            q = ""
-        self.curses.noecho()
-        self.curses.curs_set(0)
-        return q
+            while True:
+                y, x, hh, ww = self.popup_frame(label, 4, max(60, dw(label) + 4))
+                text = "".join(buf)
+                shown = text if dw(text) < ww - 1 else text[-(ww - 2):]
+                self.put(y, x, shown, fill=ww)
+                self.put(y + 1, x, "⏎ ok   Esc cancel", self.dim())
+                try:
+                    self.scr.move(y, x + min(dw(shown), ww - 1))
+                except c.error:
+                    pass
+                self.scr.refresh()
+                self.scr.timeout(-1)
+                try:
+                    ch = self.scr.get_wch()
+                except c.error:
+                    continue
+                if isinstance(ch, str):
+                    if ch in ("\n", "\r"):
+                        return text.strip()
+                    if ch == "\x1b":
+                        return ""
+                    if ch in ("\x7f", "\b"):
+                        if buf:
+                            buf.pop()
+                    elif ch == "\x15":      # ctrl-u
+                        buf = []
+                    elif ch >= " ":
+                        buf.append(ch)
+                elif ch in (c.KEY_BACKSPACE, c.KEY_DC):
+                    if buf:
+                        buf.pop()
+                elif ch == c.KEY_ENTER:
+                    return text.strip()
+        finally:
+            c.curs_set(0)
+
+    def prompt_line(self, label, maxlen=400):
+        return self.popup_prompt(label)
+
+    def confirm(self, question):
+        return self.popup_menu(question, [("yes", True), ("no", False)], cur=1) is True
 
     def search(self):
         p = self.panels[self.focus]
@@ -2828,40 +2979,6 @@ class Tui:
         self.put(h - 1, 0, bottom, attr, fill=w - 1)
         scr.refresh()
 
-    def pager(self, lines, title):
-        c = self.curses
-        top, hs = 0, 0
-        while True:
-            self.scr.erase()
-            h, w = self.scr.getmaxyx()
-            body = h - 1
-            for i in range(body):
-                if top + i >= len(lines):
-                    break
-                self.put(i, 0, clip(lines[top + i], hs, w - 1))
-            self.put(h - 1, 0, f" {title}  {top + 1}-{min(top + body, len(lines))}/{len(lines)}  "
-                               f"j/k PgUp/PgDn scroll  H L sideways  q/Esc back", c.A_BOLD | c.A_REVERSE, fill=w - 1)
-            self.scr.refresh()
-            k = self.read_key()
-            if k in (ord("q"), 27, 10, 13, c.KEY_ENTER, ord("d"), ord("?")):
-                return
-            elif k in (c.KEY_DOWN, ord("j")):
-                top = min(top + 1, max(len(lines) - body, 0))
-            elif k in (c.KEY_UP, ord("k")):
-                top = max(top - 1, 0)
-            elif k in (c.KEY_NPAGE, ord(" "), ord(".")):
-                top = min(top + body, max(len(lines) - body, 0))
-            elif k in (c.KEY_PPAGE, ord(",")):
-                top = max(top - body, 0)
-            elif k in (ord("g"), ord("<")):
-                top = 0
-            elif k in (ord("G"), ord(">")):
-                top = max(len(lines) - body, 0)
-            elif k == ord("L"):
-                hs += 20
-            elif k == ord("H"):
-                hs = max(hs - 20, 0)
-
     # ------------------------------------------------------------------ input
     ESC_SEQ = {"A": "KEY_UP", "B": "KEY_DOWN", "C": "KEY_RIGHT", "D": "KEY_LEFT", "H": "KEY_HOME", "F": "KEY_END",
                "5~": "KEY_PPAGE", "6~": "KEY_NPAGE", "1~": "KEY_HOME", "4~": "KEY_END", "3~": "KEY_DC", "Z": "KEY_BTAB"}
@@ -2916,14 +3033,30 @@ class Tui:
                 return key
         return None
 
+    def border_x(self):
+        m = self.panels["main"].rect
+        return m[1] - 1 if m[3] and m[1] > 1 else None
+
     def on_mouse(self):
         ev = self.mouse_ev
         if not ev:
             return
         b, x, y, press = ev
-        if not press or b & 32:
+        h, w = self.scr.getmaxyx()
+        if b & 32:                                   # motion with a button held: drag the side/main border
+            if self.dragging and w > 40:
+                self.side_width = min(0.8, max(0.15, (x + 1) / w))
+            return
+        if not press:
+            if self.dragging:
+                self.dragging = False
+                self.msg = f"side width {self.side_width:.2f}   (keep it: gg config side_width {self.side_width:.2f})"
             return
         base = b & ~28
+        bx = self.border_x()
+        if base == 0 and bx is not None and bx - 1 <= x <= bx + 1 and self.screen == "normal" and w > 84:
+            self.dragging = True
+            return
         key = self.panel_at(x, y)
         if base in (64, 65):
             if key:
@@ -2987,8 +3120,45 @@ class Tui:
         try:
             self._run()
         finally:
-            sys.stdout.write("\033[?1006l\033[?1000l")
+            sys.stdout.write("\033[?1006l\033[?1002l\033[?1000l")
             sys.stdout.flush()
+
+    KEYMENU = [   # (context, keys, description, key code fed to handle_key)
+        ("*", "⏎", "open / go to / re-root (see the panel hint)", 10),
+        ("*", "Tab", "next panel", 9), ("*", "[ ]", "previous / next tab", ord("]")),
+        ("*", "+ _", "screen mode normal / half / full", ord("+")),
+        ("*", "x", "hold / follow the main content", ord("x")),
+        ("*", "a", "ask claude about the selection", ord("a")),
+        ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
+        ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Home as another person", ord("u")),
+        ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
+        ("*", "r", "refetch from GitHub", ord("r")), ("*", "T", "colour theme", ord("T")),
+        ("*", "$", "token usage", ord("$")), ("*", "q", "quit", ord("q")),
+        ("main", "Space", "fold / unfold the tree node", ord(" ")),
+        ("main", "- =", "fold to depth 1 / unfold all", ord("-")),
+        ("main", "K J", "scroll", ord("J")),
+    ]
+
+    def key_menu(self):
+        items = [(f"{keys:6} {desc}", code) for ctx, keys, desc, code in self.KEYMENU if ctx in ("*", self.focus)]
+        code = self.popup_menu(f"keys — {self.panels[self.focus].title} panel", items)
+        if code is not None and code != ord("q"):
+            self.handle_key(code)
+
+    def options_menu(self):
+        o = self.o
+        items = [(f"comments: {o['comments']}  (cycle)", ord("c")),
+                 (f"translation: {o['translate']}  (toggle)", ord("t")),
+                 (f"summaries: {'on' if o['summary'] else 'off'}  (toggle)", ord("s")),
+                 (f"people nodes: {'on' if o['people'] else 'off'}  (toggle)", ord("p")),
+                 (f"hops: {o['hops']}  (cycle 1/2/3)", ord("h")),
+                 (f"theme: {THEME}  (cycle)", ord("T")),
+                 (f"screen mode: {self.screen}  (cycle)", ord("+")),
+                 (f"side width: {self.side_width:.2f}  (drag the border with the mouse; gg config side_width)", None),
+                 ("refetch from GitHub", ord("r"))]
+        code = self.popup_menu("options", items)
+        if code is not None:
+            self.handle_key(code)
 
     def _run(self):
         c = self.curses
@@ -3005,160 +3175,172 @@ class Tui:
             if k == -1:
                 continue
             self.msg = ""
-            h, w = self.scr.getmaxyx()
-            p = self.panels[self.focus]
-            page = max(p.rect[2] - 1, 1)
-            if os.environ.get("GG_DEBUG"):
-                log(f"key={k!r} focus={self.focus} cur={p.cur} rows={len(p.rows)} item={self.item} subject={self.subject} me={self.me}")
-            if k == ord("q"):
+            if not self.handle_key(k):
                 return
-            if k == c.KEY_MOUSE:
-                self.on_mouse()
-                continue
-            if k == c.KEY_RESIZE:
-                continue
-            # ---- panels ----
-            if ord("1") <= k <= ord("5"):
-                self.focus = self.SIDE[k - ord("1")]
-                continue
-            if k == ord("0"):
-                self.focus = "main"
-                continue
-            if k == 9:
-                self.cycle_focus(1)
-                continue
-            if k == c.KEY_BTAB:
-                self.cycle_focus(-1)
-                continue
-            if k in (ord("["), ord("]")) and p.tabs:
-                p.tab = (p.tab + (1 if k == ord("]") else -1)) % len(p.tabs)
-                p.top = 0
-                if self.focus == "home":
-                    p.set_rows(self.home_rows(), keep=False)
-                    p.cur = 0
-                    self.update_subject()
-                elif self.focus == "comments":
-                    p.set_rows(self.comments_rows(), keep=False)
-                    p.cur = 0
-                    self.update_subject()
-                elif self.focus == "main":
-                    self.refresh_main()
-                    if self.MAIN_TABS[p.tab] == "tree":
-                        self.fold_below(self.o.get("depth", 1))
-                self.enrich()
-                continue
-            if k == ord("+"):
-                self.screen = {"normal": "half", "half": "full", "full": "normal"}[self.screen]
-                continue
-            if k == ord("_"):
-                self.screen = {"normal": "full", "half": "normal", "full": "half"}[self.screen]
-                continue
-            # ---- navigation in the focused panel ----
-            if k in (c.KEY_DOWN, ord("j")):
-                p.move(1)
+
+    def handle_key(self, k):
+        """Returns False to quit."""
+        c = self.curses
+        h, w = self.scr.getmaxyx()
+        p = self.panels[self.focus]
+        page = max(p.rect[2] - 1, 1)
+        if os.environ.get("GG_DEBUG"):
+            log(f"key={k!r} focus={self.focus} cur={p.cur} rows={len(p.rows)} item={self.item} subject={self.subject} me={self.me}")
+        if k == ord("q"):
+            return False
+        if k == c.KEY_MOUSE:
+            self.on_mouse()
+            return True
+        if k == c.KEY_RESIZE:
+            return True
+        # ---- panels ----
+        if ord("1") <= k <= ord("5"):
+            self.focus = self.SIDE[k - ord("1")]
+            return True
+        if k == ord("0"):
+            self.focus = "main"
+            return True
+        if k == 9:
+            self.cycle_focus(1)
+            return True
+        if k == c.KEY_BTAB:
+            self.cycle_focus(-1)
+            return True
+        if k in (ord("["), ord("]")) and p.tabs:
+            p.tab = (p.tab + (1 if k == ord("]") else -1)) % len(p.tabs)
+            p.top = 0
+            if self.focus == "home":
+                p.set_rows(self.home_rows(), keep=False)
+                p.cur = 0
                 self.update_subject()
-            elif k in (c.KEY_UP, ord("k")):
-                p.move(-1)
+            elif self.focus == "comments":
+                p.set_rows(self.comments_rows(), keep=False)
+                p.cur = 0
                 self.update_subject()
-            elif k in (c.KEY_NPAGE, ord(".")):
-                p.move(page)
-                self.update_subject()
-            elif k in (c.KEY_PPAGE, ord(",")):
-                p.move(-page)
-                self.update_subject()
-            elif k in (ord("g"), ord("<"), c.KEY_HOME):
-                p.free = False
-                p.cur, p.top = 0, 0
-                p.settle()
-                self.update_subject()
-            elif k in (ord("G"), ord(">"), c.KEY_END):
-                p.free = False
-                p.cur = len(p.rows) - 1
-                p.top = max(len(p.rows) - max(p.rect[2], 1), 0)
-                p.settle()
-                self.update_subject()
-            elif k == ord("L"):
-                p.hs += 20
-            elif k == ord("H"):
-                p.hs = max(p.hs - 20, 0)
-            elif k == ord("J"):
-                self.panels["main"].move(3) if self.panels["main"].scroll_only else self.panels["main"].move(1)
-            elif k == ord("K"):
-                self.panels["main"].move(-3) if self.panels["main"].scroll_only else self.panels["main"].move(-1)
-            elif k in (10, 13, c.KEY_ENTER):
-                self.enter()
-            elif k == ord(" ") or k == c.KEY_LEFT or k == c.KEY_RIGHT:
-                if self.focus == "main":
-                    self.toggle_fold(None if k == ord(" ") else (k == c.KEY_LEFT))
-            elif k == ord("x"):
-                self.hold = not self.hold
-                if not self.hold:
-                    self.update_subject()
-                self.msg = "main holds the current selection" if self.hold else "main follows the cursor again"
-            elif k == ord("-"):
-                self.fold_below(1)
-            elif k == ord("="):
-                self.collapsed.clear()
+            elif self.focus == "main":
                 self.refresh_main()
-            elif k in (27, c.KEY_BACKSPACE, 127, 8, ord("b")):
-                self.back()
-            elif k == ord("f"):
-                self.forward()
-            elif k == ord("a"):
-                self.ask()
-            elif k == ord("d"):
-                self.details()
-            elif k == ord("o"):
-                self.open_browser()
-            elif k == ord("u"):
-                who = self.prompt_line("view as @login (empty = my gh accounts): ").lstrip("@")
-                self.view_as([who] if who else (ME or [a.lower() for a in gh_accounts()]))
-            elif k == ord("r"):
+                if self.MAIN_TABS[p.tab] == "tree":
+                    self.fold_below(self.o.get("depth", 1))
+            self.enrich()
+            return True
+        if k == ord("+"):
+            self.screen = {"normal": "half", "half": "full", "full": "normal"}[self.screen]
+            return True
+        if k == ord("_"):
+            self.screen = {"normal": "full", "half": "normal", "full": "half"}[self.screen]
+            return True
+        # ---- navigation in the focused panel ----
+        if k in (c.KEY_DOWN, ord("j")):
+            p.move(1)
+            self.update_subject()
+        elif k in (c.KEY_UP, ord("k")):
+            p.move(-1)
+            self.update_subject()
+        elif k in (c.KEY_NPAGE, ord(".")):
+            p.move(page)
+            self.update_subject()
+        elif k in (c.KEY_PPAGE, ord(",")):
+            p.move(-page)
+            self.update_subject()
+        elif k in (ord("g"), ord("<"), c.KEY_HOME):
+            p.free = False
+            p.cur, p.top = 0, 0
+            p.settle()
+            self.update_subject()
+        elif k in (ord("G"), ord(">"), c.KEY_END):
+            p.free = False
+            p.cur = len(p.rows) - 1
+            p.top = max(len(p.rows) - max(p.rect[2], 1), 0)
+            p.settle()
+            self.update_subject()
+        elif k == ord("L"):
+            p.hs += 20
+        elif k == ord("H"):
+            p.hs = max(p.hs - 20, 0)
+        elif k == ord("J"):
+            self.panels["main"].move(3) if self.panels["main"].scroll_only else self.panels["main"].move(1)
+        elif k == ord("K"):
+            self.panels["main"].move(-3) if self.panels["main"].scroll_only else self.panels["main"].move(-1)
+        elif k in (10, 13, c.KEY_ENTER):
+            self.enter()
+        elif k == ord(" ") or k == c.KEY_LEFT or k == c.KEY_RIGHT:
+            if self.focus == "main":
+                self.toggle_fold(None if k == ord(" ") else (k == c.KEY_LEFT))
+        elif k == ord("x"):
+            self.hold = not self.hold
+            if not self.hold:
+                self.update_subject()
+            self.msg = "main holds the current selection" if self.hold else "main follows the cursor again"
+        elif k == ord("-"):
+            self.fold_below(1)
+        elif k == ord("="):
+            self.collapsed.clear()
+            self.refresh_main()
+        elif k in (27, c.KEY_BACKSPACE, 127, 8, ord("b")):
+            self.back()
+        elif k == ord("f"):
+            self.forward()
+        elif k == ord("a"):
+            self.ask()
+        elif k == ord("d"):
+            self.details()
+        elif k == ord("o"):
+            self.open_browser()
+        elif k == ord("u"):
+            who = self.prompt_line("view as @login (empty = my gh accounts): ").lstrip("@")
+            self.view_as([who] if who else (ME or [a.lower() for a in gh_accounts()]))
+        elif k == ord("r"):
+            if self.confirm("Refetch everything from GitHub?"):
                 self.load(refresh=True)
-            elif k == ord("c"):
-                i = self.COMMENTS_CYCLE.index(self.o["comments"])
-                self.o["comments"] = self.COMMENTS_CYCLE[(i + 1) % 3]
-                self.rebuild_graph()
-                self.refresh_all()
-            elif k == ord("p"):
-                self.o["people"] = not self.o["people"]
-                self.rebuild_graph()
-                self.refresh_all()
-            elif k == ord("h"):
-                self.o["hops"] = self.o["hops"] % 3 + 1
-                self.refresh_main()
-            elif k == ord("t"):
-                if self.o["translate"] == "none":
-                    self.o["translate"] = self.tr_saved
-                else:
-                    self.tr_saved, self.o["translate"] = self.o["translate"], "none"
-                    for n in self.g.nodes.values():
-                        n.tr_title = n.tr_excerpt = None
-                self.enriched.clear()
-                self.refresh_all()
-            elif k == ord("s"):
-                self.o["summary"] = not self.o["summary"]
-                if not self.o["summary"]:
-                    for n in self.g.nodes.values():
-                        n.summary = None
-                self.enriched.clear()
-                self.refresh_all()
-            elif k == ord("/"):
-                self.search()
-            elif k == ord("n"):
-                self.search_next(1)
-            elif k == ord("N"):
-                self.search_next(-1)
-            elif k == ord("T"):
-                global THEME
-                names = list(THEMES)
-                THEME = names[(names.index(THEME) + 1) % len(names)]
-                self.apply_theme()
-                self.msg = f"theme: {THEME}   (keep it: gg config theme {THEME})"
-            elif k == ord("$"):
-                self.pager(usage_report(), "claude token usage")
-            elif k == ord("?"):
-                self.pager(HELP.splitlines(), "help")
+        elif k == ord("O"):
+            self.options_menu()
+        elif k == ord("c"):
+            i = self.COMMENTS_CYCLE.index(self.o["comments"])
+            self.o["comments"] = self.COMMENTS_CYCLE[(i + 1) % 3]
+            self.rebuild_graph()
+            self.refresh_all()
+        elif k == ord("p"):
+            self.o["people"] = not self.o["people"]
+            self.rebuild_graph()
+            self.refresh_all()
+        elif k == ord("h"):
+            self.o["hops"] = self.o["hops"] % 3 + 1
+            self.refresh_main()
+        elif k == ord("t"):
+            if self.o["translate"] == "none":
+                self.o["translate"] = self.tr_saved
+            else:
+                self.tr_saved, self.o["translate"] = self.o["translate"], "none"
+                for n in self.g.nodes.values():
+                    n.tr_title = n.tr_excerpt = None
+            self.enriched.clear()
+            self.refresh_all()
+        elif k == ord("s"):
+            self.o["summary"] = not self.o["summary"]
+            if not self.o["summary"]:
+                for n in self.g.nodes.values():
+                    n.summary = None
+            self.enriched.clear()
+            self.refresh_all()
+        elif k == ord("/"):
+            self.search()
+        elif k == ord("n"):
+            self.search_next(1)
+        elif k == ord("N"):
+            self.search_next(-1)
+        elif k == ord("T"):
+            global THEME
+            names = list(THEMES)
+            THEME = names[(names.index(THEME) + 1) % len(names)]
+            self.apply_theme()
+            self.msg = f"theme: {THEME}   (keep it: gg config theme {THEME})"
+        elif k == ord("$"):
+            self.pager(usage_report(), "claude token usage")
+        elif k == ord("?"):
+            self.key_menu()
+        elif k == c.KEY_F1:
+            self.popup_text("help", HELP.splitlines())
+        return True
 
 
 def tui(opts):

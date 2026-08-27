@@ -1,6 +1,6 @@
 # gg TUI를 lazygit layout으로 바꾸는 계획
 
-상태(0.4.0): B안으로 1~4단계 반영(Panel 추상화, layout 엔진, Repo/Home/Links/Comments/People + main 탭, lazygit 키). 남은 것: 5(팝업 위젯), 6(경계 드래그), 7(테스트 정리).
+상태(0.5.0): B안 1~7단계 모두 반영 — Panel 추상화, layout 엔진(accordion·screen mode·portrait·border), Repo/Home/Links/Comments/People + main 탭, lazygit 키, 팝업(입력·메뉴·확인·텍스트, `?` 키 메뉴, `O` 옵션), 경계 드래그, tests/tui_smoke.py.
 
 기준: lazygit `docs/Config.md`(gui.sidePanelWidth 0.3333, sidePanels stack, expandFocusedSidePanel, screenMode normal/half/full,
 portraitMode auto ≤84열, border rounded, showBottomLine/showPanelJumps), `docs/keybindings/Keybindings_en.md`

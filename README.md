@@ -135,10 +135,15 @@ Layout: side column `side_width` (0.33) of the screen; the focused side panel is
 | Esc / `b` · `f` | back (previous item and perspective) · forward |
 | `u` · `r` | view Home as another person · refetch |
 | `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
-| `/` `n` `N` · `T` · `$` · `?` · `q` | search in the focused panel · colour theme · token usage · help · quit |
-| mouse | click = focus + select; double-click = Enter (on `▾/▸` in the tree: fold); right click = open in browser; wheel = scroll that panel without moving the cursor; back/forward buttons |
+| `/` `n` `N` · `T` · `$` · `q` | search in the focused panel · colour theme · token usage · quit |
+| `?` · `O` · F1 | key menu for the focused panel (Enter runs the action) · options menu (comments / translation / summaries / people / hops / theme / screen) · full help text |
+| mouse | click = focus + select; double-click = Enter (on `▾/▸` in the tree: fold); right click = open in browser; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
+
+Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$`, F1) open as centred popups; Esc closes them.
 
 Under tmux enable mouse reporting (`set -g mouse on`).
+
+Smoke test: `GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py` drives the TUI in a pseudo-terminal, renders it with `tests/vt.py` and checks the screen.
 
 ## GitHub Enterprise
 

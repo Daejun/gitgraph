@@ -135,10 +135,15 @@ Layout: side column 폭 `side_width`(0.33); 포커스된 side panel이 더 높�
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
 | `u` · `r` | Home을 다른 사람 관점으로 · 재조회 |
 | `c` `t` `s` `p` `h` | comments 모드 · 번역 · 요약 · 사람 노드 · hops 1/2/3 |
-| `/` `n` `N` · `T` · `$` · `?` · `q` | 포커스 panel 검색 · 색 테마 · 토큰 사용량 · 도움말 · 종료 |
-| 마우스 | 클릭 = 포커스 + 선택 · 더블클릭 = Enter(tree의 `▾/▸` 위면 접기) · 오른쪽 클릭 = 브라우저 · 휠 = 커서는 두고 그 panel 스크롤 · 뒤로/앞으로 버튼 |
+| `/` `n` `N` · `T` · `$` · `q` | 포커스 panel 검색 · 색 테마 · 토큰 사용량 · 종료 |
+| `?` · `O` · F1 | 포커스 panel의 키 메뉴(Enter로 실행) · 옵션 메뉴(comments / 번역 / 요약 / 사람 / hops / 테마 / screen) · 전체 도움말 |
+| 마우스 | 클릭 = 포커스 + 선택 · 더블클릭 = Enter(tree의 `▾/▸` 위면 접기) · 오른쪽 클릭 = 브라우저 · 휠 = 커서는 두고 그 panel 스크롤 · 뒤로/앞으로 버튼 · side/main 경계 드래그로 폭 조절(`gg config side_width`로 저장) |
+
+입력(`a`, `/`, `u`)·메뉴(`?`, `O`)·확인(`r`)·텍스트(`d`, `$`, F1)는 중앙 팝업으로 뜨고 Esc로 닫는다.
 
 tmux 안이면 마우스 보고를 켜야 한다(`set -g mouse on`).
+
+Smoke test: `GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py` — pty에서 TUI를 돌리고 `tests/vt.py`로 화면을 그려 검사한다.
 
 ## GitHub Enterprise
 
