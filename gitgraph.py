@@ -22,7 +22,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -165,6 +165,25 @@ def gh_token(user):
     return tok
 
 
+TRANSIENT_RE = re.compile(r"TLS handshake timeout|connection reset|i/o timeout|timeout|EOF|"
+                          r"temporarily unavailable|no such host|HTTP 5\d\d|502|503|504", re.I)
+GH_RETRIES = int(os.environ.get("GITGRAPH_RETRIES", "3"))
+
+
+def gh_api(args, body, env):
+    """`gh api …` with retries on transient network errors (TLS handshake timeout, resets, 5xx)."""
+    for attempt in range(GH_RETRIES + 1):
+        r = subprocess.run(["gh", "api"] + args, input=body, capture_output=True, text=True, env=env)
+        err = (r.stderr or "").strip()
+        if r.returncode == 0 or not TRANSIENT_RE.search(err) or attempt == GH_RETRIES:
+            return r
+        wait = 2 ** (attempt + 1)
+        log(f"gh: {err.splitlines()[-1][:120]} — retrying in {wait}s ({attempt + 1}/{GH_RETRIES})")
+        progress("fetch", 0, None, f"network error, retry {attempt + 1}/{GH_RETRIES} in {wait}s")
+        time.sleep(wait)
+    return r
+
+
 def graphql(query, variables=None):
     """Run a GraphQL query through `gh api graphql`.
 
@@ -182,8 +201,7 @@ def graphql(query, variables=None):
             if not tok:
                 continue
             env["GH_TOKEN"] = tok
-        r = subprocess.run(["gh", "api", "graphql", "--input", "-"],
-                           input=body, capture_output=True, text=True, env=env)
+        r = gh_api(["graphql", "--input", "-"], body, env)
         try:
             data = json.loads(r.stdout) if r.stdout.strip() else {}
         except json.JSONDecodeError:
@@ -202,6 +220,10 @@ def graphql(query, variables=None):
         last_err = errs or r.stderr.strip() or f"gh exit {r.returncode}"
         if "NOT_FOUND" in types or "Could not resolve" in (r.stderr or ""):
             continue  # try next account
+        if TRANSIENT_RE.search(r.stderr or ""):
+            raise GhError(f"cannot reach api.github.com: {r.stderr.strip().splitlines()[-1][:160]}\n"
+                          "  check: `gh api user` works? proxy needed (export HTTPS_PROXY=http://host:port)? "
+                          "VPN/DNS? retries: GITGRAPH_RETRIES (default 3)")
         break
     raise GhError(f"graphql failed: {last_err}")
 
