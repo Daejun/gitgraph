@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gg-gitgraph"
+version = "0.2.0"
+description = "GitHub issue / PR / comment / @mention relation graph as ASCII, with a curses TUI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []   # runtime needs the `gh` CLI (and optionally the `claude` CLI); no Python packages
+
+[project.scripts]
+gg = "gitgraph:main"
+
+[tool.setuptools]
+py-modules = ["gitgraph"]
