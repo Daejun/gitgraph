@@ -42,7 +42,7 @@ gg config [KEY [VALUE]]   # 설정 저장
 gg update                 # 설치 갱신
 ```
 
-옵션: `-r owner/name` · `-u LOGIN`(TUI home의 "나"를 그 사람으로 — 관점만 바뀌고 로그인은 그대로) · `--state open|all`(all은 모든 issue/PR을 받아 느림) · `--comments linked|all|none`(linked = `#N`/`@`가 있는 코멘트만, graph·show 기본; all = tui 기본) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN`(캐시 TTL, 기본 15) · `--refresh` · `-w N`(제목 폭) · `-t zh|all|none`(번역, 기본 zh) · `-S`(코멘트 요약) · `--color auto|always|never` · `--theme dark|light|basic` · TUI 전용: `--depth N`(시작 펼침 깊이, 1), `--days N`(home 기간, 7), `--no-home`, `--no-summary`.
+옵션: `-r owner/name` · `-u LOGIN`(TUI home의 "나"를 그 사람으로 — 관점만 바뀌고 로그인은 그대로) · `--state open|all`(all은 모든 issue/PR을 받아 느림) · `--comments linked|all|none`(linked = `#N`/`@`가 있는 코멘트만, graph·show 기본; all = tui 기본) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN`(캐시 TTL, 기본 15) · `--refresh` · `-w N`(제목 폭) · `-t zh|all|none`(번역, 기본 zh) · `-S`(코멘트 요약) · `--color auto|always|never` · `--theme dark|light|basic` · TUI 전용: `--depth N`(시작 펼침 깊이, 1), `--days N`(home 기간, 7), `--no-summary`.
 
 ## 설정 (`gg config`)
 
@@ -58,6 +58,7 @@ gg update                 # 설치 갱신
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | 모델(진짜 `claude`에만 적용) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: 번역/요약 호출당 노드 수 |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
+| `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.33` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
 | `theme` | `GITGRAPH_THEME` | `dark` | 색 테마, vim의 `bg=`처럼: `dark`(256색), `light`(밝은 배경용 진한 색), `basic`(8색, dim·진한 파랑 없음 — PuTTY 등). 한 번만 바꾸려면 `--theme`, TUI에서는 `T`로 순환 |
 
 ## 줄 형식
@@ -90,33 +91,51 @@ code fence 안과 kernel log / stack trace 줄(`[ 123.4]`, `Tainted:`, `PID:`, `
 
 ## TUI
 
-시작 화면은 섹션별 **home** 목록(헤더에서 Enter/Space로 접고 펼침, `-`/`+` 전부, PgDn/PgUp으로 섹션 이동). "나" = gh 계정들, 또는 `me` / `-u`.
+lazygit 식 layout: 왼쪽 side column의 panel들과, 선택한 것을 보여주는 오른쪽 main panel.
 
-| 섹션 | 내용 |
-|---|---|
-| my turn | 내가 관여(작성·코멘트·mention)한 항목 중 마지막 코멘트가 남의 것 → `← @누가 +Nd » 요약` |
-| mentioning @me | 나를 mention한 항목 (최근 mention 순) |
-| opened in the last N days | `--days N`(기본 7) 안에 열린 것 |
-| active in the last N days | 그 기간에 갱신됐지만 새로 열린 건 아닌 것 |
-| waiting on others | 내가 마지막으로 말한 것(또는 내가 열고 코멘트 없는 것) |
-| opened by me / open PRs by others / stale(30일) / all open | 그대로 |
+```
+╭─1 Repo──────────────────────╮╭─0 Main [content] tree log answer──────────────────────╮
+│ owner/name  57 open  15:44  ││ #750 [PR] mtfs: running out of space must not …       │
+│ item: 2026-08-13 #750 [PR] …││ @Daejun7Park  2026-08-13  updated 2026-08-19          │
+╰─────────────────────────────╯│                                                       │
+╭─2 Home ‹ my turn 2 › 1/9────╮│ Running the device out of space under concurrent …   │
+│ 2026-08-17 #763 [I] xfstest…││                                                       │
+╭─3 Links─────────────────────╮│                                                       │
+│ → refs 2026-08-13 #748 [I] …││                                                       │
+╭─4 Comments [all] linked─────╮│                                                       │
+│ +0d o @Daejun7Park » …      ││                                                       │
+╭─5 People────────────────────╮│                                                       │
+│ @Daejun7Park  author        ││                                                       │
+╰─────────────────────────────╯╰───────────────────────────────────────────────────────╯
+ ⏎ open item  [ ] section  / search  a ask  o browser   1-5 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit
+```
 
-Enter로 그 항목 중심 tree, Tab으로 전체 overview(`--no-home`이면 overview로 시작). tree는 `--depth N`(기본 1)까지만 펼친 상태로 시작하고 노드 앞에 `▾` 펼침 / `▸` 접힘(`[+N]` 숨은 줄 수) / `·` leaf 표시. 번역·요약은 **화면에 보이는 줄부터** `batch`개씩 백그라운드로 처리하고, 접힌 노드는 펼칠 때 처리. 화면 아래 preview pane에 커서 줄의 전체 내용, 질문의 답은 오른쪽 절반 panel. 범례는 오른쪽 위 상자(`L`로 숨김). open 항목만 대상.
+| panel | 내용 | Enter |
+|---|---|---|
+| 1 Repo | repo, open 수, fetch 시각, "나", 현재 item, 토글 상태, 토큰 사용량, 백그라운드 진행 | – |
+| 2 Home | 한 번에 한 섹션(`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`) | **현재 item**으로 설정 — Links, Comments, People, tree가 따라옴 |
+| 3 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지) | 그 item으로 이동(`b`/Esc로 복귀) |
+| 4 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`(`[` `]` all / linked) | main에서 읽기 |
+| 5 People | 현재 item의 작성자·코멘트 작성자·mention된 사람 | 그 사람 관점으로 Home 보기 |
+| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(본문+메타 또는 코멘트); **tree** / **log** = 현재 item 주변 그래프(`--hops`, Space/←/→·`-`/`=` 접기, Enter 재루팅, `⇢` 줄 점프, `▾ ▸ ·` 표시); **answer** = 마지막 `a` 질문의 답 | tree: 그 노드로 재루팅 |
+
+Layout: side column 폭 `side_width`(0.33); 포커스된 side panel이 더 높음(`expand_focused`, `expanded_weight`); `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`.
 
 | 키 | 동작 |
 |---|---|
-| `↑`/`k` `↓`/`j` PgUp PgDn `g`/`G` | 커서 이동 (home: PgDn/PgUp = 다음/이전 섹션) |
-| Space, `←`/`→` · `1`~`9` · `-`/`+` | 접기/펼치기 · 그 깊이까지 펼침 · depth 1로 접기 / 전부 펼침 |
-| Enter | 노드: 그 노드로 재루팅 · `⇢`/`mentions` 줄: 가리키는 노드로 점프 |
-| Tab | home ↔ 전체 overview |
-| Backspace / `b` / `h` / Esc · `f` | 뒤로(화면·root·접힘·커서·관점 복원; preview·답 panel 포커스 중이면 포커스 해제만) · 앞으로 |
-| `v` · `J`/`K` · `w` · `{`/`}` | preview pane: 숨김/표시 · 스크롤 · 포커스(pane 확대; ↑↓ PgUp PgDn g G 스크롤, `w`/Esc 복귀; `w`는 목록 → preview → 답 panel 순환) · 높이 |
-| `a` · `A` | 커서 항목에 대해 claude에게 질문 · 답 panel 숨김/표시 |
-| `d` · `o` | 상세 pager · 브라우저로 열기 |
-| `u` | home의 "나"를 다른 사람으로(이전 관점은 뒤로가기 스택에) |
-| `l` `c` `p` `t` `s` `H` `r` | tree/log · comments 모드 · 사람 노드 · 번역 · 요약 · hops 1/2/3 · 재조회 |
-| `/` `n` `N` · `<` `>` · `L` · `$` · `T` · `?` · `q` | 검색 · 가로 스크롤 · 범례 · 토큰 사용량 · 색 테마 순환(dark → light → basic) · 도움말 · 종료 |
-| 마우스 | 클릭 = 커서 · `▾/▸` 클릭 = 접기 · 섹션 헤더 클릭 = 접기 · 더블클릭 = Enter(`@login` 위면 그 사람 관점) · 오른쪽 클릭 = 브라우저 · 뒤로/앞으로 버튼 · preview/답 panel 클릭 = 포커스 · 휠 = 커서는 두고 그 영역만 스크롤 |
+| `1`~`5` · `0` · Tab / Shift-Tab | panel 점프 · main · 순환 |
+| `[` `]` | 포커스 panel의 이전 / 다음 탭 |
+| `+` `_` | screen mode normal → half → full |
+| `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | 이동 · 페이지 · 처음/끝 · 가로 스크롤 |
+| `K` `J` | 어디서든 main panel 스크롤 |
+| Enter | 위 표 참조 |
+| Space, `←`/`→` · `-` `=` | tree 노드 접기/펼치기 · depth 1로 접기 / 전부 펼침 |
+| `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기 |
+| Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
+| `u` · `r` | Home을 다른 사람 관점으로 · 재조회 |
+| `c` `t` `s` `p` `h` | comments 모드 · 번역 · 요약 · 사람 노드 · hops 1/2/3 |
+| `/` `n` `N` · `T` · `$` · `?` · `q` | 포커스 panel 검색 · 색 테마 · 토큰 사용량 · 도움말 · 종료 |
+| 마우스 | 클릭 = 포커스 + 선택 · 더블클릭 = Enter(tree의 `▾/▸` 위면 접기) · 오른쪽 클릭 = 브라우저 · 휠 = 커서는 두고 그 panel 스크롤 · 뒤로/앞으로 버튼 |
 
 tmux 안이면 마우스 보고를 켜야 한다(`set -g mouse on`).
 

@@ -5,7 +5,7 @@ Usage:
   gg [overview options]                   render overview of open items
   gg 777 [--hops 2]                       neighbourhood of one item (also #777, owner/repo#777, @login)
   gg show 777                             details of one node
-  gg tui [777]                            interactive curses browser (cursor keys, mouse, fold, focus, search, ask)
+  gg tui [777]                            lazygit-style TUI: side panels (Repo/Home/Links/Comments/People) + main
   gg update                               update this installation from GitHub
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
 
@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -41,6 +41,11 @@ CONFIG_KEYS = {
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
+    "side_width": ("GITGRAPH_SIDE_WIDTH", "0.33", "tui: fraction of the width for the side column"),
+    "expand_focused": ("GITGRAPH_EXPAND_FOCUSED", "true", "tui: give the focused side panel more height (accordion)"),
+    "expanded_weight": ("GITGRAPH_EXPANDED_WEIGHT", "2", "tui: how much taller the focused side panel is"),
+    "screen_mode": ("GITGRAPH_SCREEN_MODE", "normal", "tui: normal | half | full (+ / _ cycle at runtime)"),
+    "border": ("GITGRAPH_BORDER", "rounded", "tui: rounded | single | double | bold | hidden"),
 }
 
 
@@ -1865,47 +1870,109 @@ def wrap(text, width):
     return out
 
 
-HELP = """gg tui keys
+HELP = """gg tui — lazygit style layout
 
-  Up/k  Down/j    move one row            PgUp/PgDn  page       g / G  top / bottom
-  Space           fold / unfold this node (tree layout)          - / +  fold to depth 1 / unfold all
-  1..9            unfold to that depth (start-up depth is 1; --depth N changes it)
-                  ▾ = expanded   ▸ = folded ([+N] = hidden descendants)   · = leaf
-  Left / Right    fold / unfold
-  Tab             home (my turn / mentions / opened / active / waiting / mine / PRs / stale / all)  <->  overview
-                  home: Enter or Space on a section header folds it; - / + fold / unfold all sections
-                  home: PgDn / PgUp jump to the next / previous section
-  Enter           on a node: focus on it (re-root, N hops)
-                  on a "⇢" or "mentions" line: jump to the linked node
-  Backspace/b/Esc back to the previous view (with the preview or answer panel focused: just leave it)
-  f               forward again        mouse: back/forward buttons = back/forward, right click = open in browser
-  v               show / hide the preview pane (full text of the row under the cursor)
-  w               focus the preview pane (it grows to most of the screen): Up/Down, PgUp/PgDn, g/G scroll; w/Esc returns
-  J / K           scroll the preview pane without changing focus      { / }  shrink / grow it
-  L               show / hide the legend box in the top-right corner
-  a               ask claude a one-shot question about the row under the cursor (body + all comments as context);
-                  the answer appears in a panel on the right half of the screen
-  A               hide / show that answer panel        w  cycles focus list -> preview -> answer panel
-  u               view the home lists as another person (@login); empty = back to my gh accounts
-                  (the previous person is on the back stack: Backspace / back button restores them)
-  d               details: edges, comments with their targets, body
-  o               open in the browser (xdg-open)
-  l               toggle tree / log         c  cycle comments linked/all/none   p  toggle people
-  t               toggle translation        s  toggle comment summaries          H  cycle hops 1/2/3
-  r               refetch from GitHub
-  /  n  N         search / next / previous  < >  horizontal scroll
-  mouse           click = move the cursor; click ▾/▸ = fold/unfold; click a section header = fold it;
-                  double-click = Enter (on a @login: view as that person); right click = open in browser;
-                  click preview / answer panel = focus it;
-                  wheel = scroll that area without moving the cursor; back / forward buttons = back / forward
-  $               claude token usage since start (translate / summarize / ask; also in the title bar)
-  T               cycle the colour theme dark -> light -> basic (basic = 8 colours, no dim: PuTTY);
-                  make it stick with `gg config theme basic` or --theme
-  ?               this help                 q  quit
+  side column: 1 Repo  2 Home  3 Links  4 Comments  5 People      main: 0 (tabs: content · tree · log · answer)
+  1-5 / 0         jump to a panel            Tab / Shift-Tab  next / previous panel
+  [ / ]           previous / next tab in the focused panel (Home sections, Comments all/linked, main tabs)
+  + / _           screen mode normal -> half (focused side panel fills the column) -> full (only that panel)
+  Up/k Down/j     move            PgUp/PgDn , .   page       g/G < >  top / bottom      H / L  scroll sideways
+  K / J           scroll the main panel from anywhere
+  Enter           Home: make it the current item (Links, Comments, People and the tree follow)
+                  Links: go to that item      Comments: focus main on it      People: view as that person
+                  main tree/log: re-root on the node; on a ⇢/mentions line: jump to the linked node
+  Space / Left / Right   fold / unfold a tree node      - / =   fold to depth 1 / unfold all
+  a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
+  Esc / b         back (previous item and perspective)     f  forward
+  u               view Home as another person       r  refetch from GitHub
+  c t s p h       comments mode · translation · summaries · people nodes · hops 1/2/3
+  / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
+  mouse           click = focus panel + select; double-click = Enter; right click = open in browser;
+                  wheel = scroll that panel without moving the cursor; back/forward buttons
+
+  legend          YYYY-MM-DD = when the issue/PR was opened, +Nd = a comment N days later; [I] issue [PR] pull request,
+                  [draft]/[merged]/[closed] only when not open; → refs / ← cited-by; → closes / ← closed-by;
+                  ⇢ = link to a node drawn elsewhere; ▾ open ▸ folded [+N] · leaf; » one-line summary
 """
+
+BORDERS = {"rounded": "╭╮╰╯─│", "single": "┌┐└┘─│", "double": "╔╗╚╝═║", "bold": "┏┓┗┛━┃", "hidden": "      "}
+LIST_KINDS = ("", "link", "mention", "sec")
+
+
+class Panel:
+    def __init__(self, key, title, tabs=None, scroll_only=False):
+        self.key, self.title, self.tabs, self.tab = key, title, tabs or [], 0
+        self.rows, self.cur, self.top, self.hs = [], 0, 0, 0
+        self.rect = (0, 0, 0, 0)          # content area: y, x, h, w
+        self.scroll_only = scroll_only    # main content/answer: no cursor, just scrolling
+        self.free = False                 # after a wheel scroll the view may leave the cursor off screen
+        self.query = ""
+
+    def valid(self, i):
+        return 0 <= i < len(self.rows) and self.rows[i].kind in LIST_KINDS and self.rows[i].text.strip() != ""
+
+    def current(self):
+        return self.rows[self.cur] if 0 <= self.cur < len(self.rows) else None
+
+    def move(self, delta):
+        self.free = False
+        if self.scroll_only:
+            self.top = max(0, self.top + delta)
+            return
+        step = 1 if delta > 0 else -1
+        i, left = self.cur, abs(delta)
+        while left:
+            j = i + step
+            while 0 <= j < len(self.rows) and not self.valid(j):
+                j += step
+            if not 0 <= j < len(self.rows):
+                break
+            i, left = j, left - 1
+        self.cur = i
+
+    def settle(self):
+        """Keep cur on a valid row and the viewport sane (called after rows change and before drawing)."""
+        h = max(self.rect[2], 1)
+        if self.scroll_only:
+            self.top = max(0, min(self.top, max(len(self.rows) - h, 0)))
+            return
+        self.cur = max(0, min(self.cur, len(self.rows) - 1)) if self.rows else 0
+        if self.rows and not self.valid(self.cur):
+            j = next((i for i in range(self.cur, len(self.rows)) if self.valid(i)), None)
+            if j is None:
+                j = next((i for i in range(self.cur, -1, -1) if self.valid(i)), 0)
+            self.cur = j
+        self.top = max(0, min(self.top, max(len(self.rows) - h, 0)))
+        if not self.free:
+            if self.cur < self.top:
+                self.top = self.cur
+            if self.cur >= self.top + h:
+                self.top = self.cur - h + 1
+
+    def find(self, nid, near=None):
+        hits = [i for i, r in enumerate(self.rows) if r.nid == nid and r.kind in ("", "mention")]
+        if not hits:
+            return None
+        return min(hits, key=lambda i: abs(i - (near if near is not None else self.cur)))
+
+    def goto_nid(self, nid):
+        i = self.find(nid)
+        if i is not None:
+            self.cur, self.free = i, False
+        return i is not None
+
+    def set_rows(self, rows, keep=True):
+        keep_nid = self.current().nid if (keep and self.current()) else None
+        self.rows = rows
+        if keep_nid:
+            self.goto_nid(keep_nid)
 
 
 class Tui:
+    SIDE = ["repo", "home", "links", "comments", "people"]
+    HOME_TABS = [("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
+                 ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
+    MAIN_TABS = ["content", "tree", "log", "answer"]
     COMMENTS_CYCLE = ["linked", "all", "none"]
 
     def __init__(self, scr, opts):
@@ -1913,29 +1980,34 @@ class Tui:
         self.curses = curses
         self.scr = scr
         self.o = dict(opts)
-        self.root, self.hist, self.fwd = None, [], []
-        self.collapsed, self.cur, self.top, self.hs = set(), 0, 0, 0
-        self.query, self.msg, self.rows = "", "", []
-        self.pane_on, self.pane_h, self.pv, self.pv_key = True, 0, 0, None   # preview pane
-        self.pane_focus, self.legend_on = False, True
-        self.home_folded = {"stale", "all"}
-        self.ask_thread, self.ask_state, self.last_answer = None, None, None
-        self.side, self.side_on, self.side_scroll, self.side_focus = None, False, 0, False   # right-hand answer panel
         self.o.setdefault("summary", True)
-        self.tr_saved = self.o["translate"] if self.o["translate"] != "none" else "zh"
-        self.progress, self.worker, self.enrich_pending, self.t0, self.bg_error = None, None, False, time.time(), None
-        self.view = "graph" if (self.o.get("root") or not self.o.get("home", True)) else "home"
-        self.enriched = set()   # node ids already sent for translation / summary (on demand, per view)
         self.me = ME or [a.lower() for a in gh_accounts()]
+        self.item, self.subject, self.hist, self.fwd = None, None, [], []
+        self.collapsed = set()
+        self.focus, self.screen = "home", cfg("screen_mode") if cfg("screen_mode") in ("normal", "half", "full") else "normal"
+        self.side_width = float(cfg("side_width") or 0.33)
+        self.expand_focused = cfg("expand_focused").lower() not in ("false", "0", "no", "")
+        self.expanded_weight = float(cfg("expanded_weight") or 2)
+        self.border = BORDERS.get(cfg("border"), BORDERS["rounded"])
+        self.panels = {
+            "repo": Panel("repo", "Repo"),
+            "home": Panel("home", "Home", [t for _, t in self.HOME_TABS]),
+            "links": Panel("links", "Links"),
+            "comments": Panel("comments", "Comments", ["all", "linked"]),
+            "people": Panel("people", "People"),
+            "main": Panel("main", "Main", self.MAIN_TABS, scroll_only=True),
+        }
+        self.visible = []                  # panel keys drawn in the current layout
+        self.msg, self.answer = "", None
+        self.progress, self.worker, self.t0, self.bg_error = None, None, time.time(), None
+        self.enriched = set()
+        self.ask_thread, self.ask_state = None, None
+        self.mouse_ev, self.last_click = None, (0.0, -1, "")
+        self.tr_saved = self.o["translate"] if self.o["translate"] != "none" else "zh"
         global PROGRESS
         PROGRESS = self.on_progress
         curses.curs_set(0)
         scr.keypad(True)
-        self.layout = {"body": 0, "pane": 0, "lw": 0, "sw": 0}
-        self.mouse_ev, self.last_click = None, (0.0, -1)
-        self.scroll_free = False   # True after a wheel scroll: the view may leave the cursor off screen
-        sys.stdout.write("\033[?1000h\033[?1006h")   # press/release reports in SGR form; parsed in read_key()
-        sys.stdout.flush()
         self.pairs = {}
         try:
             curses.start_color()
@@ -1943,9 +2015,11 @@ class Tui:
         except curses.error:
             pass
         self.apply_theme()
+        sys.stdout.write("\033[?1000h\033[?1006h")   # SGR mouse reports, parsed in read_key()
+        sys.stdout.flush()
         self.load(refresh=False)
 
-    # ---- background work + progress ----
+    # ------------------------------------------------------------------ background work
     def on_progress(self, phase, done, total, detail=""):
         self.progress = {"phase": phase, "done": done, "total": total, "detail": detail}
 
@@ -1972,40 +2046,34 @@ class Tui:
         sp = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time() * 8) % 10]
         if self.ask_thread is not None and self.ask_thread.is_alive():
             el = int(time.time() - self.ask_state["t0"])
-            return f"{sp} asking {model_label(ASK_MODEL)} about {self.ask_state['label']}: {trunc(self.ask_state['q'], 60)}  {el}s"
+            return f"{sp} asking {model_label(ASK_MODEL)} about {self.ask_state['label']}  {el}s"
         p = self.progress or {}
         el = int(time.time() - self.t0)
         els = f"{el // 60}m{el % 60:02d}s" if el >= 60 else f"{el}s"
         names = {"fetch": "fetching issues/PRs", "stubs": "resolving referenced items",
-                 "translate": f"translating titles ({model_label(TR_MODEL)})",
-                 "summarize": f"summarizing comments ({model_label(TR_MODEL)})",
+                 "translate": f"translating ({model_label(TR_MODEL)})", "summarize": f"summarizing ({model_label(TR_MODEL)})",
                  "error": "error"}
         phase, done, total = p.get("phase", "starting"), p.get("done", 0), p.get("total")
         if total:
-            f = int(20 * min(done, total) / total)
-            bar = f" [{'#' * f}{'.' * (20 - f)}] {done}/{total}"
+            f = int(12 * min(done, total) / total)
+            bar = f" [{'#' * f}{'.' * (12 - f)}] {done}/{total}"
         elif phase == "fetch":
             bar = f" {done} items"
         else:
             bar = ""
-        return f"{sp} {names.get(phase, phase)}{bar}  {p.get('detail', '')}  {els}"
+        return f"{sp} {names.get(phase, phase)}{bar} {p.get('detail', '')} {els}"
 
     def draw_loading(self, what):
         scr = self.scr
         scr.erase()
         h, w = scr.getmaxyx()
-        lines = [f"gg — {what}", "", self.progress_text(), "",
-                 "first run: GitHub fetch takes seconds; translation/summary batches take about a minute each",
-                 "(cached afterwards)   q = quit"]
+        lines = [f"gg — {what}", "", self.progress_text(), "", "q = quit"]
         for i, t in enumerate(lines):
-            self.put(max(h // 2 - 3 + i, 0), max((w - dw(t)) // 2, 0), t, self.curses.A_BOLD if i == 0 else 0)
+            self.put(max(h // 2 - 2 + i, 0), max((w - dw(t)) // 2, 0), t, self.curses.A_BOLD if i == 0 else 0)
         scr.refresh()
 
-    # ---- data ----
     def load(self, refresh):
-        self.g = None
-        self.worker = None
-        self.enriched = set()
+        self.g, self.worker, self.enriched = None, None, set()
 
         def work():
             self.g = build_graph(self.o["repos"], self.o["state"], self.o["max_age_min"], refresh)
@@ -2017,97 +2085,50 @@ class Tui:
             if self.scr.getch() == ord("q"):
                 raise SystemExit
         self.scr.timeout(-1)
+        self.scr.clear()
         if self.g is None:
             raise SystemExit(f"gg: cannot load the graph: {self.bg_error}")
-        if self.o.get("root") and not self.root and not self.hist:
+        self.rebuild_graph()
+        if self.o.get("root") and self.item is None:
             try:
-                self.root = resolve_root(self.g, self.o["root"])
+                self.item = resolve_root(self.g, self.o["root"])
+                self.focus = "main"
+                self.panels["main"].tab = 1
             except ValueError as e:
                 self.msg = str(e)
-        self.rebuild()
-        if self.view == "graph" and self.o["layout"] == "tree":
-            self.fold_below(self.o.get("depth", 1))
-        self.cur = 0
-        self.move(1)
+        self.refresh_all()
+        if self.item is None:
+            self.focus = "home"
 
     def rebuild_graph(self):
-        g2 = apply_filters(self.g, self.o["comments"], self.o["people"], self.o["closed_neighbors"])
-        if self.root and self.root in g2.nodes:
-            g2 = subgraph(g2, focus(g2, self.root, self.o["hops"]))
-        else:
-            self.root = None
-        self.cg = g2
+        self.cg = apply_filters(self.g, self.o["comments"], self.o["people"], self.o["closed_neighbors"])
 
-    def rebuild(self):
-        """Recompute the displayed graph (filters / focus) and its rows; enrich in the background."""
-        self.rebuild_graph()
-        self.rebuild_rows()
-
-    def enrich(self):
-        """On-demand: translate / summarize only the nodes that are in the current rows and not done yet."""
-        want_tr, want_sum = self.o["translate"] != "none", self.o["summary"]
-        if not (want_tr or want_sum):
-            return
-        if self.busy():
-            return  # picked up when the worker finishes (rows are rebuilt then)
-        h, _ = self.scr.getmaxyx()
-        onscreen = range(self.top, min(self.top + h, len(self.rows)))
-        order = list(onscreen) + [i for i in range(len(self.rows)) if i not in onscreen]
-        ids = []
-        for i in order:   # what is on screen first, then the rest of the view, ENRICH_BATCH nodes per call
-            r = self.rows[i]
-            for nid in (r.nid, r.jump if r.kind == "mention" else None):
-                if nid and nid in self.g.nodes and nid not in self.enriched and nid not in ids:
-                    ids.append(nid)
-        ids = set(ids[:ENRICH_BATCH])
-        if not ids:
-            return
-        parents = {self.g.nodes[i].parent for i in ids if self.g.nodes[i].kind == "comment"} - {None}
-        sub = subgraph(self.g, ids | parents)   # Node objects are shared, so results land on self.g too
-        mode = self.o["translate"]
-        pending = [self.g.nodes[i] for i in ids if self.g.nodes[i].kind == "comment" and want_sum
-                   and not self.g.nodes[i].summary and self.g.nodes[i].body.strip()]
-        for n in pending:
-            n.summary_pending = True
-
-        def work():
-            try:
-                prepare_translations(sub, mode)
-                if want_sum:
-                    prepare_summaries(sub)
-            finally:
-                for n in pending:
-                    n.summary_pending = False
-
-        self.enriched |= ids
-        if os.environ.get("GG_DEBUG"):
-            log(f"enrich: {len(ids)} ids, {len(pending)} pending summaries, rows={len(self.rows)} top={self.top}")
-        self.worker = self.run_bg(work)
-        if pending:
-            self.rows = self.build_rows()   # same structure, only the "» 요약 중…" texts change
-
-    def build_rows(self):
-        if self.view == "home":
-            return self.home_rows()
-        if self.root:
-            return focus_rows(self.cg, self.root, self.o["layout"], self.o["width"], self.collapsed,
-                              marks=True, legend=False)
-        return overview_rows(self.cg, self.o["layout"], self.o["width"], self.collapsed, marks=True, legend=False)
-
-    def rebuild_rows(self, keep="auto"):
-        """keep: node id to leave the cursor on; "auto" = the node under the cursor now; None = don't try."""
-        if keep == "auto":
-            keep = self.current_nid()
-        self.rows = self.build_rows()
-        self.cur = min(self.cur, max(len(self.rows) - 1, 0))
-        if keep:
-            self.goto(keep, quiet=True, unfold=False)
-        if not self.valid(self.cur):
-            self.move(1)
+    # ------------------------------------------------------------------ rows for each panel
+    def refresh_all(self, keep=True):
+        self.panels["repo"].rows = self.repo_rows()
+        self.panels["home"].set_rows(self.home_rows(), keep)
+        self.panels["links"].set_rows(self.links_rows(), keep)
+        self.panels["comments"].set_rows(self.comments_rows(), keep)
+        self.panels["people"].set_rows(self.people_rows(), keep)
+        self.refresh_main(keep)
+        if self.subject is None or self.subject not in self.g.nodes:
+            self.subject = self.item
         self.enrich()
 
-    # ---- home view ----
-    def home_rows(self):
+    def repo_rows(self):
+        g = self.g
+        n_items = sum(1 for n in g.nodes.values() if n.kind == "item" and not n.stub)
+        fa = datetime.fromtimestamp(g.fetched_at).strftime("%H:%M") if g.fetched_at else "?"
+        me = ",".join("@" + m for m in self.me) or "-"
+        cur = self.g.nodes.get(self.item)
+        return [Row(f"{g.primary}  {n_items} open  fetched {fa}  me={me}", kind="head"),
+                Row(f"item: {item_label(g, cur, 60, with_meta=False) if cur else '(none — pick one in Home)'}", kind="head"),
+                Row(f"theme={THEME} comments={self.o['comments']} translate={self.o['translate']} "
+                    f"summary={'on' if self.o['summary'] else 'off'} hops={self.o['hops']}", kind="head"),
+                Row(usage_line(), kind="head")]
+
+    def home_sections(self):
+        """{key: [Row]} for every home section (same rules as the old single-screen home)."""
         g, cg, w = self.g, self.cg, self.o["width"]
         days = self.o.get("days", 7)
         now = time.time()
@@ -2131,8 +2152,7 @@ class Tui:
 
         def item_row(n, src=None):
             deg = item_degree(cg, n.id) if n.id in cg.nodes else 0
-            text = item_label(g, n, w) + (f"  ⇢ {deg} links" if deg else "")
-            r = Row(text, n.id)
+            r = Row(item_label(g, n, w) + (f"  ⇢ {deg}" if deg else ""), n.id)
             if src is not None and src.kind == "comment":
                 what = (("» " + trunc(src.summary, w)) if src.summary else
                         ("\"" + (trunc(src.tr_excerpt, w) if src.tr_excerpt else excerpt(src.body, w)) + "\""))
@@ -2157,350 +2177,107 @@ class Tui:
         my_turn.sort(key=lambda x: -x[1].time)
         waiting.sort(key=lambda x: -(x[1].time if x[1] else x[0].time))
         mentioned = sorted(((n, mentions_me(n)) for n in items if mentions_me(n)), key=lambda x: -x[1].time)
-        mine = newest(n for n in items if (n.author or "").lower() in me)
-        others_prs = newest(n for n in items if n.is_pr and (n.author or "").lower() not in me)
-        stale = by_update(n for n in items if ts(n.updated) < now - 30 * 86400)
-        who = ", ".join("@" + m for m in self.me) or "(no gh account found; set GITGRAPH_ME)"
-        sections = [
-            ("turn", f"my turn — someone else spoke last on an item I am in", [item_row(n, lc) for n, lc in my_turn]),
-            ("mention", f"mentioning {who}", [item_row(n, src) for n, src in mentioned]),
-            ("opened", f"opened in the last {days} days", [item_row(n) for n in opened]),
-            ("active", f"active in the last {days} days (updated, not newly opened)", [item_row(n, last_comment(n)) for n in active]),
-            ("waiting", "waiting on others — I spoke last", [item_row(n, lc) for n, lc in waiting]),
-            ("mine", "opened by me", [item_row(n) for n in mine]),
-            ("prs", "open PRs by others", [item_row(n, last_comment(n)) for n in others_prs]),
-            ("stale", "stale — no update for 30 days", [item_row(n) for n in stale]),
-            ("all", f"all open items ({len(items)})", [item_row(n) for n in newest(items)]),
-        ]
-        rows = [Row(f"gg — {g.primary}" + (f"   (data fetched {datetime.fromtimestamp(g.fetched_at).strftime('%Y-%m-%d %H:%M')})"
-                    if g.fetched_at else "") + "   open items only", kind="head"),
-                Row("Enter/Space on a section = fold/unfold   Enter on an item = tree around it   Tab = full overview   ? = keys",
-                    kind="head")]
-        for key, title, body in sections:
-            rows.append(Row(""))
-            folded = key in self.home_folded
-            mark = "▸" if folded else "▾"
-            rows.append(Row(f"{mark} == {title}: {len(body)} ==" + (f"  [+{len(body)}]" if folded else ""), None, key, "sec"))
-            if not folded:
-                rows.extend(body)
+        return {
+            "turn": [item_row(n, lc) for n, lc in my_turn],
+            "mention": [item_row(n, src) for n, src in mentioned],
+            "opened": [item_row(n) for n in opened],
+            "active": [item_row(n, last_comment(n)) for n in active],
+            "waiting": [item_row(n, lc) for n, lc in waiting],
+            "mine": [item_row(n) for n in newest(n for n in items if (n.author or "").lower() in me)],
+            "prs": [item_row(n, last_comment(n)) for n in newest(n for n in items if n.is_pr and (n.author or "").lower() not in me)],
+            "stale": [item_row(n) for n in by_update(n for n in items if ts(n.updated) < now - 30 * 86400)],
+            "all": [item_row(n) for n in newest(items)],
+        }
+
+    def home_rows(self):
+        secs = self.home_sections()
+        self.home_counts = {k: len(v) for k, v in secs.items()}
+        key = self.HOME_TABS[self.panels["home"].tab][0]
+        return secs[key] or [Row("(nothing here)", kind="head")]
+
+    def links_rows(self):
+        if not self.item:
+            return [Row("(no current item)", kind="head")]
+        g, w = self.g, self.o["width"]
+        rows, seen = [], set()
+        order = {"closes": 0, "ref": 1, "mention": 3, "comment": 4}
+        srcs = [g.nodes[self.item]] + g.comments_of(self.item)
+        edges = []
+        for src in srcs:
+            for m, t, o in g.adj[src.id]:
+                if t == "comment" or g.nodes[m].kind == "person" or m == self.item:
+                    continue
+                if (m, t, o) in seen:
+                    continue
+                seen.add((m, t, o))
+                edges.append((order[t], not o, g.nodes[m].time, src, m, t, o))
+        for _, _, _, src, m, t, o in sorted(edges):
+            n = g.nodes[m]
+            via = "" if src.kind == "item" else f" (via {rel_days(src, g)} comment)"
+            rows.append(Row(EDGE_LABEL[(t, o)] + node_label(g, n, w) + via, m))
+        return rows or [Row("(no links)", kind="head")]
+
+    def comments_rows(self):
+        if not self.item:
+            return [Row("(no current item)", kind="head")]
+        g, w = self.g, self.o["width"]
+        cs = g.comments_of(self.item)
+        if self.panels["comments"].tab == 1:   # linked only
+            cs = [c for c in cs if any(t in ("ref", "mention") for _, t, _ in g.adj[c.id])]
+        rows = [Row(comment_label(g, c, w, show_item=False), c.id) for c in cs]
+        return rows or [Row("(no comments)", kind="head")]
+
+    def people_rows(self):
+        if not self.item:
+            return [Row("(no current item)", kind="head")]
+        g = self.g
+        n = g.nodes[self.item]
+        roles = {}
+
+        def add(login, role):
+            if not login:
+                return
+            roles.setdefault(login, [])
+            if role not in roles[login]:
+                roles[login].append(role)
+
+        add(n.author, "author")
+        for c in g.comments_of(self.item):
+            add(c.author, "commented")
+        for src in [n] + g.comments_of(self.item):
+            for m, t, o in g.adj[src.id]:
+                if t == "mention" and o:
+                    add(m[1:], "mentioned")
+        rows = []
+        for login, rs in roles.items():
+            pid = next((k for k in g.nodes if k.lower() == "@" + login.lower()), None)
+            rows.append(Row(f"@{login}  {', '.join(rs)}", pid or f"@{login}"))
         return rows
 
-    # ---- rows / cursor ----
-    def valid(self, i):
-        return (0 <= i < len(self.rows) and self.rows[i].kind in ("", "link", "mention", "sec")
-                and self.rows[i].text.strip() != "")
-
-    def current_nid(self):
-        return self.rows[self.cur].nid if self.rows and 0 <= self.cur < len(self.rows) else None
-
-    def move(self, delta):
-        self.scroll_free = False
-        step = 1 if delta > 0 else -1
-        i, left = self.cur, abs(delta)
-        while left:
-            j = i + step
-            while 0 <= j < len(self.rows) and not self.valid(j):
-                j += step
-            if not 0 <= j < len(self.rows):
-                break
-            i, left = j, left - 1
-        self.cur = i
-
-    def find_row(self, nid, near=None):
-        """Row index showing nid; when it appears several times (home sections), the one closest to `near`."""
-        hits = [i for i, r in enumerate(self.rows) if r.nid == nid and r.kind in ("", "mention")]
-        if not hits:
-            return None
-        return min(hits, key=lambda i: abs(i - near)) if near is not None else hits[0]
-
-    def goto(self, nid, quiet=False, unfold=True):
-        i = self.find_row(nid, near=self.cur if quiet else None)
-        if i is None and unfold and self.collapsed:
-            self.collapsed.clear()
-            self.rebuild_rows(keep=None)
-            i = self.find_row(nid)
-        if i is None:
-            if not quiet:
-                self.msg = f"{nid} is not in this view"
-            return False
-        self.cur = i
-        return True
-
-    def indent(self, i):
-        t = self.rows[i].text
-        m = re.search(r"[├└]─ ", t)
-        return m.start() if m else 0
-
-    def has_kids(self, i):
-        return i + 1 < len(self.rows) and self.rows[i + 1].kind != "head" and self.indent(i + 1) > self.indent(i)
-
-    def depth(self, i):
-        t = self.rows[i].text
-        return self.indent(i) // 3 + 1 if re.search(r"[├└]─ ", t) else 0
-
-    def fold_below(self, depth):
-        """Fold every node at tree depth >= depth (root = 0), keeping the cursor's node visible."""
-        keep = self.current_nid()
-        self.collapsed.clear()
-        self.rebuild_rows(keep=None)
-        self.collapsed = {r.nid for i, r in enumerate(self.rows)
-                          if r.kind == "" and r.nid and self.depth(i) >= depth and self.has_kids(i)}
-        self.rebuild_rows(keep=keep)
-
-    def toggle_fold(self, want=None):
-        r = self.rows[self.cur] if self.rows else None
-        if not r or r.kind != "" or not r.nid or self.o["layout"] != "tree":
-            return
-        folded = r.nid in self.collapsed
-        if want is None:
-            want = not folded
-        if want and not folded and (self.has_kids(self.cur)):
-            self.collapsed.add(r.nid)
-        elif not want and folded:
-            self.collapsed.discard(r.nid)
+    def refresh_main(self, keep=True):
+        p = self.panels["main"]
+        tab = self.MAIN_TABS[p.tab]
+        if tab == "content":
+            p.scroll_only = True
+            p.rows = [Row(t) for t in self.content_lines(self.subject, max(p.rect[3], 40))]
+        elif tab == "answer":
+            p.scroll_only = True
+            p.rows = [Row(t) for t in wrap(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))]
+        elif not self.item or self.item not in self.cg.nodes:
+            p.scroll_only = True
+            p.rows = [Row("(pick an item in Home first)")]
         else:
-            return
-        self.rebuild_rows(keep=r.nid)
+            p.scroll_only = False
+            sub = subgraph(self.cg, focus(self.cg, self.item, self.o["hops"]))
+            layout = "tree" if tab == "tree" else "log"
+            rows = focus_rows(sub, self.item, layout, self.o["width"], self.collapsed, marks=True, legend=False)
+            p.set_rows(rows, keep)
+            self.sub = sub
 
-    # ---- actions ----
-    def enter(self):
-        if not self.rows:
-            return
-        r = self.rows[self.cur]
-        if r.kind == "sec":
-            self.toggle_section(r.jump)
-        elif r.kind == "link" and r.jump:
-            if not self.goto(r.jump):
-                self.focus_on(r.jump)
-        elif r.kind in ("", "mention") and r.nid:
-            self.focus_on(r.nid)
-
-    def next_section(self, direction):
-        """home: jump to the next / previous section header and scroll it to the top of the list."""
-        idx = [i for i, r in enumerate(self.rows) if r.kind == "sec"]
-        if not idx:
-            return
-        if direction > 0:
-            nxt = [i for i in idx if i > self.cur]
-            target = nxt[0] if nxt else idx[-1]
-        else:
-            prv = [i for i in idx if i < self.cur]
-            target = prv[-1] if prv else idx[0]
-        self.cur = target
-        self.top = max(target - 1, 0)
-        self.scroll_free = False
-
-    def toggle_section(self, key):
-        self.home_folded ^= {key}
-        i = self.cur
-        self.rebuild_rows(keep=None)
-        self.cur = min(i, len(self.rows) - 1)
-        if not self.valid(self.cur):
-            self.move(-1)
-
-    def snapshot(self):
-        return (self.view, self.root, self.cur, self.top, set(self.collapsed), set(self.home_folded), list(self.me))
-
-    def restore(self, st):
-        self.view, self.root, cur, top, self.collapsed, self.home_folded, self.me = st
-        self.rebuild_graph()
-        self.rebuild_rows(keep=None)          # restore the saved fold state and cursor exactly
-        self.cur, self.top = min(cur, max(len(self.rows) - 1, 0)), top
-        self.pane_focus = self.side_focus = False
-
-    def forward(self):
-        if not self.fwd:
-            self.msg = "nothing to go forward to"
-            return
-        self.hist.append(self.snapshot())
-        self.restore(self.fwd.pop())
-
-    def focus_on(self, nid):
-        self.hist.append(self.snapshot())
-        self.fwd = []
-        self.view, self.root, self.collapsed, self.cur, self.top = "graph", nid, set(), 0, 0
-        self.rebuild()
-        if self.o["layout"] == "tree":
-            self.fold_below(self.o.get("depth", 1))
-        self.cur = 0
-        self.move(1)
-
-    def back(self):
-        if not self.hist:
-            if self.view == "graph" and self.o.get("home", True):
-                self.fwd.append(self.snapshot())
-                self.go_home()
-            else:
-                self.msg = "already at the top"
-            return
-        self.fwd.append(self.snapshot())
-        self.restore(self.hist.pop())
-
-    def go_home(self, push=False, clear=True):
-        if push:
-            self.hist.append(self.snapshot())
-            self.fwd = []
-        elif clear:
-            self.hist = []
-        self.view, self.root, self.collapsed, self.cur, self.top = "home", None, set(), 0, 0
-        self.rebuild()
-        self.cur = 0
-        self.move(1)
-
-    def view_as(self, me):
-        """Switch the home perspective (u key / double-click on @login); the previous one goes on the back stack."""
-        self.hist.append(self.snapshot())
-        self.fwd = []
-        self.me = [m.lower() for m in me]
-        self.msg = "viewing as " + (", ".join("@" + m for m in self.me) or "(nobody)")
-        if self.view == "home":
-            self.rebuild_rows(keep=None)
-            self.cur = 0
-            self.move(1)
-        else:
-            self.go_home(clear=False)
-
-    def go_overview(self):
-        self.view, self.root, self.hist, self.collapsed, self.cur, self.top = "graph", None, [], set(), 0, 0
-        self.rebuild()
-        if self.o["layout"] == "tree":
-            self.fold_below(self.o.get("depth", 1))
-        self.cur = 0
-        self.move(1)
-
-    def node_url(self, nid):
-        n = self.g.nodes.get(nid)
-        if not n:
-            return None
-        if n.kind == "person":
-            return f"https://{repo_host(self.g.primary)}/{n.title}"
-        if n.url:
-            return n.url
-        host, owner, name = split_repo(n.repo)
-        return f"https://{host}/{owner}/{name}/issues/{n.number}"
-
-    def open_browser(self):
-        url = self.node_url(self.current_nid())
-        if not url:
-            return
-        try:
-            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.msg = f"opened {url}"
-        except OSError as e:
-            self.msg = f"cannot open browser: {e}"
-
-    def details(self):
-        nid = self.current_nid()
-        if not nid:
-            return
-        self.pager(render_show(self.g, nid, width=200).splitlines(), f"details: {nid}")
-
-    def prompt_line(self, label, maxlen=400):
-        """Read one line of input on the bottom line. Returns "" when cancelled/empty."""
-        h, w = self.scr.getmaxyx()
-        self.curses.echo()
-        self.curses.curs_set(1)
-        self.scr.timeout(-1)   # block for the whole line even while a background worker is running
-        try:
-            self.scr.addstr(h - 1, 0, label.ljust(w - 1))
-            q = self.scr.getstr(h - 1, dw(label), maxlen).decode("utf-8", "replace").strip()
-        except Exception:  # noqa: BLE001
-            q = ""
-        self.curses.noecho()
-        self.curses.curs_set(0)
-        return q
-
-    def search(self):
-        q = self.prompt_line("/")
-        if q:
-            self.query = q
-            self.search_next(1)
-
-    def ask(self):
-        if self.ask_thread is not None and self.ask_thread.is_alive():
-            self.msg = "a question is still running"
-            return
-        r = self.rows[self.cur] if self.rows else None
-        nid = r.nid if r else None
-        if r and r.kind == "link" and r.jump:
-            nid = r.jump
-        if not nid or nid not in self.g.nodes:
-            self.msg = "put the cursor on an issue, PR, comment or person first"
-            return
-        n = self.g.nodes[nid]
-        label = self.g.label_num(n) if n.kind == "item" else (f"comment on {self.g.label_num(self.g.nodes[n.parent])}"
-                                                              if n.kind == "comment" else n.id)
-        q = self.prompt_line(f"ask claude about {label}: ")
-        if not q:
-            return
-        import threading
-        self.ask_state = {"nid": nid, "label": label, "q": q, "t0": time.time(), "answer": None, "error": None}
-        st = self.ask_state
-        self.side = {"title": f"asking {model_label(ASK_MODEL)} · {label}", "text": f"Q: {q}\n\n(waiting for the answer…)"}
-        self.side_on, self.side_scroll = True, 0
-
-        def work():
-            try:
-                st["answer"] = ask_claude(self.g, nid, q)
-            except Exception as e:  # noqa: BLE001
-                st["error"] = str(e)
-
-        self.ask_thread = threading.Thread(target=work, daemon=True)
-        self.ask_thread.start()
-
-    def show_answer(self):
-        """Put the finished answer into the right-hand panel and focus it."""
-        st = self.ask_state
-        if not st or st["answer"] is None and st["error"] is None:
-            self.msg = "no answer yet (a = ask)"
-            return
-        self.side = {"title": f"{model_label(ASK_MODEL)} · {st['label']}",
-                     "text": f"Q: {st['q']}\n\n" + (st["answer"] or f"error: {st['error']}")}
-        self.side_on, self.side_scroll, self.side_focus, self.pane_focus = True, 0, True, False
-
-    def side_width(self, w):
-        return w // 2 if (self.side_on and self.side and w >= 80) else 0
-
-    def draw_side(self, x0, sw, height):
-        c = self.curses
-        for y in range(height):
-            self.put(y, x0 - 1, "│", self.dim())
-        lines = wrap(self.side["text"], sw - 1)
-        body = height - 1
-        self.side_scroll = max(0, min(self.side_scroll, max(len(lines) - body, 0)))
-        pos = f" {self.side_scroll + 1}-{min(self.side_scroll + body, len(lines))}/{len(lines)}"
-        title = clip(self.side["title"], 0, sw - 1 - dw(pos)) + pos
-        hint = "[focused: ↑↓ PgUp PgDn scroll, w/Esc back]" if self.side_focus else "(w focus, A hide, a ask)"
-        self.put(0, x0, title + " " * max(0, sw - 1 - dw(title)), c.A_BOLD | c.A_REVERSE)
-        for i in range(body):
-            j = self.side_scroll + i
-            if j >= len(lines):
-                break
-            self.put(1 + i, x0, lines[j])
-        self.put(height - 1, x0, clip(hint, 0, sw - 1), self.dim())
-
-    def search_next(self, direction):
-        if not self.query:
-            self.msg = "no search query (press /)"
-            return
-        q = self.query.lower()
-        n = len(self.rows)
-        for k in range(1, n + 1):
-            i = (self.cur + direction * k) % n
-            if self.valid(i) and q in self.rows[i].text.lower():
-                self.cur = i
-                return
-        self.msg = f"not found: {self.query}"
-
-    # ---- preview pane ----
-    def preview_lines(self, width):
-        r = self.rows[self.cur] if self.rows and 0 <= self.cur < len(self.rows) else None
-        if not r:
-            return []
-        nid = r.jump if r.kind in ("link", "mention") and r.jump else r.nid
+    def content_lines(self, nid, width):
         n = self.g.nodes.get(nid) if nid else None
         if not n:
-            return wrap(r.text.strip(), width)
+            return wrap(nid.lstrip("@") if nid else "(nothing selected)", width)
         g = self.g
         out, body = [], ""
         if n.kind == "item":
@@ -2516,7 +2293,7 @@ class Tui:
                 out.append("(not fetched: closed item or other repo — press o to open it)")
             body = n.body
         elif n.kind == "comment":
-            head = f"{g.label_num(g.nodes[n.parent])} comment  @{n.author}  {short_date(n.created)}"
+            head = f"{g.label_num(g.nodes[n.parent])} comment  @{n.author}  {short_date(n.created)} ({rel_days(n, g)})"
             if n.ckind == "review":
                 head += f"  [{(n.review_state or 'review').lower()}]"
             elif n.ckind == "review_comment":
@@ -2537,15 +2314,345 @@ class Tui:
             out.extend(wrap(body, width))
         return out
 
-    # ---- drawing ----
+    # ------------------------------------------------------------------ selection / history
+    def snapshot(self):
+        return (self.item, self.subject, list(self.me), self.panels["main"].tab, self.panels["home"].tab, set(self.collapsed))
+
+    def restore(self, st):
+        self.item, self.subject, self.me, self.panels["main"].tab, self.panels["home"].tab, self.collapsed = st
+        self.refresh_all()
+
+    def set_item(self, nid, push=True):
+        if not nid or nid not in self.g.nodes or self.g.nodes[nid].kind == "person":
+            return
+        if push:
+            self.hist.append(self.snapshot())
+            self.fwd = []
+        self.item, self.subject, self.collapsed = nid, nid, set()
+        self.refresh_all()
+        self.fold_below(self.o.get("depth", 1))
+
+    def back(self):
+        if not self.hist:
+            self.msg = "nothing to go back to"
+            return
+        self.fwd.append(self.snapshot())
+        self.restore(self.hist.pop())
+
+    def forward(self):
+        if not self.fwd:
+            self.msg = "nothing to go forward to"
+            return
+        self.hist.append(self.snapshot())
+        self.restore(self.fwd.pop())
+
+    def view_as(self, me):
+        self.hist.append(self.snapshot())
+        self.fwd = []
+        self.me = [m.lower() for m in me]
+        self.msg = "viewing as " + (", ".join("@" + m for m in self.me) or "(nobody)")
+        self.refresh_all(keep=False)
+        self.focus = "home"
+
+    def update_subject(self):
+        """The main content follows the row under the cursor of the focused side panel."""
+        if self.focus in ("home", "links", "comments", "people"):
+            r = self.panels[self.focus].current()
+            nid = (r.jump if r and r.kind == "mention" and r.jump else (r.nid if r else None))
+            if nid and nid != self.subject:
+                self.subject = nid
+                if self.MAIN_TABS[self.panels["main"].tab] == "content":
+                    self.panels["main"].top = 0
+                    self.refresh_main()
+
+    # ------------------------------------------------------------------ tree folding (main tree tab)
+    def fold_below(self, depth):
+        p = self.panels["main"]
+        if self.MAIN_TABS[p.tab] != "tree" or p.scroll_only:
+            return
+        keep = p.current().nid if p.current() else None
+        self.collapsed.clear()
+        self.refresh_main(keep=False)
+        self.collapsed = {r.nid for i, r in enumerate(p.rows) if r.kind == "" and r.nid
+                          and self.row_depth(p, i) >= depth and self.has_kids(p, i)}
+        self.refresh_main(keep=False)
+        if keep:
+            p.goto_nid(keep)
+
+    @staticmethod
+    def row_indent(p, i):
+        m = re.search(r"[├└]─ ", p.rows[i].text)
+        return m.start() if m else 0
+
+    def row_depth(self, p, i):
+        return self.row_indent(p, i) // 3 + 1 if re.search(r"[├└]─ ", p.rows[i].text) else 0
+
+    def has_kids(self, p, i):
+        return i + 1 < len(p.rows) and p.rows[i + 1].kind != "head" and self.row_indent(p, i + 1) > self.row_indent(p, i)
+
+    def toggle_fold(self, want=None):
+        p = self.panels["main"]
+        r = p.current()
+        if self.MAIN_TABS[p.tab] != "tree" or not r or r.kind != "" or not r.nid:
+            return
+        folded = r.nid in self.collapsed
+        if want is None:
+            want = not folded
+        if want and not folded and self.has_kids(p, p.cur):
+            self.collapsed.add(r.nid)
+        elif not want and folded:
+            self.collapsed.discard(r.nid)
+        else:
+            return
+        self.refresh_main()
+
+    # ------------------------------------------------------------------ enrichment (visible rows first)
+    def enrich(self):
+        want_tr, want_sum = self.o["translate"] != "none", self.o["summary"]
+        if not (want_tr or want_sum) or self.busy():
+            return
+        ids = []
+
+        def add(nid):
+            if nid and nid in self.g.nodes and nid not in self.enriched and nid not in ids:
+                ids.append(nid)
+
+        add(self.subject)
+        for key in [self.focus] + [k for k in self.visible if k != self.focus]:
+            p = self.panels.get(key)
+            if not p:
+                continue
+            h = max(p.rect[2], 1)
+            for r in p.rows[p.top:p.top + h]:
+                add(r.nid)
+                if r.kind == "mention":
+                    add(r.jump)
+            for r in p.rows:
+                add(r.nid)
+        ids = set(ids[:ENRICH_BATCH])
+        if not ids:
+            return
+        parents = {self.g.nodes[i].parent for i in ids if self.g.nodes[i].kind == "comment"} - {None}
+        sub = subgraph(self.g, ids | parents)
+        mode = self.o["translate"]
+        pending = [self.g.nodes[i] for i in ids if self.g.nodes[i].kind == "comment" and want_sum
+                   and not self.g.nodes[i].summary and self.g.nodes[i].body.strip()]
+        for n in pending:
+            n.summary_pending = True
+
+        def work():
+            try:
+                prepare_translations(sub, mode)
+                if want_sum:
+                    prepare_summaries(sub)
+            finally:
+                for n in pending:
+                    n.summary_pending = False
+
+        self.enriched |= ids
+        self.worker = self.run_bg(work)
+        if pending:
+            self.refresh_all()
+
+    # ------------------------------------------------------------------ actions
+    def enter(self):
+        p = self.panels[self.focus]
+        r = p.current()
+        if not r:
+            return
+        if self.focus == "home":
+            self.set_item(r.nid)
+        elif self.focus == "links":
+            self.set_item(r.nid)
+        elif self.focus == "comments":
+            self.subject = r.nid
+            self.panels["main"].tab = 0
+            self.refresh_main()
+            self.focus = "main"
+        elif self.focus == "people":
+            self.view_as([r.nid.lstrip("@")])
+        elif self.focus == "main":
+            if p.scroll_only:
+                return
+            if r.kind == "link" and r.jump:
+                if not p.goto_nid(r.jump):
+                    self.collapsed.clear()
+                    self.refresh_main()
+                    if not p.goto_nid(r.jump):
+                        self.set_item(r.jump)
+            elif r.kind == "" and r.nid:
+                if self.g.nodes[r.nid].kind == "person":
+                    self.view_as([r.nid.lstrip("@")])
+                elif self.g.nodes[r.nid].kind == "comment":
+                    self.subject = r.nid
+                    self.panels["main"].tab = 0
+                    self.refresh_main()
+                else:
+                    self.set_item(r.nid)
+
+    def node_url(self, nid):
+        n = self.g.nodes.get(nid)
+        if not n:
+            return f"https://{repo_host(self.g.primary)}/{nid.lstrip('@')}" if nid else None
+        if n.kind == "person":
+            return f"https://{repo_host(self.g.primary)}/{n.title}"
+        if n.url:
+            return n.url
+        host, owner, name = split_repo(n.repo)
+        return f"https://{host}/{owner}/{name}/issues/{n.number}"
+
+    def open_browser(self):
+        url = self.node_url(self.subject or self.item)
+        if not url:
+            return
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.msg = f"opened {url}"
+        except OSError as e:
+            self.msg = f"cannot open browser: {e}"
+
+    def details(self):
+        nid = self.subject or self.item
+        if nid and nid in self.g.nodes:
+            self.pager(render_show(self.g, nid, width=200).splitlines(), f"details: {nid}")
+
+    def prompt_line(self, label, maxlen=400):
+        h, w = self.scr.getmaxyx()
+        self.curses.echo()
+        self.curses.curs_set(1)
+        self.scr.timeout(-1)
+        try:
+            self.scr.addstr(h - 1, 0, label.ljust(w - 1))
+            q = self.scr.getstr(h - 1, dw(label), maxlen).decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001
+            q = ""
+        self.curses.noecho()
+        self.curses.curs_set(0)
+        return q
+
+    def search(self):
+        p = self.panels[self.focus]
+        q = self.prompt_line("/")
+        if q:
+            p.query = q
+            self.search_next(1)
+
+    def search_next(self, direction):
+        p = self.panels[self.focus]
+        if not p.query:
+            self.msg = "no search query (press /)"
+            return
+        q = p.query.lower()
+        n = len(p.rows)
+        for k in range(1, n + 1):
+            i = (p.cur + direction * k) % n
+            if (p.scroll_only or p.valid(i)) and q in p.rows[i].text.lower():
+                if p.scroll_only:
+                    p.top = i
+                else:
+                    p.cur, p.free = i, False
+                return
+        self.msg = f"not found: {p.query}"
+
+    def ask(self):
+        if self.ask_thread is not None and self.ask_thread.is_alive():
+            self.msg = "a question is still running"
+            return
+        nid = self.subject or self.item
+        if not nid or nid not in self.g.nodes:
+            self.msg = "select an issue, PR, comment or person first"
+            return
+        n = self.g.nodes[nid]
+        label = self.g.label_num(n) if n.kind == "item" else (f"comment on {self.g.label_num(self.g.nodes[n.parent])}"
+                                                              if n.kind == "comment" else n.id)
+        q = self.prompt_line(f"ask about {label}: ")
+        if not q:
+            return
+        import threading
+        st = {"nid": nid, "label": label, "q": q, "t0": time.time()}
+        self.ask_state = st
+        self.answer = f"Q ({label}): {q}\n\n(waiting for the answer…)"
+        self.panels["main"].tab = 3
+        self.refresh_main()
+
+        def work():
+            try:
+                st["answer"] = ask_claude(self.g, nid, q)
+            except Exception as e:  # noqa: BLE001
+                st["answer"] = f"error: {e}"
+            self.answer = f"Q ({label}): {q}\n\n{st['answer']}"
+
+        self.ask_thread = threading.Thread(target=work, daemon=True)
+        self.ask_thread.start()
+
+    # ------------------------------------------------------------------ layout
+    def layout(self):
+        """Assign content rects to the visible panels for the current screen mode / terminal size."""
+        h, w = self.scr.getmaxyx()
+        H = h - 1                                   # bottom line
+        portrait = w <= 84
+        side_w = w if portrait else max(26, min(int(w * self.side_width), w - 30))
+        for p in self.panels.values():
+            p.rect = (0, 0, 0, 0)
+        vis = []
+
+        def place(key, y, x, hh, ww):
+            if hh >= 3 and ww >= 4:
+                self.panels[key].rect = (y + 1, x + 1, hh - 2, ww - 2)
+                vis.append(key)
+
+        if self.screen == "full":
+            place(self.focus, 0, 0, H, w)
+        elif self.screen == "half" or portrait:
+            side_key = self.focus if self.focus in self.SIDE else "home"
+            if portrait:
+                top_h = max(6, H * 2 // 5)
+                place(side_key, 0, 0, top_h, w)
+                place("main", top_h, 0, H - top_h, w)
+            else:
+                if self.focus == "main":
+                    place("main", 0, 0, H, w)
+                else:
+                    place(side_key, 0, 0, H, side_w)
+                    place("main", 0, side_w, H, w - side_w)
+        else:
+            repo_h = 6
+            rest = H - repo_h
+            lists = ["home", "links", "comments", "people"]
+            if rest < 4 * 3:
+                # too small: only the focused list panel gets space, the others collapse to their title bar
+                y = 0
+                place("repo", y, 0, repo_h, side_w)
+                y += repo_h
+                for k in lists:
+                    hh = rest - 2 * 3 if k == (self.focus if self.focus in lists else "home") else 2
+                    if hh >= 3:
+                        place(k, y, 0, hh, side_w)
+                        y += hh
+                    else:
+                        self.panels[k].rect = (y, 0, 0, side_w)   # title bar only
+                        y += 2
+            else:
+                weights = [self.expanded_weight if (self.expand_focused and k == self.focus) else 1.0 for k in lists]
+                total = sum(weights)
+                y = 0
+                place("repo", y, 0, repo_h, side_w)
+                y += repo_h
+                heights = [max(3, int(rest * wt / total)) for wt in weights]
+                heights[-1] = max(3, rest - sum(heights[:-1]))
+                for k, hh in zip(lists, heights):
+                    place(k, y, 0, hh, side_w)
+                    y += hh
+            place("main", 0, side_w, H, w - side_w)
+        self.visible = vis
+
+    # ------------------------------------------------------------------ drawing
     def apply_theme(self):
-        """(Re)build curses colour pairs for the current THEME (called at start and on T)."""
         c = self.curses
         self.pairs = {}
         if not c.has_colors():
             return
-        colors = c.COLORS
-        n = 1
+        colors, n = c.COLORS, 1
         for st in list(THEMES[THEME]) + ["people"]:
             if st == "people":
                 pal = THEMES[THEME]["people"][0 if (colors >= 256 and THEME != "basic") else 1]
@@ -2588,121 +2695,124 @@ class Tui:
         return a
 
     def dim(self):
-        """A_DIM for chrome (separators, legend); the basic theme renders it as normal text (PuTTY has no dim)."""
         return 0 if THEME == "basic" else self.curses.A_DIM
 
-    def put_row(self, y, row, hs, width, extra=0):
-        """Draw a row from display column hs, colouring each segment; fill to width when extra is set."""
-        x, col = 0, 0
-        for text, st in colorize_people(segments(row, self.cg)):
+    def put(self, y, x, text, attr=0, fill=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        s = clip(text, 0, (fill or (w - x)) - 0)
+        if fill:
+            s += " " * max(0, fill - dw(s))
+        try:
+            self.scr.addstr(y, x, clip(s, 0, w - x - (1 if y == h - 1 else 0)), attr)
+        except self.curses.error:
+            pass
+
+    def put_row(self, y, x, row, hs, width, extra=0):
+        col, cx = 0, x
+        for text, st in colorize_people(segments(row, self.g)):
             attr = self.style_attr(st) | extra
             buf = []
             for ch in text:
-                w = _cw(ch)
-                if col + w > hs + width:
+                cw = _cw(ch)
+                if col + cw > hs + width:
                     break
                 if col >= hs:
                     buf.append(ch)
-                elif col + w > hs:
+                elif col + cw > hs:
                     buf.append(" ")
-                col += w
+                col += cw
             if buf:
                 sub = "".join(buf)
                 try:
-                    self.scr.addstr(y, x, sub, attr)
+                    self.scr.addstr(y, cx, sub, attr)
                 except self.curses.error:
                     pass
-                x += dw(sub)
-        if extra and x < width:
+                cx += dw(sub)
+        if extra and cx < x + width:
             try:
-                self.scr.addstr(y, x, " " * (width - x), extra)
+                self.scr.addstr(y, cx, " " * (x + width - cx), extra)
             except self.curses.error:
                 pass
 
-    def status(self, msg):
-        self.msg = msg
-        self.draw()
+    def draw_box(self, key):
+        p = self.panels[key]
+        y, x, hh, ww = p.rect
+        if ww == 0:
+            return
+        c = self.curses
+        focused = key == self.focus
+        tl, tr, bl, br, hz, vt = self.border
+        attr = (self.style_attr("fold") | c.A_BOLD) if focused else self.dim()
+        num = self.SIDE.index(key) + 1 if key in self.SIDE else 0
+        title = f"{num} {p.title}"
+        if p.tabs:
+            if key == "home":
+                cnt = getattr(self, "home_counts", {})
+                k_, t_ = self.HOME_TABS[p.tab]
+                title += f" ‹ {t_} {cnt.get(k_, 0)} › {p.tab + 1}/{len(p.tabs)}"
+            else:
+                title += " " + " ".join(f"[{t}]" if i == p.tab else t for i, t in enumerate(p.tabs))
+        if hh == 0:                                  # collapsed to a title bar
+            self.put(y, x, clip(f"{tl}{hz}{title}{hz}", 0, ww) + hz * max(0, ww - dw(title) - 3) + tr, attr)
+            return
+        by, bx, bh, bw = y - 1, x - 1, hh + 2, ww + 2
+        top = f"{tl}{hz}{clip(title, 0, bw - 4)}"
+        self.put(by, bx, top + hz * max(0, bw - 1 - dw(top)) + tr, attr)
+        for i in range(1, bh - 1):
+            self.put(by + i, bx, vt, attr)
+            self.put(by + i, bx + bw - 1, vt, attr)
+        self.put(by + bh - 1, bx, bl + hz * (bw - 2) + br, attr)
+        # rows
+        p.settle()
+        for i in range(hh):
+            idx = p.top + i
+            if idx >= len(p.rows):
+                break
+            r = p.rows[idx]
+            extra = 0
+            if not p.scroll_only and idx == p.cur:
+                extra = c.A_REVERSE if focused else c.A_UNDERLINE
+            self.put_row(y + i, x, r, p.hs, ww, extra)
+        if len(p.rows) > hh:                          # scroll indicator on the right border
+            pos = int((bh - 3) * min(p.top, max(len(p.rows) - hh, 1)) / max(len(p.rows) - hh, 1))
+            self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
 
-    def put(self, y, x, text, attr=0, fill=False):
-        h, w = self.scr.getmaxyx()
-        s = clip(text, 0, w - 1 - x)
-        if fill:
-            s += " " * max(0, w - 1 - x - dw(s))
-        try:
-            self.scr.addstr(y, x, s, attr)
-        except self.curses.error:
-            pass
+    HINTS = {
+        "home": "⏎ open item  [ ] section  / search  a ask  o browser  u view-as",
+        "links": "⏎ go to item  / search  a ask  o browser",
+        "comments": "⏎ read in main  [ ] all/linked  / search  a ask  o browser",
+        "people": "⏎ view as this person  a ask  o browser",
+        "main": "[ ] content/tree/log/answer  ⏎ re-root  Space fold  - = fold all/none  K J scroll",
+        "repo": "r refetch  c t s p h toggles  T theme  $ tokens",
+    }
 
     def draw(self):
         c = self.curses
         scr = self.scr
         scr.erase()
         h, w = scr.getmaxyx()
-        if not self.pane_h:
-            self.pane_h = max(6, h // 3)
-        pane = min(self.pane_h, h - 8) if self.pane_on and h >= 14 else 0
-        if pane and self.pane_focus:
-            pane = max(pane, h - 9)   # focused: the preview takes most of the screen, 6 list rows stay visible
-        body = h - 2 - (pane + 1 if pane else 0)
-        sw = self.side_width(w)
-        lw = w - 1 - (sw + 1 if sw else 0)   # width of the left (list + preview) area
-        self.layout = {"body": body, "pane": pane, "lw": lw, "sw": sw}
-        self.top = max(0, min(self.top, max(len(self.rows) - body, 0)))
-        if not self.scroll_free:
-            if self.cur < self.top:
-                self.top = self.cur
-            if self.cur >= self.top + body:
-                self.top = self.cur - body + 1
-        for i in range(body):
-            idx = self.top + i
-            if idx >= len(self.rows):
-                break
-            self.put_row(i, self.rows[idx], self.hs, lw, c.A_REVERSE if idx == self.cur else 0)
-        if self.legend_on and lw >= 70:
-            leg = (["YYYY-MM-DD opened   +Nd comment, days after opening   [I] issue  [PR] pull  (state shown only if not open)",
-                    "→ refs  ← cited-by   → closes  ← closed-by   → mentions",
-                    "⇢ link drawn elsewhere   ▾ open  ▸ folded [+N]  · leaf   L hide"]
-                   if self.o["layout"] == "tree" or self.view == "home" else
-                   ["* issue/PR   o comment   @ person   newest on top",
-                    "lanes = references;  → what a comment points at   L hide"])
-            legw = max(dw(x) for x in leg) + 2
-            for i, x in enumerate(leg):
-                self.put(i, lw - legw, " " + x + " " * (legw - 1 - dw(x)), c.A_REVERSE | self.dim())
-        if pane:
-            lines = self.preview_lines(lw - 2)
-            if self.pv_key != self.cur:
-                self.pv_key, self.pv = self.cur, 0
-            self.pv = max(0, min(self.pv, max(len(lines) - pane, 0)))
-            label = (f" preview {self.pv + 1}-{min(self.pv + pane, len(lines))}/{len(lines)}  "
-                     + ("[focused: ↑↓ PgUp PgDn g G scroll, w/Esc back] " if self.pane_focus
-                        else "(J/K scroll, w focus, v hide) "))
-            self.put(body, 0, clip("─" * 2 + label + "─" * max(0, lw - 2 - dw(label)), 0, lw),
-                     c.A_BOLD if self.pane_focus else self.dim())
-            for i in range(pane):
-                if self.pv + i >= len(lines):
-                    break
-                self.put(body + 1 + i, 1, clip(lines[self.pv + i], 0, lw - 1))
-        if sw:
-            self.draw_side(lw + 1, sw, h - 2)
-        where = "home" if self.view == "home" else (f"focus {self.root} (hops {self.o['hops']})" if self.root else "overview")
-        title = (f" gitgraph  {self.o['layout']}  {where}  comments={self.o['comments']} "
-                 f"people={'on' if self.o['people'] else 'off'} translate={self.o['translate']} "
-                 f"summary={'on' if self.o['summary'] else 'off'} me={','.join('@' + m for m in self.me) or '-'}  "
-                 f"theme={THEME} | {usage_line()}  "
-                 f"row {self.cur + 1}/{len(self.rows)}")
-        self.put(h - 2, 0, title, c.A_BOLD | c.A_REVERSE, fill=True)
-        r = self.rows[self.cur] if self.rows and self.cur < len(self.rows) else None
-        info = self.msg or (f"{r.nid}" + (f"  → {r.jump}" if r and r.jump else "") if r and r.nid else "")
+        self.layout()
+        for key in self.visible:
+            self.draw_box(key)
+        for key in self.SIDE:                         # collapsed title bars in the tiny layout
+            if key not in self.visible and self.panels[key].rect[3] and self.screen == "normal" and w > 84:
+                self.draw_box(key)
         if self.busy():
-            self.put(h - 1, 0, self.progress_text(), c.A_BOLD)
+            bottom = self.progress_text()
+            attr = c.A_BOLD
         elif self.bg_error:
-            self.put(h - 1, 0, f"background work failed: {self.bg_error}", self.style_attr("closed"))
+            bottom, attr = f"background work failed: {self.bg_error}", self.style_attr("closed")
+        elif self.msg:
+            bottom, attr = self.msg, c.A_BOLD
         else:
-            self.put(h - 1, 0, f"{info}   ?=help q=quit", self.dim())
+            bottom = f"{self.HINTS.get(self.focus, '')}   1-5 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit"
+            attr = self.dim()
+        self.put(h - 1, 0, bottom, attr, fill=w - 1)
         scr.refresh()
 
     def pager(self, lines, title):
-        """Scrollable full-screen text pager."""
         c = self.curses
         top, hs = 0, 0
         while True:
@@ -2714,115 +2824,33 @@ class Tui:
                     break
                 self.put(i, 0, clip(lines[top + i], hs, w - 1))
             self.put(h - 1, 0, f" {title}  {top + 1}-{min(top + body, len(lines))}/{len(lines)}  "
-                               f"j/k PgUp/PgDn scroll  < > hscroll  q/Esc back", c.A_BOLD | c.A_REVERSE, fill=True)
+                               f"j/k PgUp/PgDn scroll  H L sideways  q/Esc back", c.A_BOLD | c.A_REVERSE, fill=w - 1)
             self.scr.refresh()
             k = self.read_key()
-            if k in (ord("q"), 27, 10, 13, c.KEY_ENTER, ord("d")):
+            if k in (ord("q"), 27, 10, 13, c.KEY_ENTER, ord("d"), ord("?")):
                 return
             elif k in (c.KEY_DOWN, ord("j")):
                 top = min(top + 1, max(len(lines) - body, 0))
             elif k in (c.KEY_UP, ord("k")):
                 top = max(top - 1, 0)
-            elif k == c.KEY_NPAGE or k == ord(" "):
+            elif k in (c.KEY_NPAGE, ord(" "), ord(".")):
                 top = min(top + body, max(len(lines) - body, 0))
-            elif k == c.KEY_PPAGE:
+            elif k in (c.KEY_PPAGE, ord(",")):
                 top = max(top - body, 0)
-            elif k == ord("g"):
+            elif k in (ord("g"), ord("<")):
                 top = 0
-            elif k == ord("G"):
+            elif k in (ord("G"), ord(">")):
                 top = max(len(lines) - body, 0)
-            elif k == ord(">"):
+            elif k == ord("L"):
                 hs += 20
-            elif k == ord("<"):
+            elif k == ord("H"):
                 hs = max(hs - 20, 0)
 
-    # ---- mouse (SGR events parsed in read_key: b = button code, press = True for press) ----
-    def on_mouse(self):
-        c = self.curses
-        ev = self.mouse_ev
-        if not ev:
-            return
-        b, x, y, press = ev
-        if not press or b & 32:      # releases and motion are ignored
-            return
-        base = b & ~28               # strip shift/meta/ctrl
-        L = self.layout
-        in_side = bool(L["sw"]) and x > L["lw"]
-        in_pane = (not in_side) and bool(L["pane"]) and L["body"] < y <= L["body"] + L["pane"]
-        in_list = (not in_side) and y < L["body"]
-        if base in (64, 65):         # wheel
-            d = -3 if base == 64 else 3
-            if in_side:
-                self.side_scroll = max(0, self.side_scroll + d)
-            elif in_pane:
-                self.pv = max(0, self.pv + d)
-            elif in_list:
-                self.top = max(0, self.top + d)   # scroll the view; the cursor stays where it is
-                self.scroll_free = True
-            return
-        if base == 2:                # right button: open the row under the mouse in the browser
-            if in_list:
-                idx = self.top + y
-                if idx < len(self.rows) and self.valid(idx):
-                    self.cur = idx
-            self.open_browser()
-            return
-        if base == 128:              # back button: leave a focused panel first, otherwise go back
-            if self.pane_focus or self.side_focus:
-                self.pane_focus = self.side_focus = False
-            else:
-                self.back()
-            return
-        if base == 129:              # forward button
-            self.forward()
-            return
-        if base != 0:                # only the left button does something below
-            return
-        if in_side:
-            self.side_focus, self.pane_focus = True, False
-            return
-        if in_pane:
-            self.pane_focus, self.side_focus = True, False
-            return
-        if not in_list:
-            return
-        idx = self.top + y
-        if idx >= len(self.rows) or not self.valid(idx):
-            return
-        self.pane_focus = self.side_focus = False
-        self.scroll_free = False
-        now = time.time()
-        double = (now - self.last_click[0] < 0.4) and self.last_click[1] == idx
-        self.last_click = (now, idx)
-        self.cur = idx
-        r = self.rows[idx]
-        if os.environ.get("GG_DEBUG"):
-            log("spans " + " ".join(f"{dw(r.text[:m.start()]) - self.hs}:{m.group(0)}" for m in _LOGIN_RE.finditer(r.text)))
-        if double:
-            self.last_click = (0.0, -1)
-            for m in _LOGIN_RE.finditer(r.text):    # double-click on a @login -> that person's perspective
-                c0 = dw(r.text[:m.start()]) - self.hs
-                if c0 <= x < c0 + dw(m.group(0)):
-                    self.view_as([m.group(0)[1:]])
-                    return
-            self.enter()
-            return
-        if r.kind == "sec":
-            self.toggle_section(r.jump)
-            return
-        m = re.search(r"[▾▸·] ", r.text)
-        if m:
-            col = dw(r.text[:m.start()]) - self.hs
-            if col <= x <= col + 1:
-                self.toggle_fold()
-
-    # ---- input ----
+    # ------------------------------------------------------------------ input
     ESC_SEQ = {"A": "KEY_UP", "B": "KEY_DOWN", "C": "KEY_RIGHT", "D": "KEY_LEFT", "H": "KEY_HOME", "F": "KEY_END",
-               "5~": "KEY_PPAGE", "6~": "KEY_NPAGE", "1~": "KEY_HOME", "4~": "KEY_END", "3~": "KEY_DC"}
+               "5~": "KEY_PPAGE", "6~": "KEY_NPAGE", "1~": "KEY_HOME", "4~": "KEY_END", "3~": "KEY_DC", "Z": "KEY_BTAB"}
 
     def read_key(self):
-        """getch() that reassembles CSI sequences curses sometimes hands over byte by byte (ESC [ B),
-        and parses SGR mouse reports (ESC [ < b ; x ; y M/m) that curses announces as KEY_MOUSE."""
         c = self.curses
         k = self.scr.getch()
         if k == c.KEY_MOUSE:
@@ -2865,17 +2893,96 @@ class Tui:
         finally:
             self.scr.nodelay(False)
 
-    # ---- main loop ----
+    def panel_at(self, x, y):
+        for key in self.visible:
+            py, px, ph, pw = self.panels[key].rect
+            if py - 1 <= y <= py + ph and px - 1 <= x <= px + pw:
+                return key
+        return None
+
+    def on_mouse(self):
+        ev = self.mouse_ev
+        if not ev:
+            return
+        b, x, y, press = ev
+        if not press or b & 32:
+            return
+        base = b & ~28
+        key = self.panel_at(x, y)
+        if base in (64, 65):
+            if key:
+                p = self.panels[key]
+                d = -3 if base == 64 else 3
+                if p.scroll_only:
+                    p.top = max(0, p.top + d)
+                else:
+                    p.top = max(0, p.top + d)
+                    p.free = True
+            return
+        if base == 128:
+            self.back()
+            return
+        if base == 129:
+            self.forward()
+            return
+        if base == 2:
+            if key and key != "repo":
+                self.focus = key
+                self.click_row(key, y)
+                self.update_subject()
+            self.open_browser()
+            return
+        if base != 0 or not key:
+            return
+        self.focus = key
+        idx = self.click_row(key, y)
+        self.update_subject()
+        now = time.time()
+        if now - self.last_click[0] < 0.4 and self.last_click[1] == idx and self.last_click[2] == key:
+            self.last_click = (0.0, -1, "")
+            p = self.panels[key]
+            r = p.current()
+            if r and key == "main" and not p.scroll_only:
+                m = re.search(r"[▾▸·] ", r.text)
+                if m and (dw(r.text[:m.start()]) - p.hs) <= x - p.rect[1] <= (dw(r.text[:m.start()]) - p.hs) + 1:
+                    self.toggle_fold()
+                    return
+            self.enter()
+        else:
+            self.last_click = (now, idx, key)
+
+    def click_row(self, key, y):
+        p = self.panels[key]
+        idx = p.top + (y - p.rect[0])
+        if not p.scroll_only and 0 <= y - p.rect[0] < p.rect[2] and idx < len(p.rows) and p.valid(idx):
+            p.cur, p.free = idx, False
+            return idx
+        return -1
+
+    # ------------------------------------------------------------------ main loop
+    def cycle_focus(self, d):
+        order = self.SIDE + ["main"]
+        self.focus = order[(order.index(self.focus) + d) % len(order)]
+        if self.focus == "repo":
+            self.focus = order[(order.index("repo") + d) % len(order)]
+
     def run(self):
+        c = self.curses
+        try:
+            self._run()
+        finally:
+            sys.stdout.write("\033[?1006l\033[?1000l")
+            sys.stdout.flush()
+
+    def _run(self):
         c = self.curses
         while True:
             if self.worker is not None and not self.worker.is_alive():
-                self.worker = None
-                self.progress = None
-                self.rebuild_rows()
+                self.worker, self.progress = None, None
+                self.refresh_all()
             if self.ask_thread is not None and not self.ask_thread.is_alive():
                 self.ask_thread = None
-                self.show_answer()
+                self.refresh_main()
             self.scr.timeout(150 if self.busy() else -1)
             self.draw()
             k = self.read_key()
@@ -2883,153 +2990,122 @@ class Tui:
                 continue
             self.msg = ""
             h, w = self.scr.getmaxyx()
-            page = max(h - 3, 1)
+            p = self.panels[self.focus]
+            page = max(p.rect[2] - 1, 1)
             if os.environ.get("GG_DEBUG"):
-                log(f"key={k!r} cur={self.cur} rows={len(self.rows)} folded={len(self.collapsed)} view={self.view} "
-                    f"root={self.root} me={self.me} enriched={len(self.enriched)}")
+                log(f"key={k!r} focus={self.focus} cur={p.cur} rows={len(p.rows)} item={self.item} subject={self.subject} me={self.me}")
             if k == ord("q"):
                 return
             if k == c.KEY_MOUSE:
                 self.on_mouse()
                 continue
-            if k == ord("w"):   # cycle focus: list -> preview -> answer panel -> list
-                h_, w_ = self.scr.getmaxyx()
-                if self.pane_focus:
-                    self.pane_focus = False
-                    self.side_focus = bool(self.side_width(w_))
-                elif self.side_focus:
-                    self.side_focus = False
-                else:
-                    self.pane_focus = self.pane_on
-                    if not self.pane_focus:
-                        self.side_focus = bool(self.side_width(w_))
+            if k == c.KEY_RESIZE:
                 continue
-            if self.side_focus:
-                sh = max(h - 4, 1)
-                if k in (c.KEY_DOWN, ord("j"), ord("J")):
-                    self.side_scroll += 1
-                elif k in (c.KEY_UP, ord("k"), ord("K")):
-                    self.side_scroll = max(self.side_scroll - 1, 0)
-                elif k in (c.KEY_NPAGE, ord(" ")):
-                    self.side_scroll += sh
-                elif k == c.KEY_PPAGE:
-                    self.side_scroll = max(self.side_scroll - sh, 0)
-                elif k == ord("g"):
-                    self.side_scroll = 0
-                elif k == ord("G"):
-                    self.side_scroll = 10 ** 9
-                elif k in (27, c.KEY_BACKSPACE, 127, 8, ord("b"), ord("h")):
-                    self.side_focus = False
-                elif k == c.KEY_MOUSE:
-                    self.on_mouse()
-                elif k == ord("A"):
-                    self.side_on, self.side_focus = False, False
-                elif k == ord("a"):
-                    self.side_focus = False
-                    self.ask()
-                elif k == ord("q"):
-                    return
+            # ---- panels ----
+            if ord("1") <= k <= ord("5"):
+                self.focus = self.SIDE[k - ord("1")]
                 continue
-            if k == ord("L"):
-                self.legend_on = not self.legend_on
+            if k == ord("0"):
+                self.focus = "main"
                 continue
-            if self.pane_focus:
-                ph = max(h - 10, 1)
-                if k in (c.KEY_DOWN, ord("j"), ord("J")):
-                    self.pv += 1
-                elif k in (c.KEY_UP, ord("k"), ord("K")):
-                    self.pv = max(self.pv - 1, 0)
-                elif k in (c.KEY_NPAGE, ord(" ")):
-                    self.pv += ph
-                elif k == c.KEY_PPAGE:
-                    self.pv = max(self.pv - ph, 0)
-                elif k == ord("g"):
-                    self.pv = 0
-                elif k == ord("G"):
-                    self.pv = 10 ** 9   # clamped in draw()
-                elif k in (27, c.KEY_BACKSPACE, 127, 8, ord("b"), ord("h")):
-                    self.pane_focus = False   # "back" while the preview is focused just leaves it
-                elif k == ord("v"):
-                    self.pane_on, self.pane_focus = False, False
-                elif k == c.KEY_MOUSE:
-                    self.on_mouse()
+            if k == 9:
+                self.cycle_focus(1)
                 continue
-            elif k in (c.KEY_DOWN, ord("j")):
-                self.move(1)
+            if k == c.KEY_BTAB:
+                self.cycle_focus(-1)
+                continue
+            if k in (ord("["), ord("]")) and p.tabs:
+                p.tab = (p.tab + (1 if k == ord("]") else -1)) % len(p.tabs)
+                p.top = 0
+                if self.focus == "home":
+                    p.set_rows(self.home_rows(), keep=False)
+                    p.cur = 0
+                    self.update_subject()
+                elif self.focus == "comments":
+                    p.set_rows(self.comments_rows(), keep=False)
+                    p.cur = 0
+                    self.update_subject()
+                elif self.focus == "main":
+                    self.refresh_main()
+                    if self.MAIN_TABS[p.tab] == "tree":
+                        self.fold_below(self.o.get("depth", 1))
+                self.enrich()
+                continue
+            if k == ord("+"):
+                self.screen = {"normal": "half", "half": "full", "full": "normal"}[self.screen]
+                continue
+            if k == ord("_"):
+                self.screen = {"normal": "full", "half": "normal", "full": "half"}[self.screen]
+                continue
+            # ---- navigation in the focused panel ----
+            if k in (c.KEY_DOWN, ord("j")):
+                p.move(1)
+                self.update_subject()
             elif k in (c.KEY_UP, ord("k")):
-                self.move(-1)
-            elif k == c.KEY_NPAGE:
-                self.next_section(1) if self.view == "home" else self.move(page)
-            elif k == c.KEY_PPAGE:
-                self.next_section(-1) if self.view == "home" else self.move(-page)
-            elif k in (ord("g"), c.KEY_HOME):
-                self.scroll_free = False
-                self.cur = 0
-                self.move(1) if not self.valid(0) else None
-            elif k in (ord("G"), c.KEY_END):
-                self.scroll_free = False
-                self.cur = len(self.rows) - 1
-                if not self.valid(self.cur):
-                    self.move(-1)
-            elif k == 9:  # Tab
-                self.go_overview() if self.view == "home" else self.go_home()
-            elif self.view == "home" and k in (ord(" "), c.KEY_LEFT, c.KEY_RIGHT):
-                r = self.rows[self.cur] if self.rows else None
-                if r and r.kind == "sec":
-                    self.toggle_section(r.jump)
-                else:
-                    self.msg = "Enter opens the tree; Space on a section header folds it; Tab = full overview"
-            elif self.view == "home" and k in (ord("-"), ord("+"), ord("l")):
-                if k == ord("-"):
-                    self.home_folded = {"turn", "mention", "opened", "active", "waiting", "mine", "prs", "stale", "all"}
-                elif k == ord("+"):
-                    self.home_folded = set()
-                self.rebuild_rows()
-            elif k == ord(" "):
-                self.toggle_fold()
-            elif k == c.KEY_LEFT:
-                self.toggle_fold(True)
-            elif k == c.KEY_RIGHT:
-                self.toggle_fold(False)
-            elif k == ord("-"):
-                self.fold_below(1)
-            elif ord("1") <= k <= ord("9"):
-                self.fold_below(k - ord("0"))
-            elif k == ord("+"):
-                nid = self.current_nid()
-                self.collapsed.clear()
-                self.rebuild_rows(keep=nid)
+                p.move(-1)
+                self.update_subject()
+            elif k in (c.KEY_NPAGE, ord(".")):
+                p.move(page)
+                self.update_subject()
+            elif k in (c.KEY_PPAGE, ord(",")):
+                p.move(-page)
+                self.update_subject()
+            elif k in (ord("g"), ord("<"), c.KEY_HOME):
+                p.free = False
+                p.cur, p.top = 0, 0
+                p.settle()
+                self.update_subject()
+            elif k in (ord("G"), ord(">"), c.KEY_END):
+                p.free = False
+                p.cur = len(p.rows) - 1
+                p.top = max(len(p.rows) - max(p.rect[2], 1), 0)
+                p.settle()
+                self.update_subject()
+            elif k == ord("L"):
+                p.hs += 20
+            elif k == ord("H"):
+                p.hs = max(p.hs - 20, 0)
+            elif k == ord("J"):
+                self.panels["main"].move(3) if self.panels["main"].scroll_only else self.panels["main"].move(1)
+            elif k == ord("K"):
+                self.panels["main"].move(-3) if self.panels["main"].scroll_only else self.panels["main"].move(-1)
             elif k in (10, 13, c.KEY_ENTER):
                 self.enter()
-            elif k in (c.KEY_BACKSPACE, 127, 8, 27, ord("h"), ord("b")):
+            elif k == ord(" ") or k == c.KEY_LEFT or k == c.KEY_RIGHT:
+                if self.focus == "main":
+                    self.toggle_fold(None if k == ord(" ") else (k == c.KEY_LEFT))
+            elif k == ord("-"):
+                self.fold_below(1)
+            elif k == ord("="):
+                self.collapsed.clear()
+                self.refresh_main()
+            elif k in (27, c.KEY_BACKSPACE, 127, 8, ord("b")):
                 self.back()
             elif k == ord("f"):
                 self.forward()
-            elif k == ord("d"):
-                self.details()
             elif k == ord("a"):
                 self.ask()
+            elif k == ord("d"):
+                self.details()
+            elif k == ord("o"):
+                self.open_browser()
             elif k == ord("u"):
                 who = self.prompt_line("view as @login (empty = my gh accounts): ").lstrip("@")
                 self.view_as([who] if who else (ME or [a.lower() for a in gh_accounts()]))
-            elif k == ord("A"):
-                if self.side:
-                    self.side_on = not self.side_on
-                    self.side_focus = False
-                else:
-                    self.msg = "no answer yet (a = ask)"
-            elif k == ord("o"):
-                self.open_browser()
-            elif k == ord("l"):
-                self.o["layout"] = "log" if self.o["layout"] == "tree" else "tree"
-                self.rebuild_rows()
+            elif k == ord("r"):
+                self.load(refresh=True)
             elif k == ord("c"):
                 i = self.COMMENTS_CYCLE.index(self.o["comments"])
                 self.o["comments"] = self.COMMENTS_CYCLE[(i + 1) % 3]
-                self.rebuild()
+                self.rebuild_graph()
+                self.refresh_all()
             elif k == ord("p"):
                 self.o["people"] = not self.o["people"]
-                self.rebuild()
+                self.rebuild_graph()
+                self.refresh_all()
+            elif k == ord("h"):
+                self.o["hops"] = self.o["hops"] % 3 + 1
+                self.refresh_main()
             elif k == ord("t"):
                 if self.o["translate"] == "none":
                     self.o["translate"] = self.tr_saved
@@ -3038,61 +3114,38 @@ class Tui:
                     for n in self.g.nodes.values():
                         n.tr_title = n.tr_excerpt = None
                 self.enriched.clear()
-                self.rebuild_rows()
-            elif k == ord("v"):
-                self.pane_on = not self.pane_on
-            elif k == ord("J"):
-                self.pv += 1
-            elif k == ord("K"):
-                self.pv = max(self.pv - 1, 0)
-            elif k == ord("}"):
-                self.pane_h = min(self.pane_h + 2, h - 8)
-            elif k == ord("{"):
-                self.pane_h = max(self.pane_h - 2, 3)
+                self.refresh_all()
             elif k == ord("s"):
                 self.o["summary"] = not self.o["summary"]
                 if not self.o["summary"]:
                     for n in self.g.nodes.values():
                         n.summary = None
                 self.enriched.clear()
-                self.rebuild_rows()
-            elif k == ord("H"):
-                self.o["hops"] = self.o["hops"] % 3 + 1
-                if self.root:
-                    self.rebuild()
-            elif k == ord("r"):
-                self.load(refresh=True)
+                self.refresh_all()
             elif k == ord("/"):
                 self.search()
             elif k == ord("n"):
                 self.search_next(1)
             elif k == ord("N"):
                 self.search_next(-1)
-            elif k == ord(">"):
-                self.hs += 20
-            elif k == ord("<"):
-                self.hs = max(self.hs - 20, 0)
-            elif k == ord("?"):
-                self.pager(HELP.splitlines(), "help")
-            elif k == ord("$"):
-                self.pager(usage_report(), "claude token usage")
             elif k == ord("T"):
                 global THEME
                 names = list(THEMES)
                 THEME = names[(names.index(THEME) + 1) % len(names)]
                 self.apply_theme()
                 self.msg = f"theme: {THEME}   (keep it: gg config theme {THEME})"
-            elif k == c.KEY_RESIZE:
-                pass
+            elif k == ord("$"):
+                self.pager(usage_report(), "claude token usage")
+            elif k == ord("?"):
+                self.pager(HELP.splitlines(), "help")
 
 
 def tui(opts):
     import curses
     import locale
     locale.setlocale(locale.LC_ALL, "")
-    os.environ.setdefault("ESCDELAY", "25")   # plain Esc responds quickly; read_key() reassembles sequences
+    os.environ.setdefault("ESCDELAY", "25")
     os.makedirs(CACHE_DIR, exist_ok=True)
-    # keep the curses screen clean: gh / translation progress goes to a log file
     errf = open(os.path.join(CACHE_DIR, "tui.log"), "a")
     os.dup2(errf.fileno(), 2)
     try:
@@ -3100,41 +3153,6 @@ def tui(opts):
     except SystemExit as e:
         if isinstance(e.code, str):
             print(e.code)
-    finally:
-        sys.stdout.write("\033[?1006l\033[?1000l")
-        sys.stdout.flush()
-
-
-# --------------------------------------------------------------------------
-# request handling (shared by CLI and MCP)
-# --------------------------------------------------------------------------
-def graph_rows(repos=None, layout="tree", state="open", comments="linked", people=True,
-               closed_neighbors=True, root=None, hops=2, max_age_min=15, refresh=False, width=60,
-               translate=None, summary=False):
-    """(rows, rendered graph) for the overview or a focus view."""
-    repos = resolve_repos(repos)
-    translate = translate or DEFAULT_TRANSLATE
-    g = build_graph(repos, state, max_age_min, refresh)
-    g2 = apply_filters(g, comments, people, closed_neighbors)
-    if root:
-        rid = resolve_root(g, root)
-        if rid not in g2.nodes:
-            raise ValueError(f"{rid} was filtered out (comments={comments}, people={people})")
-        g2 = subgraph(g2, focus(g2, rid, hops))
-    prepare_translations(g2, translate)
-    if summary:
-        prepare_summaries(g2)
-    if root:
-        return focus_rows(g2, rid, layout, width), g2
-    return overview_rows(g2, layout, width), g2
-
-
-def do_show(id_, repos=None, state="open", max_age_min=15, refresh=False, translate=None):
-    repos = resolve_repos(repos)
-    g = build_graph(repos, state, max_age_min, refresh)
-    nid = resolve_root(g, id_)
-    prepare_translations(subgraph(g, {nid} | {m for m, t, o in g.adj[nid]}), translate or DEFAULT_TRANSLATE)
-    return render_show(g, nid)
 
 
 # --------------------------------------------------------------------------
@@ -3228,7 +3246,6 @@ def main(argv=None):
     ap.add_argument("--no-summary", action="store_true", help="tui: keep comment first lines instead of summaries")
     ap.add_argument("--depth", type=int, default=1, help="tui: initial tree expansion depth (default 1)")
     ap.add_argument("--days", type=int, default=7, help="tui home: 'opened in the last N days' window (default 7)")
-    ap.add_argument("--no-home", action="store_true", help="tui: start at the full overview instead of the home list")
     ap.add_argument("--theme", choices=list(THEMES), help="colour theme (default: config/env, else dark)")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="ANSI colours (auto = when stdout is a terminal)")
@@ -3254,7 +3271,7 @@ def main(argv=None):
              "people": not a.no_people, "closed_neighbors": not a.no_closed_neighbors,
              "max_age_min": a.max_age, "width": a.width, "translate": a.translate,
              "layout": a.layout, "hops": a.hops, "root": a.arg or a.root, "summary": not a.no_summary,
-             "depth": a.depth, "days": a.days, "home": not a.no_home})
+             "depth": a.depth, "days": a.days})
         return 0
     try:
         a.repo = resolve_repos(a.repo, interactive=True)

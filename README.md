@@ -42,7 +42,7 @@ gg config [KEY [VALUE]]   # persistent settings
 gg update                 # update this installation
 ```
 
-Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; only the perspective changes, not the gh login) · `--state open|all` (all fetches every issue/PR — slow) · `--comments linked|all|none` (linked = only comments that reference `#N`/`@someone`, default for graph/show; all = default for tui) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN` (cache TTL, default 15) · `--refresh` · `-w N` (title width) · `-t zh|all|none` (translation, default zh) · `-S` (comment summaries) · `--color auto|always|never` · `--theme dark|light|basic` · TUI only: `--depth N` (initial fold depth, 1), `--days N` (home window, 7), `--no-home`, `--no-summary`.
+Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; only the perspective changes, not the gh login) · `--state open|all` (all fetches every issue/PR — slow) · `--comments linked|all|none` (linked = only comments that reference `#N`/`@someone`, default for graph/show; all = default for tui) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN` (cache TTL, default 15) · `--refresh` · `-w N` (title width) · `-t zh|all|none` (translation, default zh) · `-S` (comment summaries) · `--color auto|always|never` · `--theme dark|light|basic` · TUI only: `--depth N` (initial fold depth, 1), `--days N` (home window, 7), `--no-summary`.
 
 ## Settings (`gg config`)
 
@@ -58,6 +58,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | models (real `claude` only) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
+| `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.33` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
 | `theme` | `GITGRAPH_THEME` | `dark` | colour theme, like vim's `bg=`: `dark` (256 colours), `light` (darker tones for a light background), `basic` (8 colours, no dim, no dark blue — PuTTY and other plain terminals). `--theme` for one run, `T` in the TUI to cycle |
 
 ## Line format
@@ -90,33 +91,51 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 
 ## TUI
 
-Starts on a **home** screen of sections (Enter/Space on a header folds it, `-`/`+` all, PgDn/PgUp jump between sections). "Me" = your gh accounts, or `me` / `-u`.
+lazygit-style layout: a side column of panels and a main panel that shows whatever is selected.
 
-| section | content |
-|---|---|
-| my turn | items I am in (author, commenter or mentioned) where someone else spoke last → `← @who +Nd » summary` |
-| mentioning @me | items that mention me, newest mention first |
-| opened in the last N days | `--days N` (default 7) |
-| active in the last N days | updated in that window but not newly opened |
-| waiting on others | I spoke last (or I opened it and nobody commented) |
-| opened by me / open PRs by others / stale (30 days) / all open | as named |
+```
+╭─1 Repo──────────────────────╮╭─0 Main [content] tree log answer──────────────────────╮
+│ owner/name  57 open  15:44  ││ #750 [PR] mtfs: running out of space must not …       │
+│ item: 2026-08-13 #750 [PR] …││ @Daejun7Park  2026-08-13  updated 2026-08-19          │
+╰─────────────────────────────╯│                                                       │
+╭─2 Home ‹ my turn 2 › 1/9────╮│ Running the device out of space under concurrent …   │
+│ 2026-08-17 #763 [I] xfstest…││                                                       │
+╭─3 Links─────────────────────╮│                                                       │
+│ → refs 2026-08-13 #748 [I] …││                                                       │
+╭─4 Comments [all] linked─────╮│                                                       │
+│ +0d o @Daejun7Park » …      ││                                                       │
+╭─5 People────────────────────╮│                                                       │
+│ @Daejun7Park  author        ││                                                       │
+╰─────────────────────────────╯╰───────────────────────────────────────────────────────╯
+ ⏎ open item  [ ] section  / search  a ask  o browser   1-5 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit
+```
 
-Enter opens a tree around the item; Tab switches to the full overview (`--no-home` starts there). Trees start folded to `--depth N` (default 1); nodes carry `▾` open / `▸` folded (`[+N]` hidden lines) / `·` leaf. Translation and summaries run in the background for the rows on screen first (`batch` per call), then the rest; folded nodes are processed when unfolded. The preview pane at the bottom shows the full text of the row under the cursor; a question's answer appears in a panel on the right half. The legend sits in the top-right box (`L` hides it). Open items only.
+| panel | shows | Enter |
+|---|---|---|
+| 1 Repo | repo, open count, fetch time, "me", current item, toggles, token usage, background progress | – |
+| 2 Home | one section at a time (`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — same rules as before ("my turn" = items I am in where someone else spoke last, `--days N` window, "me" = gh accounts / `-u` / `u`) | make it the **current item** — Links, Comments, People and the tree follow |
+| 3 Links | every edge of the current item and its comments: `→ refs`, `← cited-by`, `→ closes`, `← closed-by` (via which comment) | go to that item (back with `b`/Esc) |
+| 4 Comments | the current item's comments `+Nd o @who » summary` (`[` `]` all / linked) | read it in main |
+| 5 People | author, commenters and mentioned people of the current item | view Home as that person |
+| 0 Main | tabs (`[` `]`): **content** = full text of the row under the cursor in the focused side panel (body + metadata, or a comment); **tree** / **log** = the graph around the current item (`--hops`, fold with Space/←/→, `-`/`=`, Enter re-roots, `⇢` lines jump, `▾ ▸ ·` marks); **answer** = the last `a` question | tree: re-root on the node |
+
+Layout: side column `side_width` (0.33) of the screen; the focused side panel is taller (`expand_focused`, `expanded_weight`); `+`/`_` cycle screen modes normal → half (the focused panel fills its column) → full (only that panel); narrow terminals (≤ 84 columns) stack the focused side panel above the main panel; borders `border` (rounded · single · double · bold · hidden). Translation and summaries run in the background for the visible rows first (`batch` per call); `» summarizing…` marks a pending one.
 
 | key | action |
 |---|---|
-| `↑`/`k` `↓`/`j` PgUp PgDn `g`/`G` | move (home: PgDn/PgUp = next/previous section) |
-| Space, `←`/`→` · `1`~`9` · `-`/`+` | fold/unfold · unfold to that depth · depth 1 / all |
-| Enter | node: tree around it (re-root) · `⇢`/`mentions` line: jump to the linked node |
-| Tab | home ↔ overview |
-| Backspace / `b` / `h` / Esc · `f` | back (restores view, root, folds, cursor and perspective; with the preview or answer panel focused: just leave it) · forward |
-| `v` · `J`/`K` · `w` · `{`/`}` | preview pane: hide/show · scroll · focus (pane grows; ↑↓ PgUp PgDn g G scroll, `w`/Esc back; `w` cycles list → preview → answer panel) · height |
-| `a` · `A` | ask claude about the row · hide/show the answer panel |
-| `d` · `o` | details pager · open in the browser |
-| `u` | view home as another person (the previous one goes on the back stack) |
-| `l` `c` `p` `t` `s` `H` `r` | tree/log · comments mode · people nodes · translation · summaries · hops 1/2/3 · refetch |
-| `/` `n` `N` · `<` `>` · `L` · `$` · `T` · `?` · `q` | search · horizontal scroll · legend · token usage · cycle the colour theme (dark → light → basic) · help · quit |
-| mouse | click = cursor; click `▾/▸` = fold; click a section header = fold; double-click = Enter (on a `@login`: view as that person); right click = open in browser; back/forward buttons = back/forward; click preview/answer panel = focus; wheel = scroll that area without moving the cursor |
+| `1`-`5` · `0` · Tab / Shift-Tab | jump to a panel · main · cycle |
+| `[` `]` | previous / next tab of the focused panel |
+| `+` `_` | screen mode normal → half → full |
+| `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | move · page · top/bottom · scroll sideways |
+| `K` `J` | scroll the main panel from anywhere |
+| Enter | see the table above |
+| Space, `←`/`→` · `-` `=` | fold / unfold a tree node · fold to depth 1 / unfold all |
+| `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser |
+| Esc / `b` · `f` | back (previous item and perspective) · forward |
+| `u` · `r` | view Home as another person · refetch |
+| `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
+| `/` `n` `N` · `T` · `$` · `?` · `q` | search in the focused panel · colour theme · token usage · help · quit |
+| mouse | click = focus + select; double-click = Enter (on `▾/▸` in the tree: fold); right click = open in browser; wheel = scroll that panel without moving the cursor; back/forward buttons |
 
 Under tmux enable mouse reporting (`set -g mouse on`).
 
