@@ -19,6 +19,12 @@ git repo 안(또는 repo들이 모여 있는 상위 dir)에서 실행하면 `ori
 
 환경변수: `GITGRAPH_REPOS`, `GITGRAPH_ME`("나"로 볼 login들), `GITGRAPH_LANG`(기본 Korean), `GITGRAPH_TRANSLATE`(zh|all|none), `GITGRAPH_TR_MODEL`(haiku), `GITGRAPH_ASK_MODEL`(sonnet), `GITGRAPH_BATCH`(10).
 
+## 설정 (`gg config`)
+
+`gg config`는 모든 설정과 출처를 보여주고, `gg config KEY VALUE`는 `~/.config/gitgraph/config.json`에 저장, `gg config unset KEY`는 삭제. 우선순위: CLI 옵션 > 환경변수 > config 파일 > 기본값. 키: `claude_bin`, `repos`, `me`, `lang`, `translate`, `tr_model`, `ask_model`, `batch`, `retries`(각각 `GITGRAPH_*` 환경변수도 있음, `gg config`에 표시).
+
+`claude_bin`으로 번역·요약·질문 호출을 Claude 호환 변종에 맡길 수 있다(예: `gg config claude_bin cla`). `claude`와 같은 인자(`-p --no-session-persistence --output-format json <prompt>`)를 받되 **`--model`은 붙이지 않는다** — 변종은 자기 기본 모델을 쓰고, `tr_model` / `ask_model`은 진짜 `claude`에만 적용된다.
+
 ## 사용법
 
 ```

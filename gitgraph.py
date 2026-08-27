@@ -7,6 +7,7 @@ Usage:
   gg show 777                             details of one node
   gg tui [777]                            interactive curses browser (cursor keys, mouse, fold, focus, search, ask)
   gg update                               update this installation from GitHub
+  gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
 """
@@ -22,14 +23,78 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
-ENV_REPOS = [r.strip() for r in os.environ.get("GITGRAPH_REPOS", "").split(",") if r.strip()]
+CONFIG_PATH = os.path.expanduser("~/.config/gitgraph/config.json")
+# key -> (env var, default, help)
+CONFIG_KEYS = {
+    "claude_bin": ("GITGRAPH_CLAUDE", "claude", "binary used for translation / summaries / questions; a variant such as "
+                                               "`cla` gets the same arguments except --model (its own default model is used)"),
+    "repos": ("GITGRAPH_REPOS", "", "default repos, comma separated (owner/name or host/owner/name)"),
+    "me": ("GITGRAPH_ME", "", "logins that count as \"me\", comma separated (default: gh accounts)"),
+    "lang": ("GITGRAPH_LANG", "Korean", "language for translations, summaries and answers"),
+    "translate": ("GITGRAPH_TRANSLATE", "zh", "zh | all | none"),
+    "tr_model": ("GITGRAPH_TR_MODEL", "haiku", "model for translation / summaries (claude only)"),
+    "ask_model": ("GITGRAPH_ASK_MODEL", "sonnet", "model for `a` / `gg ask` (claude only)"),
+    "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
+    "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+CONFIG = load_config()
+
+
+def cfg(key):
+    """CLI option (handled by the caller) > environment variable > config file > built-in default."""
+    env, default, _ = CONFIG_KEYS[key]
+    return os.environ.get(env) or str(CONFIG.get(key, "") or "") or default
+
+
+def config_cmd(args):
+    """gg config            show everything and where each value comes from
+       gg config KEY VALUE  store VALUE in ~/.config/gitgraph/config.json
+       gg config KEY        show one value
+       gg config unset KEY  remove it from the file"""
+    if not args:
+        for k, (env, default, help_) in CONFIG_KEYS.items():
+            src = "env" if os.environ.get(env) else ("config" if CONFIG.get(k) else "default")
+            print(f"{k:12} = {cfg(k) or '(empty)':24} [{src:7}]  {help_}")
+        print(f"\nfile: {CONFIG_PATH}   (env var wins over the file; CLI options win over both)")
+        return 0
+    if args[0] == "unset":
+        key = args[1] if len(args) > 1 else ""
+        if key not in CONFIG_KEYS:
+            print(f"unknown key {key!r}; keys: {', '.join(CONFIG_KEYS)}", file=sys.stderr)
+            return 1
+        CONFIG.pop(key, None)
+    else:
+        key = args[0]
+        if key not in CONFIG_KEYS:
+            print(f"unknown key {key!r}; keys: {', '.join(CONFIG_KEYS)}", file=sys.stderr)
+            return 1
+        if len(args) == 1:
+            print(cfg(key))
+            return 0
+        CONFIG[key] = " ".join(args[1:])
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(CONFIG, f, indent=2, ensure_ascii=False)
+    print(f"{key} = {cfg(key) or '(unset)'}   -> {CONFIG_PATH}")
+    return 0
+ENV_REPOS = [r.strip() for r in cfg("repos").split(",") if r.strip()]
 PAGE = 50
-ME = [m.strip().lower() for m in os.environ.get("GITGRAPH_ME", "").split(",") if m.strip()]
-ENRICH_BATCH = int(os.environ.get("GITGRAPH_BATCH", "10"))   # tui: nodes per translate/summary call
+ME = [m.strip().lower() for m in cfg("me").split(",") if m.strip()]
+ENRICH_BATCH = int(cfg("batch"))   # tui: nodes per translate/summary call
 
 
 def log(msg):
@@ -187,7 +252,7 @@ def gh_token(user, host=DEFAULT_HOST):
 
 TRANSIENT_RE = re.compile(r"TLS handshake timeout|connection reset|i/o timeout|timeout|EOF|"
                           r"temporarily unavailable|no such host|HTTP 5\d\d|502|503|504", re.I)
-GH_RETRIES = int(os.environ.get("GITGRAPH_RETRIES", "3"))
+GH_RETRIES = int(cfg("retries"))
 
 
 def gh_api(args, body, env):
@@ -497,9 +562,15 @@ def ts(s):
 # --------------------------------------------------------------------------
 HAN_RE = re.compile(r"[一-鿿㐀-䶿]")
 HANGUL_RE = re.compile(r"[가-힣]")
-TR_LANG = os.environ.get("GITGRAPH_LANG", "Korean")
-TR_MODEL = os.environ.get("GITGRAPH_TR_MODEL", "haiku")
-DEFAULT_TRANSLATE = os.environ.get("GITGRAPH_TRANSLATE", "zh")
+TR_LANG = cfg("lang")
+TR_MODEL = cfg("tr_model")
+DEFAULT_TRANSLATE = cfg("translate")
+CLAUDE_BIN = cfg("claude_bin")
+IS_CLAUDE = os.path.basename(CLAUDE_BIN) == "claude"   # a variant binary keeps its own default model (no --model)
+
+
+def model_label(model):
+    return f"{os.path.basename(CLAUDE_BIN)} {model}" if IS_CLAUDE else os.path.basename(CLAUDE_BIN)
 TR_BATCH = 60
 PENDING_TEXT = "요약 중…" if TR_LANG.lower().startswith("korean") else "summarizing…"
 TR_PROMPT = """Translate every string in the JSON array below into {lang}. Rules:
@@ -530,12 +601,17 @@ USAGE_T0 = time.time()
 def claude_call(prompt, model, phase, timeout=300):
     """Run `claude -p` (Claude Code login, no API key); return the reply text and add its usage to USAGE."""
     # no --bare: bare mode skips the stored login and answers "Not logged in"
-    r = subprocess.run(["claude", "-p", "--no-session-persistence", "--output-format", "json", "--model", model, prompt],
-                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json"]
+    if IS_CLAUDE:
+        cmd += ["--model", model]          # a variant binary (gg config claude_bin cla) keeps its own default model
+    try:
+        r = subprocess.run(cmd + [prompt], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise ValueError(f"{CLAUDE_BIN} not found (gg config claude_bin …)") from None
     try:
         d = json.loads(r.stdout)
     except json.JSONDecodeError:
-        raise ValueError((r.stderr or r.stdout or "").strip()[:300] or f"claude exited {r.returncode}") from None
+        raise ValueError((r.stderr or r.stdout or "").strip()[:300] or f"{CLAUDE_BIN} exited {r.returncode}") from None
     u = d.get("usage") or {}
     rec = USAGE["by"].setdefault(phase, {"calls": 0, "input": 0, "cache_read": 0, "cache_create": 0, "output": 0, "cost_usd": 0.0})
     for tgt in (USAGE, rec):
@@ -624,7 +700,7 @@ def summarize_comments(entries, lang=TR_LANG):
         batches.append(cur)
     done = 0
     for bi, batch in enumerate(batches, 1):
-        log(f"summarizing {len(batch)} comments in {lang} via claude -p --model {TR_MODEL}")
+        log(f"summarizing {len(batch)} comments in {lang} via {model_label(TR_MODEL)}")
         progress("summarize", done, len(need), f"batch {bi}/{len(batches)}, {len(batch)} comments")
         done += len(batch)
         prompt = SUM_PROMPT.format(lang=lang, payload=json.dumps([d for k, d in batch], ensure_ascii=False))
@@ -642,7 +718,7 @@ def summarize_comments(entries, lang=TR_LANG):
     return out
 
 
-ASK_MODEL = os.environ.get("GITGRAPH_ASK_MODEL", "sonnet")
+ASK_MODEL = cfg("ask_model")
 ASK_MAX_CHARS = 60000
 ASK_PROMPT = """You are helping a developer read a GitHub {kind}. Answer the question using only the material below; \
 if it cannot be answered from it, say so. Answer in {lang}; keep identifiers, code, file names, #numbers and technical \
@@ -734,7 +810,7 @@ def translate_texts(texts, lang=TR_LANG):
             need.append(t)
     for i in range(0, len(need), TR_BATCH):
         batch = need[i:i + TR_BATCH]
-        log(f"translating {len(batch)} strings to {lang} via claude -p --model {TR_MODEL}")
+        log(f"translating {len(batch)} strings to {lang} via {model_label(TR_MODEL)}")
         progress("translate", i, len(need), f"{len(batch)} strings in this batch")
         prompt = TR_PROMPT.format(lang=lang, payload=json.dumps(batch, ensure_ascii=False))
         try:
@@ -1545,7 +1621,7 @@ def tr_note(g):
         parts.append(f"{g.translated} titles/excerpts translated to {TR_LANG}")
     if getattr(g, "summarized", 0):
         parts.append(f"{g.summarized} comments summarized")
-    return f"   ({', '.join(parts)} by claude {TR_MODEL})" if parts else ""
+    return f"   ({', '.join(parts)} by {model_label(TR_MODEL)})" if parts else ""
 
 
 def overview_rows(g, layout, width, collapsed=frozenset(), title=None, marks=False, legend=True):
@@ -1830,12 +1906,13 @@ class Tui:
         sp = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time() * 8) % 10]
         if self.ask_thread is not None and self.ask_thread.is_alive():
             el = int(time.time() - self.ask_state["t0"])
-            return f"{sp} asking claude {ASK_MODEL} about {self.ask_state['label']}: {trunc(self.ask_state['q'], 60)}  {el}s"
+            return f"{sp} asking {model_label(ASK_MODEL)} about {self.ask_state['label']}: {trunc(self.ask_state['q'], 60)}  {el}s"
         p = self.progress or {}
         el = int(time.time() - self.t0)
         els = f"{el // 60}m{el % 60:02d}s" if el >= 60 else f"{el}s"
         names = {"fetch": "fetching issues/PRs", "stubs": "resolving referenced items",
-                 "translate": "translating titles (claude haiku)", "summarize": "summarizing comments (claude haiku)",
+                 "translate": f"translating titles ({model_label(TR_MODEL)})",
+                 "summarize": f"summarizing comments ({model_label(TR_MODEL)})",
                  "error": "error"}
         phase, done, total = p.get("phase", "starting"), p.get("done", 0), p.get("total")
         if total:
@@ -2293,7 +2370,7 @@ class Tui:
         import threading
         self.ask_state = {"nid": nid, "label": label, "q": q, "t0": time.time(), "answer": None, "error": None}
         st = self.ask_state
-        self.side = {"title": f"asking claude {ASK_MODEL} · {label}", "text": f"Q: {q}\n\n(waiting for the answer…)"}
+        self.side = {"title": f"asking {model_label(ASK_MODEL)} · {label}", "text": f"Q: {q}\n\n(waiting for the answer…)"}
         self.side_on, self.side_scroll = True, 0
 
         def work():
@@ -2311,7 +2388,7 @@ class Tui:
         if not st or st["answer"] is None and st["error"] is None:
             self.msg = "no answer yet (a = ask)"
             return
-        self.side = {"title": f"claude {ASK_MODEL} · {st['label']}",
+        self.side = {"title": f"{model_label(ASK_MODEL)} · {st['label']}",
                      "text": f"Q: {st['q']}\n\n" + (st["answer"] or f"error: {st['error']}")}
         self.side_on, self.side_scroll, self.side_focus, self.pane_focus = True, 0, True, False
 
@@ -3012,9 +3089,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="graph",
                     help="graph (default) | ROOT (777 / #777 / owner/repo#777 / @login) | tui [ROOT] | show ID | "
-                         "ask ID \"question\" | update")
+                         "ask ID \"question\" | update | config [KEY [VALUE]]")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
+    ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"gg {VERSION}")
     ap.add_argument("--repo", "-r", action="append",
                     help="owner/name on github.com, or host/owner/name for GitHub Enterprise (repeatable)")
@@ -3045,10 +3123,12 @@ def main(argv=None):
     a = ap.parse_intermixed_args(argv)
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config") and ROOT_RE.match(a.cmd):
         a.root, a.cmd = a.cmd, "graph"   # `gg 777`
     if a.cmd == "update":
         return update()
+    if a.cmd == "config":
+        return config_cmd([x for x in (a.arg, a.question) if x is not None] + (a.extra or []))
     if a.cmd == "tui":
         try:
             repos = resolve_repos(a.repo, interactive=True)
@@ -3068,7 +3148,7 @@ def main(argv=None):
             if not a.arg or not a.question:
                 ap.error('ask needs an ID and a question: gg ask 4563 "why does it reference #3859?"')
             g = build_graph(a.repo, a.state, a.max_age, a.refresh)
-            log(f"asking claude {ASK_MODEL}…")
+            log(f"asking {model_label(ASK_MODEL)}…")
             print(ask_claude(g, resolve_root(g, a.arg), a.question))
         elif a.cmd == "show":
             if not a.arg:

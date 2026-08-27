@@ -19,6 +19,12 @@ Run it inside a git repo (or a directory that contains repos): the GitHub repo i
 
 Environment: `GITGRAPH_REPOS`, `GITGRAPH_ME` (logins that count as "me"), `GITGRAPH_LANG` (default Korean), `GITGRAPH_TRANSLATE` (zh|all|none), `GITGRAPH_TR_MODEL` (haiku), `GITGRAPH_ASK_MODEL` (sonnet), `GITGRAPH_BATCH` (10).
 
+## Settings (`gg config`)
+
+`gg config` shows every setting and where it comes from; `gg config KEY VALUE` stores it in `~/.config/gitgraph/config.json`; `gg config unset KEY` removes it. Precedence: CLI option > environment variable > config file > default. Keys: `claude_bin`, `repos`, `me`, `lang`, `translate`, `tr_model`, `ask_model`, `batch`, `retries` (each also has a `GITGRAPH_*` variable, listed by `gg config`).
+
+`claude_bin` lets a Claude-compatible variant do the translation / summary / question calls, e.g. `gg config claude_bin cla`. It receives the same arguments as `claude` (`-p --no-session-persistence --output-format json <prompt>`) **except `--model`**: a variant keeps its own default model; `tr_model` / `ask_model` only apply to the real `claude`.
+
 ## Usage
 
 ```
