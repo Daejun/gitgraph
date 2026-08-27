@@ -22,7 +22,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -48,7 +48,30 @@ def progress(phase, done, total=None, detail=""):
 # --------------------------------------------------------------------------
 # repo discovery: git repos under the directory gg was started in
 # --------------------------------------------------------------------------
-_GH_URL_RE = re.compile(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+DEFAULT_HOST = "github.com"
+_REMOTE_RE = re.compile(r"^(?:https?://(?:[^@/]+@)?|ssh://(?:[^@/]+@)?|[^@/]+@)?(?P<host>[\w.-]+)(?::\d+)?[:/]"
+                        r"(?P<owner>[\w.-]+)/(?P<name>[\w.-]+?)(?:\.git)?/?$")
+
+
+def split_repo(repo):
+    """'owner/name' -> (github.com, owner, name); 'ghe.example.com/owner/name' -> (host, owner, name)."""
+    parts = repo.split("/")
+    if len(parts) >= 3:
+        return parts[0], parts[1], "/".join(parts[2:])
+    return DEFAULT_HOST, parts[0], parts[1] if len(parts) > 1 else ""
+
+
+def make_repo(host, owner, name):
+    return f"{owner}/{name}" if host == DEFAULT_HOST else f"{host}/{owner}/{name}"
+
+
+def qualify(repo, host):
+    """A bare 'owner/name' seen inside a repo on `host` belongs to that host."""
+    return repo if len(repo.split("/")) >= 3 or host == DEFAULT_HOST else f"{host}/{repo}"
+
+
+def repo_host(repo):
+    return split_repo(repo)[0]
 
 
 def discover_repos(root, depth=2):
@@ -71,11 +94,11 @@ def discover_repos(root, depth=2):
     best = {}   # repo -> dir (shallowest wins; a dir named like the repo wins ties)
     for d in dict.fromkeys(dirs):
         r = subprocess.run(["git", "-C", d, "remote", "get-url", "origin"], capture_output=True, text=True)
-        m = _GH_URL_RE.search(r.stdout.strip()) if r.returncode == 0 else None
+        m = _REMOTE_RE.match(r.stdout.strip()) if r.returncode == 0 else None
         if not m:
             continue
-        repo = f"{m.group(1)}/{m.group(2)}"
-        rank = (d.count(os.sep), os.path.basename(d) != m.group(2), d)
+        repo = make_repo(m.group("host"), m.group("owner"), m.group("name"))
+        rank = (d.count(os.sep), os.path.basename(d) != m.group("name"), d)
         if repo not in best or rank < best[repo][0]:
             best[repo] = (rank, d)
     return sorted(((repo, d) for repo, (rank, d) in best.items()), key=lambda x: best[x[0]][0])
@@ -128,40 +151,37 @@ class GhError(Exception):
     pass
 
 
-_accounts = None
+_accounts = None   # host -> [login, ...] (active first)
 _tokens = {}
 
 
-def gh_accounts():
-    """Return login names known to gh, active account first."""
+def gh_accounts(host=None):
+    """Login names gh knows for `host` (active first); host=None -> every host, github.com first."""
     global _accounts
-    if _accounts is not None:
-        return _accounts
-    r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
-    out = r.stdout + r.stderr
-    accts, active = [], None
-    cur = None
-    for line in out.splitlines():
-        m = re.search(r"Logged in to \S+ account (\S+)", line)
-        if m:
-            cur = m.group(1)
-            accts.append(cur)
-        elif "Active account: true" in line and cur:
-            active = cur
-    if active in accts:
-        accts.remove(active)
-        accts.insert(0, active)
-    _accounts = accts
-    return accts
+    if _accounts is None:
+        r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        by_host, cur = {}, None
+        for line in (r.stdout + r.stderr).splitlines():
+            m = re.search(r"Logged in to (\S+) account (\S+)", line)
+            if m:
+                cur = (m.group(1), m.group(2))
+                by_host.setdefault(cur[0], []).append(cur[1])
+            elif "Active account: true" in line and cur:
+                by_host[cur[0]].remove(cur[1])
+                by_host[cur[0]].insert(0, cur[1])
+        _accounts = by_host
+    if host:
+        return list(_accounts.get(host, []))
+    return list(_accounts.get(DEFAULT_HOST, [])) + [a for h, l in _accounts.items() if h != DEFAULT_HOST for a in l]
 
 
-def gh_token(user):
-    if user in _tokens:
-        return _tokens[user]
-    r = subprocess.run(["gh", "auth", "token", "-h", "github.com", "-u", user],
-                       capture_output=True, text=True)
+def gh_token(user, host=DEFAULT_HOST):
+    key = (host, user)
+    if key in _tokens:
+        return _tokens[key]
+    r = subprocess.run(["gh", "auth", "token", "-h", host, "-u", user], capture_output=True, text=True)
     tok = r.stdout.strip() or None
-    _tokens[user] = tok
+    _tokens[key] = tok
     return tok
 
 
@@ -184,24 +204,25 @@ def gh_api(args, body, env):
     return r
 
 
-def graphql(query, variables=None):
-    """Run a GraphQL query through `gh api graphql`.
+def graphql(query, variables=None, host=DEFAULT_HOST):
+    """Run a GraphQL query through `gh api graphql` against `host` (github.com or a GitHub Enterprise host).
 
     If the active account gets NOT_FOUND (private repo not visible), retry
-    with the other registered accounts; the account that works is moved to
-    the front for the rest of the process.
+    with the other accounts registered for that host; the account that works
+    is moved to the front for the rest of the process.
     """
-    accts = gh_accounts() or [None]
+    accts = gh_accounts(host) or [None]
     body = json.dumps({"query": query, "variables": variables or {}})
     last_err = None
     for i, acct in enumerate(accts):
         env = dict(os.environ)
         if acct:
-            tok = gh_token(acct)
+            tok = gh_token(acct, host)
             if not tok:
                 continue
             env["GH_TOKEN"] = tok
-        r = gh_api(["graphql", "--input", "-"], body, env)
+            env["GH_ENTERPRISE_TOKEN"] = tok
+        r = gh_api(["graphql", "--hostname", host, "--input", "-"], body, env)
         try:
             data = json.loads(r.stdout) if r.stdout.strip() else {}
         except json.JSONDecodeError:
@@ -212,8 +233,9 @@ def graphql(query, variables=None):
                 accts.insert(0, accts.pop(i))
             return data.get("data", {})
         types = {e.get("type") for e in errs}
-        if errs and types <= {"NOT_FOUND"} and data.get("data"):
-            # partial NOT_FOUND (e.g. one alias in a stub batch): usable
+        partial = data.get("data") or {}
+        if errs and types <= {"NOT_FOUND"} and any(v is not None for v in partial.values()):
+            # partial NOT_FOUND (e.g. one alias in a stub batch): usable; a null repository is not
             if i:
                 accts.insert(0, accts.pop(i))
             return data.get("data", {})
@@ -305,14 +327,17 @@ def _norm_item(repo, n, is_pr):
 
 
 def fetch_repo(repo, state):
-    owner, name = repo.split("/", 1)
+    host, owner, name = split_repo(repo)
     items = []
     for q, is_pr, states in ((Q_ISSUES, False, ["OPEN"]), (Q_PRS, True, ["OPEN"])):
         after = None
         while True:
             vars_ = {"owner": owner, "name": name, "after": after,
                      "states": states if state == "open" else None}
-            data = graphql(q, vars_)
+            data = graphql(q, vars_, host)
+            if not data.get("repository"):
+                raise GhError(f"{repo}: repository not found on {host} with any gh account "
+                              f"({', '.join(gh_accounts(host)) or 'none logged in'})")
             conn = data["repository"]["issues" if not is_pr else "pullRequests"]
             for n in conn["nodes"]:
                 items.append(_norm_item(repo, n, is_pr))
@@ -352,7 +377,7 @@ def resolve_stubs(repo, numbers, max_age_min):
     now = time.time()
     need = [n for n in numbers if str(n) not in cache
             or now - cache[str(n)].get("fetched_at", 0) > max_age_min * 60]
-    owner, name = repo.split("/", 1)
+    host, owner, name = split_repo(repo)
     for i in range(0, len(need), 50):
         batch = need[i:i + 50]
         progress("stubs", i, len(need), repo)
@@ -363,7 +388,7 @@ def resolve_stubs(repo, numbers, max_age_min):
             for n in batch)
         q = f'query {{ repository(owner:"{owner}", name:"{name}") {{ {aliases} }} }}'
         try:
-            data = graphql(q)
+            data = graphql(q, host=host)
         except GhError as e:
             log(f"stub resolve failed for {repo}: {e}")
             break
@@ -387,7 +412,7 @@ def resolve_stubs(repo, numbers, max_age_min):
 # --------------------------------------------------------------------------
 FENCE_RE = re.compile(r"```.*?```", re.S)
 REF_RE = re.compile(r"(?<![\w/])(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<num>\d+)\b")
-URL_RE = re.compile(r"https?://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/(?P<num>\d+)")
+URL_RE = re.compile(r"https?://(?P<host>[A-Za-z0-9.-]+)/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/(?P<num>\d+)")
 MENTION_RE = re.compile(r"(?<![\w/`])@(?P<login>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))(?![\w-])")
 # lines that are pasted kernel logs / stack traces: "#14" there is a build number, not an issue
 NOISE_LINE_RE = re.compile(
@@ -418,18 +443,22 @@ def _plausible_small_ref(line, m, is_url=False):
 
 def parse_refs(text, default_repo):
     out = []
+    host = repo_host(default_repo)
     for line in _clean_lines(text):
         for m in URL_RE.finditer(line):
             num = int(m.group("num"))
             if num <= SMALL_REF and not _plausible_small_ref(line, m, is_url=True):
                 continue
-            out.append((m.group("repo"), num))
+            h = m.group("host").lower()
+            if h.startswith("www."):
+                h = h[4:]
+            out.append((make_repo(h, *m.group("repo").split("/", 1)), num))
         line = URL_RE.sub(" ", line)
         for m in REF_RE.finditer(line):
             num = int(m.group("num"))
             if num <= SMALL_REF and not _plausible_small_ref(line, m):
                 continue
-            out.append((m.group("repo") or default_repo, num))
+            out.append((qualify(m.group("repo"), host) if m.group("repo") else default_repo, num))
     seen, res = set(), []
     for r in out:
         if r[1] > 0 and r not in seen:
@@ -889,7 +918,7 @@ def build_graph(repos, state, max_age_min, refresh=False):
         for login in parse_mentions(it["body"]):
             g.add_edge(iid, g.ensure_person(login).id, "mention")
         for c in it["closes"]:
-            t = g.ensure_item(c["repo"], c["number"])
+            t = g.ensure_item(qualify(c["repo"], repo_host(it["repo"])), c["number"])
             g.add_edge(iid, t.id, "closes")
             parsed_pairs.add((iid, t.id))
         for c in it["comments"]:
@@ -908,7 +937,7 @@ def build_graph(repos, state, max_age_min, refresh=False):
     for it in all_items:
         iid = g.item_id(it["repo"], it["number"])
         for x in it["crossrefs"]:
-            s = g.ensure_item(x["repo"], x["number"], is_pr=x["is_pr"], title=x["title"],
+            s = g.ensure_item(qualify(x["repo"], repo_host(it["repo"])), x["number"], is_pr=x["is_pr"], title=x["title"],
                               state=x["state"], draft=x["draft"], created=x["created"], author=x["author"])
             if (s.id, iid) not in parsed_pairs:
                 g.add_edge(s.id, iid, "ref")
@@ -1016,7 +1045,7 @@ def subgraph(g, ids):
     return h
 
 
-ROOT_RE = re.compile(r"^(?:@[A-Za-z0-9][A-Za-z0-9-]*|(?:(?P<repo>[\w.-]+/[\w.-]+))?#?(?P<num>\d+))$")
+ROOT_RE = re.compile(r"^(?:@[A-Za-z0-9][A-Za-z0-9-]*|(?:(?P<repo>(?:[\w.-]+/)+[\w.-]+))?#?(?P<num>\d+))$")
 
 
 def resolve_root(g, root):
@@ -1031,7 +1060,7 @@ def resolve_root(g, root):
         m = None
     if not m:
         raise ValueError(f"cannot parse root {root!r}: use 777, #777, owner/repo#777 or @login")
-    nid = g.item_id(m.group("repo") or g.primary, int(m.group("num")))
+    nid = g.item_id(qualify(m.group("repo"), repo_host(g.primary)) if m.group("repo") else g.primary, int(m.group("num")))
     if nid not in g.nodes:
         raise ValueError(f"{nid} is not in the loaded graph (state filter / other repo?)")
     return nid
@@ -2198,10 +2227,11 @@ class Tui:
         if not n:
             return None
         if n.kind == "person":
-            return f"https://github.com/{n.title}"
+            return f"https://{repo_host(self.g.primary)}/{n.title}"
         if n.url:
             return n.url
-        return f"https://github.com/{n.repo}/issues/{n.number}"
+        host, owner, name = split_repo(n.repo)
+        return f"https://{host}/{owner}/{name}/issues/{n.number}"
 
     def open_browser(self):
         url = self.node_url(self.current_nid())
@@ -2983,7 +3013,8 @@ def main(argv=None):
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("--version", action="version", version=f"gg {VERSION}")
-    ap.add_argument("--repo", "-r", action="append", help="owner/name (repeatable)")
+    ap.add_argument("--repo", "-r", action="append",
+                    help="owner/name on github.com, or host/owner/name for GitHub Enterprise (repeatable)")
     ap.add_argument("--user", "-u", help="view as this GitHub login: 'me' for the tui home lists (my turn / mentions / "
                                          "mine / waiting). Only the perspective changes, not the gh login.")
     ap.add_argument("--layout", "-l", choices=["tree", "log"], default="tree")

@@ -100,6 +100,10 @@ Enter로 그 항목 중심 tree, Tab으로 전체 overview(`--no-home`이면 ove
 
 `claude -p --output-format json`의 usage를 프로세스 시작 시점부터 누적한다. TUI 제목줄에 `tokens 31.2k in / 1.4k out · $0.052 · 7 calls`, `$` 키로 phase(translate / summarize / ask)별 표. CLI는 호출이 있었을 때 종료 시 stderr에 한 줄. 캐시 hit은 호출이 없으므로 0.
 
+## GitHub Enterprise
+
+GHE의 repo는 `host/owner/name`으로 쓴다(`-r ghe.example.com/team/proj`, 또는 `git@ghe.example.com:team/proj.git` 같은 remote에서 자동 인식). `gh auth login -h ghe.example.com`이 돼 있어야 하고, API 호출은 `gh api --hostname`과 그 host에 등록된 계정·토큰을 쓴다. 본문의 참조(`#N`, `owner/name#N`, URL)는 그 항목의 host 기준으로 해석한다. 실제 Enterprise 인스턴스에서는 아직 검증하지 못했으니 안 되는 부분이 있으면 알려 달라.
+
 ## 계정, 캐시
 
 private repo가 `NOT_FOUND`면 `gh auth status`에 등록된 다른 계정 토큰으로 자동 재시도한다(전역 계정 전환 없음). 캐시: `~/.cache/gitgraph/`(repo별 항목, 번역, 요약; `--max-age`분, `--refresh`로 강제). TUI 로그는 `~/.cache/gitgraph/tui.log`.

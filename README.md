@@ -100,6 +100,10 @@ Enter opens a tree around the item; Tab switches to the full overview (`--no-hom
 
 Usage reported by `claude -p --output-format json` is accumulated from process start: the TUI title bar shows `tokens 31.2k in / 1.4k out · $0.052 · 7 calls`, `$` shows a per-phase table (translate / summarize / ask); the CLI prints one line on stderr at exit when any call was made. Cache hits cost nothing.
 
+## GitHub Enterprise
+
+Repos on a GitHub Enterprise host are written `host/owner/name` (e.g. `-r ghe.example.com/team/proj`, or found automatically from a remote such as `git@ghe.example.com:team/proj.git`). `gh auth login -h ghe.example.com` must have been done; API calls use `gh api --hostname`, and the accounts/tokens gh holds for that host. References in bodies (`#N`, `owner/name#N`, full URLs) resolve to the item's own host. Not yet tested against a real Enterprise instance — please report what breaks.
+
 ## Accounts, cache
 
 If a private repo answers `NOT_FOUND`, the other accounts registered in `gh auth status` are tried automatically (no global account switch). Cache: `~/.cache/gitgraph/` (items per repo, translations, summaries; `--max-age` minutes, `--refresh` to force). TUI logs go to `~/.cache/gitgraph/tui.log`.
