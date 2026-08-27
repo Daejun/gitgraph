@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -40,6 +40,7 @@ CONFIG_KEYS = {
     "ask_model": ("GITGRAPH_ASK_MODEL", "sonnet", "model for `a` / `gg ask` (claude only)"),
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
+    "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
 }
 
 
@@ -1269,13 +1270,73 @@ EDGE_STYLE = {"→ closes": "closes", "← closed-by": "closedby", "→ refs": "
 # --------------------------------------------------------------------------
 # styling: split a row into (text, style) segments; CLI maps styles to ANSI, TUI to curses attrs
 # --------------------------------------------------------------------------
-STYLE_ANSI = {
-    "pre": "\033[2m", "link": "\033[2m", "head": "\033[1m", "meta": "\033[2m", "stub": "\033[2m",
-    "out": "\033[34m", "in": "\033[35m", "closes": "\033[1;34m", "closedby": "\033[1;35m",
-    "issue": "\033[1;32m", "pr": "\033[1;94m", "draft": "\033[94m", "merged": "\033[1;35m", "closed": "\033[1;31m",
-    "comment": "\033[36m", "person": "\033[33m", "fold": "\033[1;33m",
-    "sum": "\033[38;5;180m", "pending": "\033[2;3m",
+# style -> (fg256, fg8, bold, dim); fg None = default colour.  people: (256-colour list, 8-colour list)
+THEMES = {
+    "dark": {   # dark background, 256 colours (default)
+        "pre": (None, None, False, True), "link": (None, None, False, True), "meta": (None, None, False, True),
+        "stub": (None, None, False, True), "pending": (None, None, False, True), "head": (None, None, True, False),
+        "out": (4, 4, False, False), "in": (5, 5, False, False), "closes": (4, 4, True, False), "closedby": (5, 5, True, False),
+        "issue": (2, 2, True, False), "pr": (12, 4, True, False), "draft": (12, 4, False, False),
+        "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
+        "fold": (3, 3, True, False), "sum": (180, 3, False, False),
+        "people": ([39, 208, 42, 205, 226, 51, 141, 203, 118, 214, 81, 171, 190, 99, 209, 45], [1, 2, 3, 4, 5, 6]),
+    },
+    "light": {  # light background: darker tones, grey instead of dim
+        "pre": (8, 8, False, False), "link": (8, 8, False, False), "meta": (8, 8, False, False),
+        "stub": (8, 8, False, False), "pending": (8, 8, False, False), "head": (None, None, True, False),
+        "out": (4, 4, False, False), "in": (5, 5, False, False), "closes": (4, 4, True, False), "closedby": (5, 5, True, False),
+        "issue": (22, 2, True, False), "pr": (4, 4, True, False), "draft": (4, 4, False, False),
+        "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (30, 6, False, False),
+        "fold": (130, 3, True, False), "sum": (94, 3, False, False),
+        "people": ([18, 88, 22, 90, 130, 24, 54, 94, 28, 124, 30, 91, 52, 58, 23, 89], [1, 2, 3, 4, 5, 6]),
+    },
+    "basic": {  # 8 colours only, no dim, no dark blue: PuTTY and other plain terminals
+        "pre": (8, 8, False, False), "link": (8, 8, False, False), "meta": (8, 8, False, False),
+        "stub": (8, 8, False, False), "pending": (8, 8, False, False), "head": (None, None, True, False),
+        "out": (6, 6, False, False), "in": (5, 5, False, False), "closes": (6, 6, True, False), "closedby": (5, 5, True, False),
+        "issue": (2, 2, True, False), "pr": (3, 3, True, False), "draft": (3, 3, False, False),
+        "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
+        "fold": (7, 7, True, False), "sum": (7, 7, False, False),
+        "people": ([2, 3, 5, 6, 1, 7], [2, 3, 5, 6, 1, 7]),
+    },
 }
+THEME = cfg("theme") if cfg("theme") in THEMES else "dark"
+PERSON_COLOR = {}   # login (lower) -> palette index, assigned in order of first appearance
+_LOGIN_RE = re.compile(r"@[A-Za-z0-9][A-Za-z0-9-]*")
+
+
+def person_index(login):
+    key = login.lower().lstrip("@")
+    if key not in PERSON_COLOR:
+        PERSON_COLOR[key] = len(PERSON_COLOR)
+    return PERSON_COLOR[key]
+
+
+def term_256():
+    return THEME != "basic" and (os.environ.get("TERM", "").endswith("256color") or bool(os.environ.get("COLORTERM")))
+
+
+def style_spec(st):
+    """(fg, bold, dim) for a style under the current theme; fg is a colour number or None."""
+    th = THEMES[THEME]
+    if st.startswith("person:"):
+        pal = th["people"][0 if term_256() else 1]
+        return pal[person_index(st[7:]) % len(pal)], False, False
+    spec = th.get(st)
+    if not spec:
+        return None, False, False
+    fg256, fg8, bold, dim = spec
+    return (fg256 if term_256() else fg8), bold, dim
+
+
+def ansi_style(st):
+    fg, bold, dim = style_spec(st)
+    codes = (["1"] if bold else []) + (["2"] if dim else [])
+    if fg is not None:
+        codes.append(f"3{fg}" if fg < 8 else f"9{fg - 8}" if fg < 16 else f"38;5;{fg}")
+    return f"\033[{';'.join(codes)}m" if codes else ""
+
+
 _PRE_TREE = re.compile(r"^[│ ]*[├└]─ ")
 _PRE_LOG = re.compile(r"^[|*o@ \\/_]+  ")
 _COMMENT_HEAD = re.compile(r"^(?:\S+ )?o @\S+(?: \[[^\]]*\])? ")
@@ -1343,19 +1404,6 @@ def segments(row, g):
     return [x for x in segs if x[0]]
 
 
-PERSON_PALETTE_256 = [39, 208, 42, 205, 226, 51, 141, 203, 118, 214, 81, 171, 190, 99, 209, 45]
-PERSON_PALETTE_8 = [1, 2, 3, 4, 5, 6]
-PERSON_COLOR = {}   # login (lower) -> palette index, assigned in order of first appearance
-_LOGIN_RE = re.compile(r"@[A-Za-z0-9][A-Za-z0-9-]*")
-
-
-def person_index(login):
-    key = login.lower().lstrip("@")
-    if key not in PERSON_COLOR:
-        PERSON_COLOR[key] = len(PERSON_COLOR)
-    return PERSON_COLOR[key]
-
-
 def colorize_people(segs):
     """Split @login tokens out of segments so each person gets a colour of their own."""
     out = []
@@ -1372,15 +1420,6 @@ def colorize_people(segs):
         if pos < len(text):
             out.append((text[pos:], st))
     return out
-
-
-def ansi_style(st):
-    if st.startswith("person:"):
-        i = person_index(st[7:])
-        if os.environ.get("TERM", "").endswith("256color") or os.environ.get("COLORTERM"):
-            return f"\033[38;5;{PERSON_PALETTE_256[i % len(PERSON_PALETTE_256)]}m"
-        return f"\033[3{PERSON_PALETTE_8[i % len(PERSON_PALETTE_8)]}m"
-    return STYLE_ANSI.get(st, "")
 
 
 def ansi_rows(rows, g):
@@ -1860,6 +1899,8 @@ HELP = """gg tui keys
                   click preview / answer panel = focus it;
                   wheel = scroll that area without moving the cursor; back / forward buttons = back / forward
   $               claude token usage since start (translate / summarize / ask; also in the title bar)
+  T               cycle the colour theme dark -> light -> basic (basic = 8 colours, no dim: PuTTY);
+                  make it stick with `gg config theme basic` or --theme
   ?               this help                 q  quit
 """
 
@@ -1895,18 +1936,13 @@ class Tui:
         self.scroll_free = False   # True after a wheel scroll: the view may leave the cursor off screen
         sys.stdout.write("\033[?1000h\033[?1006h")   # press/release reports in SGR form; parsed in read_key()
         sys.stdout.flush()
+        self.pairs = {}
         try:
             curses.start_color()
             curses.use_default_colors()
-            for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_MAGENTA, curses.COLOR_RED,
-                                   curses.COLOR_CYAN, curses.COLOR_YELLOW, curses.COLOR_BLUE), 1):
-                curses.init_pair(i, c, -1)
-            self.person_pal = PERSON_PALETTE_256 if curses.COLORS >= 256 else PERSON_PALETTE_8
-            for i, c in enumerate(self.person_pal):
-                curses.init_pair(20 + i, c, -1)
-            curses.init_pair(7, 180 if curses.COLORS >= 256 else curses.COLOR_YELLOW, -1)   # summaries
         except curses.error:
             pass
+        self.apply_theme()
         self.load(refresh=False)
 
     # ---- background work + progress ----
@@ -2428,7 +2464,7 @@ class Tui:
     def draw_side(self, x0, sw, height):
         c = self.curses
         for y in range(height):
-            self.put(y, x0 - 1, "│", c.A_DIM)
+            self.put(y, x0 - 1, "│", self.dim())
         lines = wrap(self.side["text"], sw - 1)
         body = height - 1
         self.side_scroll = max(0, min(self.side_scroll, max(len(lines) - body, 0)))
@@ -2441,7 +2477,7 @@ class Tui:
             if j >= len(lines):
                 break
             self.put(1 + i, x0, lines[j])
-        self.put(height - 1, x0, clip(hint, 0, sw - 1), c.A_DIM)
+        self.put(height - 1, x0, clip(hint, 0, sw - 1), self.dim())
 
     def search_next(self, direction):
         if not self.query:
@@ -2502,19 +2538,58 @@ class Tui:
         return out
 
     # ---- drawing ----
+    def apply_theme(self):
+        """(Re)build curses colour pairs for the current THEME (called at start and on T)."""
+        c = self.curses
+        self.pairs = {}
+        if not c.has_colors():
+            return
+        colors = c.COLORS
+        n = 1
+        for st in list(THEMES[THEME]) + ["people"]:
+            if st == "people":
+                pal = THEMES[THEME]["people"][0 if (colors >= 256 and THEME != "basic") else 1]
+                for i, fg in enumerate(pal):
+                    if fg < colors:
+                        try:
+                            c.init_pair(n, fg, -1)
+                            self.pairs[f"person#{i}"] = n
+                            n += 1
+                        except c.error:
+                            pass
+                continue
+            fg256, fg8, _, _ = THEMES[THEME][st]
+            fg = fg256 if (colors >= 256 and THEME != "basic") else fg8
+            if fg is None or fg >= colors:
+                continue
+            try:
+                c.init_pair(n, fg, -1)
+                self.pairs[st] = n
+                n += 1
+            except c.error:
+                pass
+
     def style_attr(self, st):
         c = self.curses
         if st.startswith("person:"):
-            pal = getattr(self, "person_pal", PERSON_PALETTE_8)
-            return c.color_pair(20 + person_index(st[7:]) % len(pal))
-        return {"pre": c.A_DIM, "link": c.A_DIM, "head": c.A_BOLD, "meta": c.A_DIM, "stub": c.A_DIM,
-                "out": c.color_pair(6), "in": c.color_pair(2),
-                "closes": c.color_pair(6) | c.A_BOLD, "closedby": c.color_pair(2) | c.A_BOLD,
-                "issue": c.color_pair(1) | c.A_BOLD, "pr": c.color_pair(6) | c.A_BOLD, "draft": c.color_pair(6),
-                "merged": c.color_pair(2) | c.A_BOLD, "closed": c.color_pair(3) | c.A_BOLD,
-                "comment": c.color_pair(4), "person": c.color_pair(5),
-                "fold": c.color_pair(5) | c.A_BOLD, "sum": c.color_pair(7),
-                "pending": c.A_DIM | getattr(c, "A_ITALIC", 0)}.get(st, 0)
+            pal = THEMES[THEME]["people"][0 if (c.COLORS >= 256 and THEME != "basic") else 1]
+            return c.color_pair(self.pairs.get(f"person#{person_index(st[7:]) % len(pal)}", 0))
+        spec = THEMES[THEME].get(st)
+        if not spec:
+            return 0
+        _, _, bold, dim = spec
+        a = c.color_pair(self.pairs.get(st, 0))
+        if bold:
+            a |= c.A_BOLD
+        if dim:
+            a |= c.A_DIM
+        if st == "pending":
+            a |= getattr(c, "A_ITALIC", 0)
+        return a
+
+    def dim(self):
+        """A_DIM for chrome (separators, legend); the basic theme renders it as normal text (PuTTY has no dim)."""
+        return 0 if THEME == "basic" else self.curses.A_DIM
 
     def put_row(self, y, row, hs, width, extra=0):
         """Draw a row from display column hs, colouring each segment; fill to width when extra is set."""
@@ -2592,7 +2667,7 @@ class Tui:
                     "lanes = references;  → what a comment points at   L hide"])
             legw = max(dw(x) for x in leg) + 2
             for i, x in enumerate(leg):
-                self.put(i, lw - legw, " " + x + " " * (legw - 1 - dw(x)), c.A_REVERSE | c.A_DIM)
+                self.put(i, lw - legw, " " + x + " " * (legw - 1 - dw(x)), c.A_REVERSE | self.dim())
         if pane:
             lines = self.preview_lines(lw - 2)
             if self.pv_key != self.cur:
@@ -2602,7 +2677,7 @@ class Tui:
                      + ("[focused: ↑↓ PgUp PgDn g G scroll, w/Esc back] " if self.pane_focus
                         else "(J/K scroll, w focus, v hide) "))
             self.put(body, 0, clip("─" * 2 + label + "─" * max(0, lw - 2 - dw(label)), 0, lw),
-                     c.A_BOLD if self.pane_focus else c.A_DIM)
+                     c.A_BOLD if self.pane_focus else self.dim())
             for i in range(pane):
                 if self.pv + i >= len(lines):
                     break
@@ -2613,7 +2688,7 @@ class Tui:
         title = (f" gitgraph  {self.o['layout']}  {where}  comments={self.o['comments']} "
                  f"people={'on' if self.o['people'] else 'off'} translate={self.o['translate']} "
                  f"summary={'on' if self.o['summary'] else 'off'} me={','.join('@' + m for m in self.me) or '-'}  "
-                 f"| {usage_line()}  "
+                 f"theme={THEME} | {usage_line()}  "
                  f"row {self.cur + 1}/{len(self.rows)}")
         self.put(h - 2, 0, title, c.A_BOLD | c.A_REVERSE, fill=True)
         r = self.rows[self.cur] if self.rows and self.cur < len(self.rows) else None
@@ -2621,9 +2696,9 @@ class Tui:
         if self.busy():
             self.put(h - 1, 0, self.progress_text(), c.A_BOLD)
         elif self.bg_error:
-            self.put(h - 1, 0, f"background work failed: {self.bg_error}", c.color_pair(3))
+            self.put(h - 1, 0, f"background work failed: {self.bg_error}", self.style_attr("closed"))
         else:
-            self.put(h - 1, 0, f"{info}   ?=help q=quit", c.A_DIM)
+            self.put(h - 1, 0, f"{info}   ?=help q=quit", self.dim())
         scr.refresh()
 
     def pager(self, lines, title):
@@ -3001,6 +3076,12 @@ class Tui:
                 self.pager(HELP.splitlines(), "help")
             elif k == ord("$"):
                 self.pager(usage_report(), "claude token usage")
+            elif k == ord("T"):
+                global THEME
+                names = list(THEMES)
+                THEME = names[(names.index(THEME) + 1) % len(names)]
+                self.apply_theme()
+                self.msg = f"theme: {THEME}   (keep it: gg config theme {THEME})"
             elif k == c.KEY_RESIZE:
                 pass
 
@@ -3148,9 +3229,13 @@ def main(argv=None):
     ap.add_argument("--depth", type=int, default=1, help="tui: initial tree expansion depth (default 1)")
     ap.add_argument("--days", type=int, default=7, help="tui home: 'opened in the last N days' window (default 7)")
     ap.add_argument("--no-home", action="store_true", help="tui: start at the full overview instead of the home list")
+    ap.add_argument("--theme", choices=list(THEMES), help="colour theme (default: config/env, else dark)")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="ANSI colours (auto = when stdout is a terminal)")
     a = ap.parse_intermixed_args(argv)
+    if a.theme:
+        global THEME
+        THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
     if a.cmd not in ("graph", "tui", "show", "ask", "update", "config") and ROOT_RE.match(a.cmd):

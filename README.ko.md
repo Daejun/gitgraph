@@ -42,7 +42,7 @@ gg config [KEY [VALUE]]   # 설정 저장
 gg update                 # 설치 갱신
 ```
 
-옵션: `-r owner/name` · `-u LOGIN`(TUI home의 "나"를 그 사람으로 — 관점만 바뀌고 로그인은 그대로) · `--state open|all`(all은 모든 issue/PR을 받아 느림) · `--comments linked|all|none`(linked = `#N`/`@`가 있는 코멘트만, graph·show 기본; all = tui 기본) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN`(캐시 TTL, 기본 15) · `--refresh` · `-w N`(제목 폭) · `-t zh|all|none`(번역, 기본 zh) · `-S`(코멘트 요약) · `--color auto|always|never` · TUI 전용: `--depth N`(시작 펼침 깊이, 1), `--days N`(home 기간, 7), `--no-home`, `--no-summary`.
+옵션: `-r owner/name` · `-u LOGIN`(TUI home의 "나"를 그 사람으로 — 관점만 바뀌고 로그인은 그대로) · `--state open|all`(all은 모든 issue/PR을 받아 느림) · `--comments linked|all|none`(linked = `#N`/`@`가 있는 코멘트만, graph·show 기본; all = tui 기본) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN`(캐시 TTL, 기본 15) · `--refresh` · `-w N`(제목 폭) · `-t zh|all|none`(번역, 기본 zh) · `-S`(코멘트 요약) · `--color auto|always|never` · `--theme dark|light|basic` · TUI 전용: `--depth N`(시작 펼침 깊이, 1), `--days N`(home 기간, 7), `--no-home`, `--no-summary`.
 
 ## 설정 (`gg config`)
 
@@ -58,6 +58,7 @@ gg update                 # 설치 갱신
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | 모델(진짜 `claude`에만 적용) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: 번역/요약 호출당 노드 수 |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
+| `theme` | `GITGRAPH_THEME` | `dark` | 색 테마, vim의 `bg=`처럼: `dark`(256색), `light`(밝은 배경용 진한 색), `basic`(8색, dim·진한 파랑 없음 — PuTTY 등). 한 번만 바꾸려면 `--theme`, TUI에서는 `T`로 순환 |
 
 ## 줄 형식
 
@@ -114,7 +115,7 @@ Enter로 그 항목 중심 tree, Tab으로 전체 overview(`--no-home`이면 ove
 | `d` · `o` | 상세 pager · 브라우저로 열기 |
 | `u` | home의 "나"를 다른 사람으로(이전 관점은 뒤로가기 스택에) |
 | `l` `c` `p` `t` `s` `H` `r` | tree/log · comments 모드 · 사람 노드 · 번역 · 요약 · hops 1/2/3 · 재조회 |
-| `/` `n` `N` · `<` `>` · `L` · `$` · `?` · `q` | 검색 · 가로 스크롤 · 범례 · 토큰 사용량 · 도움말 · 종료 |
+| `/` `n` `N` · `<` `>` · `L` · `$` · `T` · `?` · `q` | 검색 · 가로 스크롤 · 범례 · 토큰 사용량 · 색 테마 순환(dark → light → basic) · 도움말 · 종료 |
 | 마우스 | 클릭 = 커서 · `▾/▸` 클릭 = 접기 · 섹션 헤더 클릭 = 접기 · 더블클릭 = Enter(`@login` 위면 그 사람 관점) · 오른쪽 클릭 = 브라우저 · 뒤로/앞으로 버튼 · preview/답 panel 클릭 = 포커스 · 휠 = 커서는 두고 그 영역만 스크롤 |
 
 tmux 안이면 마우스 보고를 켜야 한다(`set -g mouse on`).

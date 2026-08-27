@@ -42,7 +42,7 @@ gg config [KEY [VALUE]]   # persistent settings
 gg update                 # update this installation
 ```
 
-Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; only the perspective changes, not the gh login) · `--state open|all` (all fetches every issue/PR — slow) · `--comments linked|all|none` (linked = only comments that reference `#N`/`@someone`, default for graph/show; all = default for tui) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN` (cache TTL, default 15) · `--refresh` · `-w N` (title width) · `-t zh|all|none` (translation, default zh) · `-S` (comment summaries) · `--color auto|always|never` · TUI only: `--depth N` (initial fold depth, 1), `--days N` (home window, 7), `--no-home`, `--no-summary`.
+Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; only the perspective changes, not the gh login) · `--state open|all` (all fetches every issue/PR — slow) · `--comments linked|all|none` (linked = only comments that reference `#N`/`@someone`, default for graph/show; all = default for tui) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN` (cache TTL, default 15) · `--refresh` · `-w N` (title width) · `-t zh|all|none` (translation, default zh) · `-S` (comment summaries) · `--color auto|always|never` · `--theme dark|light|basic` · TUI only: `--depth N` (initial fold depth, 1), `--days N` (home window, 7), `--no-home`, `--no-summary`.
 
 ## Settings (`gg config`)
 
@@ -58,6 +58,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | models (real `claude` only) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
+| `theme` | `GITGRAPH_THEME` | `dark` | colour theme, like vim's `bg=`: `dark` (256 colours), `light` (darker tones for a light background), `basic` (8 colours, no dim, no dark blue — PuTTY and other plain terminals). `--theme` for one run, `T` in the TUI to cycle |
 
 ## Line format
 
@@ -114,7 +115,7 @@ Enter opens a tree around the item; Tab switches to the full overview (`--no-hom
 | `d` · `o` | details pager · open in the browser |
 | `u` | view home as another person (the previous one goes on the back stack) |
 | `l` `c` `p` `t` `s` `H` `r` | tree/log · comments mode · people nodes · translation · summaries · hops 1/2/3 · refetch |
-| `/` `n` `N` · `<` `>` · `L` · `$` · `?` · `q` | search · horizontal scroll · legend · token usage · help · quit |
+| `/` `n` `N` · `<` `>` · `L` · `$` · `T` · `?` · `q` | search · horizontal scroll · legend · token usage · cycle the colour theme (dark → light → basic) · help · quit |
 | mouse | click = cursor; click `▾/▸` = fold; click a section header = fold; double-click = Enter (on a `@login`: view as that person); right click = open in browser; back/forward buttons = back/forward; click preview/answer panel = focus; wheel = scroll that area without moving the cursor |
 
 Under tmux enable mouse reporting (`set -g mouse on`).
