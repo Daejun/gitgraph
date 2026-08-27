@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -673,7 +673,8 @@ def claude_call(prompt, model, phase, timeout=300):
     if IS_CLAUDE:
         cmd += ["--model", model]          # a variant binary (gg config claude_bin cla) keeps its own default model
     try:
-        r = subprocess.run(cmd + [prompt], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd + [prompt], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                           start_new_session=True)   # no controlling terminal: the child cannot touch our screen
     except FileNotFoundError:
         raise ValueError(f"{CLAUDE_BIN} not found (gg config claude_bin …)") from None
     try:
@@ -788,10 +789,13 @@ def summarize_comments(entries, lang=TR_LANG):
 
 
 ASK_MODEL = cfg("ask_model")
-ASK_MAX_CHARS = 60000
-ASK_PROMPT = """You are helping a developer read a GitHub {kind}. Answer the question using only the material below; \
-if it cannot be answered from it, say so. Answer in {lang}; keep identifiers, code, file names, #numbers and technical \
-terms in English. Be concise (under 300 words) unless the question asks for more.
+ASK_MAX_CHARS = 90000
+ASK_PROMPT = """You are helping a developer who is reading a GitHub {kind} in a terminal tool. The material below is \
+what they see: the item (or the comment their cursor is on), its metadata, the full comment thread in order, and the \
+issues/PRs it is linked to with the sentence that made each link. Answer the question from this material; when you \
+rely on a specific comment or linked item, say which (author + date, or #number). If the material does not contain the \
+answer, say so rather than guessing. Answer in {lang}; keep identifiers, code, file names, #numbers and technical terms \
+in English. Be concise (under 300 words) unless the question asks for more.
 
 === {label} ===
 {context}
@@ -801,30 +805,50 @@ terms in English. Be concise (under 300 words) unless the question asks for more
 
 
 def ask_context(g, nid):
-    """(kind, label, text): everything worth knowing about one node, capped at ASK_MAX_CHARS."""
+    """(kind, label, text): the node under the cursor with everything around it, capped at ASK_MAX_CHARS."""
     n = g.nodes[nid]
+
+    def item_block(it, body_chars, comment_chars, mark=None):
+        parts = [f"{g.label_num(it)} {kind_tag(it)} {it.title}",
+                 f"by @{it.author}, opened {short_date(it.created)}, updated {short_date(it.updated)}, "
+                 f"labels: {', '.join(it.labels) or '-'}, {it.url or ''}", "", (it.body or "(no body)")[:body_chars]]
+        cs = g.comments_of(it.id)
+        if cs:
+            parts.append(f"\n--- {len(cs)} comments, oldest first ---")
+        for c in cs:
+            tag = f" [{c.ckind}{' ' + (c.review_state or '') if c.review_state else ''}]" if c.ckind != "comment" else ""
+            flag = "  <<< THE COMMENT THE USER IS LOOKING AT" if c.id == mark else ""
+            parts += ["", f"--- comment by @{c.author}, {short_date(c.created)} ({rel_days(c, g)}){tag}{flag} ---",
+                      c.body[:comment_chars]]
+        links = []
+        for src in [it] + cs:
+            for m, t, o in g.adj[src.id]:
+                if t == "comment" or g.nodes[m].kind == "person" or m == it.id:
+                    continue
+                other = g.nodes[m]
+                why = g.ctx.get((src.id, m)) if o else g.ctx.get((m, it.id))
+                why = f'"{why}"' if why else (f"» {other.summary}" if other.summary else "")
+                links.append(f"- {EDGE_LABEL[(t, o)]}{node_label(g, other, 120)}" + (f"  — {why}" if why else ""))
+        if links:
+            parts += ["", "--- linked issues / PRs (how they are connected) ---"] + list(dict.fromkeys(links))[:40]
+        return parts
+
     if n.kind == "comment":
         p = g.nodes.get(n.parent)
-        parts = [f"Comment by @{n.author} on {short_date(n.created)} ({rel_days(n, g)} after the item opened) "
-                 f"[{n.ckind}{' ' + (n.review_state or '') if n.review_state else ''}]", n.body, ""]
+        parts = [f"The user's cursor is on this comment by @{n.author} ({short_date(n.created)}, {rel_days(n, g)} "
+                 f"after the item opened):", "", n.body, ""]
         if p:
-            parts += [f"--- the {'PR' if p.is_pr else 'issue'} it belongs to: {g.label_num(p)} {p.title} (by @{p.author}, "
-                      f"{short_date(p.created)}, {p.state_label()}) ---", (p.body or "")[:3000]]
+            parts += [f"=== the {'PR' if p.is_pr else 'issue'} it belongs to, with the whole thread ==="] + \
+                     item_block(p, 4000, 2500, mark=n.id)
         return "comment", f"comment on {g.label_num(p) if p else '?'}", "\n".join(parts)
     if n.kind == "person":
-        lines = [f"{n.id} is mentioned in:"]
+        lines = [f"{n.id} appears in:"]
         for m, t, o in sorted(g.adj[nid], key=lambda e: -g.nodes[e[0]].time):
             if t == "mention":
-                src = g.nodes[m]
-                lines.append(f"- {node_label(g, src, 200)}")
+                lines.append(f"- {node_label(g, g.nodes[m], 200)}")
         return "person", n.id, "\n".join(lines)
     kind = "pull request" if n.is_pr else "issue"
-    parts = [f"{g.label_num(n)} {n.title}", f"author @{n.author}, opened {short_date(n.created)}, state {n.state_label()}, "
-             f"updated {short_date(n.updated)}, labels: {', '.join(n.labels) or '-'}", n.url or "", "", n.body or "(no body)"]
-    for c in g.comments_of(nid):
-        tag = f" [{c.ckind}{' ' + (c.review_state or '') if c.review_state else ''}]" if c.ckind != "comment" else ""
-        parts += ["", f"--- comment by @{c.author}, {short_date(c.created)} ({rel_days(c, g)}){tag} ---", c.body[:6000]]
-    text = "\n".join(parts)
+    text = "\n".join(item_block(n, 12000, 6000))
     if len(text) > ASK_MAX_CHARS:
         text = text[:ASK_MAX_CHARS] + "\n\n[... truncated ...]"
     return kind, f"{g.label_num(n)} {n.title}", text
@@ -1953,23 +1977,19 @@ def wrap(text, width):
 
 HELP = """gg tui — lazygit style layout
 
-  side column: 1 Repo  2 Item  3 Home  4 Links  5 Comments  6 People      main: 0 (content · tree · log · answer)
+  side column: 1 Repo  2 Item  3 Home  4 Links  5 Comments  6 People      main: 0 (content · answer)
   1-6 / 0         jump to a panel            Tab / Shift-Tab  next / previous panel
-  [ / ]           previous / next tab in the focused panel (Home sections, Comments all/linked, main tabs)
+  [ / ]           previous / next tab in the focused panel (Home sections, main content / answer)
   + / _           screen mode normal -> half (focused side panel fills the column) -> full (only that panel)
   Up/k Down/j     move            PgUp/PgDn , .   page       g/G < >  top / bottom      H / L  scroll sideways
   K / J           scroll the main panel from anywhere
-  Enter           Home: make it the current item (Links, Comments, People and the tree follow)
-                  Links: go to that item      Comments: focus main on it      People: view as that person
-                  main tree/log: re-root on the node; on a ⇢/mentions line: jump to the linked node
-  x               hold / follow: after Enter the main panel holds the chosen item (or comment) — cursor moves
-                  in the side panels do not change it; x releases it so main follows the cursor again
-  Space / Left / Right   fold / unfold a tree node      - / =   fold to depth 1 / unfold all
+  Enter           Home: make it the current item (Item, Links, Comments and People follow)
+                  Item / Comments: read it in main      Links: go to that item      People: view as that person
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
   i               translate the main content (issue/PR body or comment) in full; press again for the original
   Esc / b         back (previous item and perspective)     f  forward
   u               view Home as another person       r  refetch from GitHub
-  c t s p h       comments mode · translation · summaries · people nodes · hops 1/2/3
+  c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
   mouse           click = focus panel + select; double-click = Enter;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
@@ -2059,7 +2079,7 @@ class Tui:
     SIDE = ["repo", "item", "home", "links", "comments", "people"]
     HOME_TABS = [("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
-    MAIN_TABS = ["content", "tree", "log", "answer"]
+    MAIN_TABS = ["content", "answer"]
     COMMENTS_CYCLE = ["linked", "all", "none"]
 
     def __init__(self, scr, opts):
@@ -2070,7 +2090,6 @@ class Tui:
         self.o.setdefault("summary", True)
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
-        self.hold = False   # True: main keeps showing the chosen item/comment instead of following the cursor
         self.show_tr = False   # main content: show the full-text translation (i toggles; runs claude on demand)
         self.last_side = "home"   # the side list panel that stays expanded while main is focused
         self.tr_thread, self.tr_pending = None, None
@@ -2085,7 +2104,7 @@ class Tui:
             "item": Panel("item", "Item"),
             "home": Panel("home", "Home", [t for _, t in self.HOME_TABS]),
             "links": Panel("links", "Links"),
-            "comments": Panel("comments", "Comments", ["all", "linked"]),
+            "comments": Panel("comments", "Comments"),
             "people": Panel("people", "People"),
             "main": Panel("main", "Main", self.MAIN_TABS, scroll_only=True),
         }
@@ -2352,8 +2371,6 @@ class Tui:
             return [Row("(no current item)", kind="head")]
         g, w = self.g, self.o["width"]
         cs = g.comments_of(self.item)
-        if self.panels["comments"].tab == 1:   # linked only
-            cs = [c for c in cs if any(t in ("ref", "mention") for _, t, _ in g.adj[c.id])]
         rows = [Row(comment_label(g, c, w, show_item=False), c.id) for c in cs]
         return rows or [Row("(no comments)", kind="head")]
 
@@ -2391,19 +2408,9 @@ class Tui:
             p.scroll_only = True
             p.rows = [Row(t, kind="url" if re.match(r"https?://\S+$", t) else "")
                       for t in self.content_lines(self.subject, max(p.rect[3], 40))]
-        elif tab == "answer":
+        else:
             p.scroll_only = True
             p.rows = [Row(t) for t in wrap(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))]
-        elif not self.item or self.item not in self.cg.nodes:
-            p.scroll_only = True
-            p.rows = [Row("(pick an item in Home first)")]
-        else:
-            p.scroll_only = False
-            sub = subgraph(self.cg, focus(self.cg, self.item, self.o["hops"]))
-            layout = "tree" if tab == "tree" else "log"
-            rows = focus_rows(sub, self.item, layout, self.o["width"], self.collapsed, marks=True, legend=False)
-            p.set_rows(rows, keep)
-            self.sub = sub
 
     def content_lines(self, nid, width):
         n = self.g.nodes.get(nid) if nid else None
@@ -2486,11 +2493,10 @@ class Tui:
 
     # ------------------------------------------------------------------ selection / history
     def snapshot(self):
-        return (self.item, self.subject, list(self.me), self.panels["main"].tab, self.panels["home"].tab,
-                set(self.collapsed), self.hold)
+        return (self.item, self.subject, list(self.me), self.panels["main"].tab, self.panels["home"].tab, set(self.collapsed))
 
     def restore(self, st):
-        self.item, self.subject, self.me, self.panels["main"].tab, self.panels["home"].tab, self.collapsed, self.hold = st
+        self.item, self.subject, self.me, self.panels["main"].tab, self.panels["home"].tab, self.collapsed = st
         self.refresh_all()
 
     def set_item(self, nid, push=True):
@@ -2500,10 +2506,8 @@ class Tui:
             self.hist.append(self.snapshot())
             self.fwd = []
         self.item, self.subject, self.collapsed = nid, nid, set()
-        self.hold = True
         self.panels["main"].top = 0
         self.refresh_all()
-        self.fold_below(self.o.get("depth", 1))
 
     def back(self):
         if not self.hist:
@@ -2528,9 +2532,7 @@ class Tui:
         self.focus = "home"
 
     def update_subject(self):
-        """The main content follows the row under the cursor of the focused side panel (unless held with x/Enter)."""
-        if self.hold:
-            return
+        """The main content follows the row under the cursor of the focused side panel; it stays when main is focused."""
         if self.focus in ("item", "home", "links", "comments", "people"):
             r = self.panels[self.focus].current()
             nid = (r.jump if r and r.kind == "mention" and r.jump else (r.nid if r else None))
@@ -2638,7 +2640,7 @@ class Tui:
         if self.focus == "home":
             self.set_item(r.nid)
         elif self.focus == "item":
-            self.subject, self.hold = self.item, True
+            self.subject = self.item
             self.panels["main"].tab = 0
             self.panels["main"].top = 0
             self.refresh_main()
@@ -2646,7 +2648,7 @@ class Tui:
         elif self.focus == "links":
             self.set_item(r.nid)
         elif self.focus == "comments":
-            self.subject, self.hold = r.nid, True
+            self.subject = r.nid
             self.panels["main"].tab = 0
             self.panels["main"].top = 0
             self.refresh_main()
@@ -2654,24 +2656,7 @@ class Tui:
         elif self.focus == "people":
             self.view_as([r.nid.lstrip("@")])
         elif self.focus == "main":
-            if p.scroll_only:
-                return
-            if r.kind == "link" and r.jump:
-                if not p.goto_nid(r.jump):
-                    self.collapsed.clear()
-                    self.refresh_main()
-                    if not p.goto_nid(r.jump):
-                        self.set_item(r.jump)
-            elif r.kind == "" and r.nid:
-                if self.g.nodes[r.nid].kind == "person":
-                    self.view_as([r.nid.lstrip("@")])
-                elif self.g.nodes[r.nid].kind == "comment":
-                    self.subject, self.hold = r.nid, True
-                    self.panels["main"].tab = 0
-                    self.panels["main"].top = 0
-                    self.refresh_main()
-                else:
-                    self.set_item(r.nid)
+            return
 
     def node_url(self, nid):
         n = self.g.nodes.get(nid)
@@ -3098,7 +3083,7 @@ class Tui:
                 what = (self.g.label_num(sub) if sub and sub.kind == "item" else
                         (f"comment on {self.g.label_num(self.g.nodes[sub.parent])}" if sub and sub.kind == "comment" else
                          (self.subject or "")))
-                title += f"  {'⊙ hold' if self.hold else '~ follows cursor'} {what}"
+                title += f"  · {what}"
         if hh == 0:                                  # collapsed to a title bar
             self.put(y, x, clip(f"{tl}{hz}{title}{hz}", 0, ww) + hz * max(0, ww - dw(title) - 3) + tr, attr)
             return
@@ -3125,11 +3110,11 @@ class Tui:
             self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
 
     HINTS = {
-        "home": "⏎ open item (main holds it)  x hold/follow  [ ] section  / search  a ask  o browser  u view-as",
+        "home": "⏎ open item  [ ] section  / search  a ask  o browser  u view-as",
         "links": "⏎ go to item  / search  a ask  o browser",
-        "comments": "⏎ read in main  [ ] all/linked  / search  a ask  o browser",
+        "comments": "⏎ read in main  / search  a ask  o browser",
         "people": "⏎ view as this person  a ask  o browser",
-        "main": "[ ] content/tree/log/answer  i translate  ⏎ re-root  Space fold  - = fold all/none  K J scroll  x hold",
+        "main": "[ ] content / answer  i translate  a ask  K J scroll  o browser",
         "repo": "r refetch  c t s p h toggles  T theme  $ tokens",
         "item": "⏎ read in main  i translate  a ask  o browser  d details",
     }
@@ -3299,7 +3284,6 @@ class Tui:
         ("*", "⏎", "open / go to / re-root (see the panel hint)", 10),
         ("*", "Tab", "next panel", 9), ("*", "[ ]", "previous / next tab", ord("]")),
         ("*", "+ _", "screen mode normal / half / full", ord("+")),
-        ("*", "x", "hold / follow the main content", ord("x")),
         ("*", "a", "ask claude about the selection", ord("a")),
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
@@ -3307,8 +3291,6 @@ class Tui:
         ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
         ("*", "r", "refetch from GitHub", ord("r")), ("*", "T", "colour theme", ord("T")),
         ("*", "$", "token usage", ord("$")), ("*", "q", "quit", ord("q")),
-        ("main", "Space", "fold / unfold the tree node", ord(" ")),
-        ("main", "- =", "fold to depth 1 / unfold all", ord("-")),
         ("main", "K J", "scroll", ord("J")),
     ]
 
@@ -3345,7 +3327,7 @@ class Tui:
             if self.tr_thread is not None and not self.tr_thread.is_alive():
                 self.tr_thread = None
                 self.refresh_main()
-            self.scr.timeout(150 if self.busy() else -1)
+            self.scr.timeout(400 if self.busy() else -1)
             self.draw()
             k = self.read_key()
             if k == -1:
@@ -3389,14 +3371,8 @@ class Tui:
                 p.set_rows(self.home_rows(), keep=False)
                 p.cur = 0
                 self.update_subject()
-            elif self.focus == "comments":
-                p.set_rows(self.comments_rows(), keep=False)
-                p.cur = 0
-                self.update_subject()
             elif self.focus == "main":
                 self.refresh_main()
-                if self.MAIN_TABS[p.tab] == "tree":
-                    self.fold_below(self.o.get("depth", 1))
             self.enrich()
             return True
         if k == ord("+"):
@@ -3439,19 +3415,6 @@ class Tui:
             self.panels["main"].move(-3) if self.panels["main"].scroll_only else self.panels["main"].move(-1)
         elif k in (10, 13, c.KEY_ENTER):
             self.enter()
-        elif k == ord(" ") or k == c.KEY_LEFT or k == c.KEY_RIGHT:
-            if self.focus == "main":
-                self.toggle_fold(None if k == ord(" ") else (k == c.KEY_LEFT))
-        elif k == ord("x"):
-            self.hold = not self.hold
-            if not self.hold:
-                self.update_subject()
-            self.msg = "main holds the current selection" if self.hold else "main follows the cursor again"
-        elif k == ord("-"):
-            self.fold_below(1)
-        elif k == ord("="):
-            self.collapsed.clear()
-            self.refresh_main()
         elif k in (27, c.KEY_BACKSPACE, 127, 8, ord("b")):
             self.back()
         elif k == ord("f"):

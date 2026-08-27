@@ -86,7 +86,7 @@ code fence 안과 kernel log / stack trace 줄(`[ 123.4]`, `Tainted:`, `PID:`, `
 
 - **번역** — 제목과 코멘트 첫 줄 중 한자가 섞인 것(`-t zh`)을 `tr_model`로 `lang`으로 바꾼다. `-t all`이면 영어도. `~/.cache/gitgraph/translations.json`에 캐시, `show`는 원문 제목도 같이 보여준다.
 - **요약** (`-S`, TUI 기본) — 코멘트 줄이 첫 줄 발췌 대신 한 줄 요약(issue/PR 본문도 요약해 Links panel에 씀)(`» …`)이 된다. 본문 sha1 기준 `summaries.json` 캐시(본문 4,000자, 호출당 40건 / 40,000자 상한). 생성 중에는 `» 요약 중…`, 실패하면 첫 줄 발췌.
-- **질문** (`a`, `gg ask`) — 그 항목의 본문과 코멘트 전체(코멘트당 6,000자, 총 60,000자)를 질문과 함께 `ask_model`에 보낸다. 단발, 캐시 없음.
+- **질문** (`a`, `gg ask`) — 질문과 함께 그 항목(또는 커서의 코멘트, 표시됨)·메타·코멘트 전체 스레드(순서대로)·링크된 issue/PR과 그 참조 문장(총 90,000자까지)을 `ask_model`에 보내고, 답은 근거로 삼은 코멘트나 #번호를 밝힌다. 단발, 캐시 없음.
 - Claude Code 로그인만 있으면 되고 API key는 필요 없다. `--output-format json`이 알려주는 usage를 프로세스 시작부터 누적: TUI 제목줄에 `tokens 31.2k in / 1.4k out · $0.052 · 7 calls`, `$` 키로 phase별 표, CLI는 종료 시 stderr 한 줄. "in"의 대부분은 캐시된 system prompt라 비용은 작다.
 
 ## TUI
@@ -94,7 +94,7 @@ code fence 안과 kernel log / stack trace 줄(`[ 123.4]`, `Tainted:`, `PID:`, `
 lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links · Comments · People)과, 선택한 것을 보여주는 오른쪽 main panel.
 
 ```
-╭─1 Repo──────────────────────╮╭─0 Main [content] tree log answer──────────────────────╮
+╭─1 Repo──────────────────────╮╭─0 Main [content] answer───────────────────────────────╮
 │ owner/name  57 open  15:44  ││ #750 [PR] mtfs: running out of space must not …       │
 ╰─────────────────────────────╯│ @Daejun7Park  2026-08-13  updated 2026-08-19          │
 ╭─2 Item──────────────────────╮│ https://github.com/owner/name/pull/750                │
@@ -105,7 +105,7 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links
 │ 2026-08-17 #763 [I] xfstest…││                                                       │
 ╭─4 Links─────────────────────╮│                                                       │
 │ → refs 2026-08-13 #748 [I] …││                                                       │
-╭─5 Comments [all] linked─────╮│                                                       │
+╭─5 Comments──────────────────╮│                                                       │
 │ +0d o @Daejun7Park » …      ││                                                       │
 ╭─6 People────────────────────╮│                                                       │
 │ @Daejun7Park  author        ││                                                       │
@@ -119,9 +119,9 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links
 | 2 Item | 현재 item: 제목, 메타, `» 한 줄 요약`(없으면 본문 첫 줄), 코멘트/링크 수, URL | main에서 읽기 |
 | 3 Home | 한 번에 한 섹션(`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`) | **현재 item**으로 설정 — Links, Comments, People, tree가 따라옴 |
 | 4 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄에 **이유**: 참조가 나온 문장, 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 코멘트 요약과 같은 요약기·캐시) | 그 item으로 이동(`b`/Esc로 복귀) |
-| 5 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`(`[` `]` all / linked) | main에서 읽기 |
+| 5 Comments | 현재 item의 코멘트 `+Nd o @who » 요약` | main에서 읽기 |
 | 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람 | 그 사람 관점으로 Home 보기 |
-| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(본문+메타 또는 코멘트) — Enter로 정한 item/코멘트는 `x`로 풀 때까지 **고정(hold)**(제목에 `⊙ hold #750` / `~ follows cursor`); **tree** / **log** = 현재 item 주변 그래프(`--hops`, Space/←/→·`-`/`=` 접기, Enter 재루팅, `⇢` 줄 점프, `▾ ▸ ·` 표시); **answer** = 마지막 `a` 질문의 답 | tree: 그 노드로 재루팅 |
+| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(URL이 첫 줄에 밑줄로; 본문+메타 또는 코멘트) — main에 포커스가 있는 동안은 그대로 유지; **answer** = 마지막 `a` 질문의 답 | – |
 
 Layout: side column 폭 `side_width`(0.33); 포커스된 side panel이 더 높고(`expand_focused`, `expanded_weight`) main으로 포커스가 가도 그 크기를 유지해 다음 선택이 쉬움; `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`.
 
@@ -133,8 +133,6 @@ Layout: side column 폭 `side_width`(0.33); 포커스된 side panel이 더 높�
 | `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | 이동 · 페이지 · 처음/끝 · 가로 스크롤 |
 | `K` `J` | 어디서든 main panel 스크롤 |
 | Enter | 위 표 참조 |
-| Space, `←`/`→` · `-` `=` | tree 노드 접기/펼치기 · depth 1로 접기 / 전부 펼침 |
-| `x` | main content 고정 / 따라가기 토글 |
 | `i` | main content(issue/PR 본문 또는 코멘트)를 `lang`으로 전문 번역; 다시 누르면 원문(`translations_full.json` 캐시) |
 | `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기(URL은 content 첫 줄에 밑줄로도 표시) |
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
