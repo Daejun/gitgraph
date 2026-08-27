@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -158,15 +158,40 @@ def discover_repos(root, depth=2):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
     best = {}   # repo -> dir (shallowest wins; a dir named like the repo wins ties)
     for d in dict.fromkeys(dirs):
-        r = subprocess.run(["git", "-C", d, "remote", "get-url", "origin"], capture_output=True, text=True)
-        m = _REMOTE_RE.match(r.stdout.strip()) if r.returncode == 0 else None
-        if not m:
-            continue
-        repo = make_repo(m.group("host"), m.group("owner"), m.group("name"))
-        rank = (d.count(os.sep), os.path.basename(d) != m.group("name"), d)
-        if repo not in best or rank < best[repo][0]:
-            best[repo] = (rank, d)
+        for rank_remote, repo in github_remotes(d):
+            rank = (d.count(os.sep), rank_remote, os.path.basename(d) != split_repo(repo)[2], d)
+            if repo not in best or rank < best[repo][0]:
+                best[repo] = (rank, d)
     return sorted(((repo, d) for repo, (rank, d) in best.items()), key=lambda x: best[x[0]][0])
+
+
+def is_github_host(host):
+    """github.com, any github.* host (typical for Enterprise), or a host gh is logged in to."""
+    host = host.lower()
+    return host == DEFAULT_HOST or host.startswith("github.") or host in gh_hosts()
+
+
+def github_remotes(d):
+    """[(rank, repo)] for every remote of the git repo at d whose URL points at a GitHub host.
+    rank: 0 = origin, 1 = a remote named github*, 2 = anything else."""
+    r = subprocess.run(["git", "-C", d, "remote", "-v"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    out, seen = [], set()
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or (len(parts) > 2 and parts[2] != "(fetch)"):
+            continue
+        name, url = parts[0], parts[1]
+        m = _REMOTE_RE.match(url)
+        if not m or not is_github_host(m.group("host")):
+            continue
+        repo = make_repo(m.group("host").lower(), m.group("owner"), m.group("name"))
+        if repo in seen:
+            continue
+        seen.add(repo)
+        out.append((0 if name == "origin" else 1 if name.lower().startswith("github") else 2, repo))
+    return sorted(out)
 
 
 def choose_repos(cands):
@@ -238,6 +263,11 @@ def gh_accounts(host=None):
     if host:
         return list(_accounts.get(host, []))
     return list(_accounts.get(DEFAULT_HOST, [])) + [a for h, l in _accounts.items() if h != DEFAULT_HOST for a in l]
+
+
+def gh_hosts():
+    gh_accounts()
+    return set(_accounts or {})
 
 
 def gh_token(user, host=DEFAULT_HOST):
