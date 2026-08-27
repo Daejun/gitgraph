@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -871,8 +871,35 @@ Output only the translation, no commentary.
 {body}"""
 
 
+def _split_prose(body):
+    """[(is_prose, text)] — code fences and pasted log / trace lines are kept verbatim, the rest is prose."""
+    parts, cur, in_fence, cur_prose = [], [], False, True
+
+    def flush():
+        if cur:
+            parts.append((cur_prose, "\n".join(cur)))
+
+    for ln in body.splitlines():
+        fence = ln.strip().startswith("```")
+        prose = not in_fence and not fence and not NOISE_LINE_RE.match(ln)
+        if fence:
+            if not in_fence:
+                flush(); cur = []; cur_prose = False
+                cur.append(ln); in_fence = True
+            else:
+                cur.append(ln); in_fence = False
+                flush(); cur = []; cur_prose = True
+            continue
+        if prose != cur_prose:
+            flush(); cur = []; cur_prose = prose
+        cur.append(ln)
+    flush()
+    return parts
+
+
 def translate_body(n, g, lang=TR_LANG):
-    """Full-text translation of an item/comment body (cached in translations_full.json). Returns the text."""
+    """Full-text translation of an item/comment body: prose only, code fences and log lines stay as they are.
+    Cached in translations_full.json. Returns the text."""
     body = (n.body or "")[:TR_FULL_CHARS]
     if not body.strip():
         return ""
@@ -886,7 +913,20 @@ def translate_body(n, g, lang=TR_LANG):
     if key in cache:
         return cache[key]
     kind = "comment" if n.kind == "comment" else ("pull request" if n.is_pr else "issue")
-    out = claude_call(TR_FULL_PROMPT.format(kind=kind, lang=lang, body=body), TR_MODEL, "translate", timeout=600).strip()
+    pieces = _split_prose(body)
+    prose = [t for is_p, t in pieces if is_p and t.strip()]
+    if not prose:
+        return body
+    marked = "\n\n<<<SEG>>>\n\n".join(prose)
+    tr = claude_call(TR_FULL_PROMPT.format(kind=kind, lang=lang, body=marked) +
+                     "\n\n(The text contains <<<SEG>>> separators between independent parts: keep every separator "
+                     "exactly, in the same order.)", TR_MODEL, "translate", timeout=600).strip()
+    got = [x.strip() for x in tr.split("<<<SEG>>>")]
+    if len(got) != len(prose):
+        out = tr                      # separators lost: fall back to the plain translation
+    else:
+        it = iter(got)
+        out = "\n".join((next(it) if (is_p and t.strip()) else t) for is_p, t in pieces)
     if out:
         cache[key] = out
         with open(p, "w") as f:
@@ -2208,8 +2248,9 @@ class Tui:
         if self.o.get("root") and self.item is None:
             try:
                 self.item = resolve_root(self.g, self.o["root"])
+                self.subject = self.item
                 self.focus = "main"
-                self.panels["main"].tab = 1
+                self.panels["main"].tab = 0
             except ValueError as e:
                 self.msg = str(e)
         self.refresh_all()
@@ -2427,6 +2468,8 @@ class Tui:
             meta = [f"@{n.author}" if n.author else "", short_date(n.created),
                     f"updated {short_date(n.updated)}" if n.updated else "", ", ".join(n.labels)]
             out.append("  ".join(x for x in meta if x))
+            if n.summary:
+                out.append(f"» {n.summary}")
             if n.stub:
                 out.append("(not fetched: closed item or other repo — press o to open it)")
             body = n.body
@@ -2646,7 +2689,14 @@ class Tui:
             self.refresh_main()
             self.focus = "main"
         elif self.focus == "links":
-            self.set_item(r.nid)
+            n = self.g.nodes.get(r.nid)
+            if n and n.kind == "comment":
+                self.set_item(n.parent)
+                self.panels["comments"].goto_nid(n.id)
+                self.subject = n.id
+                self.refresh_main()
+            else:
+                self.set_item(r.nid)
         elif self.focus == "comments":
             self.subject = r.nid
             self.panels["main"].tab = 0
@@ -2753,7 +2803,7 @@ class Tui:
         c = self.curses
         top = 0
         while True:
-            width = max(dw(l) for l, _ in items) + 6
+            width = max([dw(l) for l, _ in items] + [dw(title) + 4]) + 6
             y, x, hh, ww = self.popup_frame(title, len(items) + 2, width)
             if cur < top:
                 top = cur
@@ -2866,6 +2916,7 @@ class Tui:
                     p.top = i
                 else:
                     p.cur, p.free = i, False
+                    self.update_subject()
                 return
         self.msg = f"not found: {p.query}"
 
@@ -2887,7 +2938,7 @@ class Tui:
         st = {"nid": nid, "label": label, "q": q, "t0": time.time()}
         self.ask_state = st
         self.answer = f"Q ({label}): {q}\n\n(waiting for the answer…)"
-        self.panels["main"].tab = 3
+        self.panels["main"].tab = self.MAIN_TABS.index("answer")
         self.refresh_main()
 
         def work():
@@ -3138,7 +3189,7 @@ class Tui:
         elif self.msg:
             bottom, attr = self.msg, c.A_BOLD
         else:
-            bottom = f"{self.HINTS.get(self.focus, '')}   1-5 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit"
+            bottom = f"{self.HINTS.get(self.focus, '')}   1-6 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit"
             attr = self.dim()
         self.put(h - 1, 0, bottom, attr, fill=w - 1)
         scr.refresh()
@@ -3474,6 +3525,7 @@ class Tui:
             names = list(THEMES)
             THEME = names[(names.index(THEME) + 1) % len(names)]
             self.apply_theme()
+            self.panels["repo"].rows = self.repo_rows()
             self.msg = f"theme: {THEME}   (keep it: gg config theme {THEME})"
         elif k == ord("$"):
             self.pager(usage_report(), "claude token usage")

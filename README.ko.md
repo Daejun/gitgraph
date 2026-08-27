@@ -42,7 +42,7 @@ gg config [KEY [VALUE]]   # 설정 저장
 gg update                 # 설치 갱신
 ```
 
-옵션: `-r owner/name` · `-u LOGIN`(TUI home의 "나"를 그 사람으로 — 관점만 바뀌고 로그인은 그대로) · `--state open|all`(all은 모든 issue/PR을 받아 느림) · `--comments linked|all|none`(linked = `#N`/`@`가 있는 코멘트만, graph·show 기본; all = tui 기본) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN`(캐시 TTL, 기본 15) · `--refresh` · `-w N`(제목 폭) · `-t zh|all|none`(번역, 기본 zh) · `-S`(코멘트 요약) · `--color auto|always|never` · `--theme dark|light|basic` · TUI 전용: `--depth N`(시작 펼침 깊이, 1), `--days N`(home 기간, 7), `--no-summary`.
+옵션: `-r owner/name` · `-u LOGIN`(TUI home의 "나"를 그 사람으로 — 관점만 바뀌고 로그인은 그대로) · `--state open|all`(all은 모든 issue/PR을 받아 느림) · `--comments linked|all|none`(linked = `#N`/`@`가 있는 코멘트만, graph·show 기본; all = tui 기본) · `--no-people` · `--no-closed-neighbors` · `--max-age MIN`(캐시 TTL, 기본 15) · `--refresh` · `-w N`(제목 폭) · `-t zh|all|none`(번역, 기본 zh) · `-S`(코멘트 요약) · `--color auto|always|never` · `--theme dark|light|basic` · TUI 전용: `--days N`(home 기간, 7), `--no-summary`.
 
 ## 설정 (`gg config`)
 
@@ -117,8 +117,8 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links
 |---|---|---|
 | 1 Repo | repo, open 수, fetch 시각, "나", 토글 상태, 토큰 사용량 | – |
 | 2 Item | 현재 item: 제목, 메타, `» 한 줄 요약`(없으면 본문 첫 줄), 코멘트/링크 수, URL | main에서 읽기 |
-| 3 Home | 한 번에 한 섹션(`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`) | **현재 item**으로 설정 — Links, Comments, People, tree가 따라옴 |
-| 4 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄에 **이유**: 참조가 나온 문장, 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 코멘트 요약과 같은 요약기·캐시) | 그 item으로 이동(`b`/Esc로 복귀) |
+| 3 Home | 한 번에 한 섹션(`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`). my turn / active / waiting / PRs 행에서는 커서가 **마지막 코멘트**를 미리 보여줌(main에 코멘트가 뜨는 이유) | **현재 item**으로 설정 — Item, Links, Comments, People이 따라옴 |
+| 4 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄에 **이유**: 참조가 나온 문장, 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 본문을 받아온 뒤 코멘트와 같은 요약기로; 대기 중엔 `» 요약 중…`) | 그 item으로 이동; 코멘트 행이면 그 item으로 가고 커서는 그 코멘트에(`b`/Esc로 복귀) |
 | 5 Comments | 현재 item의 코멘트 `+Nd o @who » 요약` | main에서 읽기 |
 | 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람 | 그 사람 관점으로 Home 보기 |
 | 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(URL이 첫 줄에 밑줄로; 본문+메타 또는 코멘트) — main에 포커스가 있는 동안은 그대로 유지; **answer** = 마지막 `a` 질문의 답 | – |

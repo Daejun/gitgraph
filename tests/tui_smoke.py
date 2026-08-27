@@ -104,6 +104,10 @@ def main():
     s.key("a", 0.5)
     check("prompt popup", "ask about" in s.text())
     s.key("\x1b", 0.5)
+    s.key("a", 0.5)
+    s.key("x\r", 1.5)                # a real question would take a while; the answer tab must open without crashing
+    check("ask opens the answer tab", "[answer]" in s.line(0))
+    s.key("[", 0.5)
     # drag the border from the current position 15 columns to the right
     home_row = next(i for i, l in enumerate(s.text().splitlines()) if "3 Home" in l)
     bx = next((i for i, ch in enumerate(s.line(home_row)) if ch == "╮"), None)   # Home's top border
