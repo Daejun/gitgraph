@@ -117,7 +117,7 @@ lazygit-style layout: a side column of panels and a main panel that shows whatev
 | 3 Links | every edge of the current item and its comments: `→ refs`, `← cited-by`, `→ closes`, `← closed-by` (via which comment) | go to that item (back with `b`/Esc) |
 | 4 Comments | the current item's comments `+Nd o @who » summary` (`[` `]` all / linked) | read it in main |
 | 5 People | author, commenters and mentioned people of the current item | view Home as that person |
-| 0 Main | tabs (`[` `]`): **content** = full text of the row under the cursor in the focused side panel (body + metadata, or a comment); **tree** / **log** = the graph around the current item (`--hops`, fold with Space/←/→, `-`/`=`, Enter re-roots, `⇢` lines jump, `▾ ▸ ·` marks); **answer** = the last `a` question | tree: re-root on the node |
+| 0 Main | tabs (`[` `]`): **content** = full text of the row under the cursor in the focused side panel (body + metadata, or a comment) — after Enter it **holds** the chosen item/comment until `x` releases it (title shows `⊙ hold #750` / `~ follows cursor`); **tree** / **log** = the graph around the current item (`--hops`, fold with Space/←/→, `-`/`=`, Enter re-roots, `⇢` lines jump, `▾ ▸ ·` marks); **answer** = the last `a` question | tree: re-root on the node |
 
 Layout: side column `side_width` (0.33) of the screen; the focused side panel is taller (`expand_focused`, `expanded_weight`); `+`/`_` cycle screen modes normal → half (the focused panel fills its column) → full (only that panel); narrow terminals (≤ 84 columns) stack the focused side panel above the main panel; borders `border` (rounded · single · double · bold · hidden). Translation and summaries run in the background for the visible rows first (`batch` per call); `» summarizing…` marks a pending one.
 
@@ -130,6 +130,7 @@ Layout: side column `side_width` (0.33) of the screen; the focused side panel is
 | `K` `J` | scroll the main panel from anywhere |
 | Enter | see the table above |
 | Space, `←`/`→` · `-` `=` | fold / unfold a tree node · fold to depth 1 / unfold all |
+| `x` | toggle hold / follow for the main content |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser |
 | Esc / `b` · `f` | back (previous item and perspective) · forward |
 | `u` · `r` | view Home as another person · refetch |

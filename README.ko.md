@@ -117,7 +117,7 @@ lazygit 식 layout: 왼쪽 side column의 panel들과, 선택한 것을 보여�
 | 3 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지) | 그 item으로 이동(`b`/Esc로 복귀) |
 | 4 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`(`[` `]` all / linked) | main에서 읽기 |
 | 5 People | 현재 item의 작성자·코멘트 작성자·mention된 사람 | 그 사람 관점으로 Home 보기 |
-| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(본문+메타 또는 코멘트); **tree** / **log** = 현재 item 주변 그래프(`--hops`, Space/←/→·`-`/`=` 접기, Enter 재루팅, `⇢` 줄 점프, `▾ ▸ ·` 표시); **answer** = 마지막 `a` 질문의 답 | tree: 그 노드로 재루팅 |
+| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(본문+메타 또는 코멘트) — Enter로 정한 item/코멘트는 `x`로 풀 때까지 **고정(hold)**(제목에 `⊙ hold #750` / `~ follows cursor`); **tree** / **log** = 현재 item 주변 그래프(`--hops`, Space/←/→·`-`/`=` 접기, Enter 재루팅, `⇢` 줄 점프, `▾ ▸ ·` 표시); **answer** = 마지막 `a` 질문의 답 | tree: 그 노드로 재루팅 |
 
 Layout: side column 폭 `side_width`(0.33); 포커스된 side panel이 더 높음(`expand_focused`, `expanded_weight`); `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`.
 
@@ -130,6 +130,7 @@ Layout: side column 폭 `side_width`(0.33); 포커스된 side panel이 더 높�
 | `K` `J` | 어디서든 main panel 스크롤 |
 | Enter | 위 표 참조 |
 | Space, `←`/`→` · `-` `=` | tree 노드 접기/펼치기 · depth 1로 접기 / 전부 펼침 |
+| `x` | main content 고정 / 따라가기 토글 |
 | `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기 |
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
 | `u` · `r` | Home을 다른 사람 관점으로 · 재조회 |

@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1881,6 +1881,8 @@ HELP = """gg tui — lazygit style layout
   Enter           Home: make it the current item (Links, Comments, People and the tree follow)
                   Links: go to that item      Comments: focus main on it      People: view as that person
                   main tree/log: re-root on the node; on a ⇢/mentions line: jump to the linked node
+  x               hold / follow: after Enter the main panel holds the chosen item (or comment) — cursor moves
+                  in the side panels do not change it; x releases it so main follows the cursor again
   Space / Left / Right   fold / unfold a tree node      - / =   fold to depth 1 / unfold all
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
   Esc / b         back (previous item and perspective)     f  forward
@@ -1983,6 +1985,7 @@ class Tui:
         self.o.setdefault("summary", True)
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
+        self.hold = False   # True: main keeps showing the chosen item/comment instead of following the cursor
         self.collapsed = set()
         self.focus, self.screen = "home", cfg("screen_mode") if cfg("screen_mode") in ("normal", "half", "full") else "normal"
         self.side_width = float(cfg("side_width") or 0.33)
@@ -2316,10 +2319,11 @@ class Tui:
 
     # ------------------------------------------------------------------ selection / history
     def snapshot(self):
-        return (self.item, self.subject, list(self.me), self.panels["main"].tab, self.panels["home"].tab, set(self.collapsed))
+        return (self.item, self.subject, list(self.me), self.panels["main"].tab, self.panels["home"].tab,
+                set(self.collapsed), self.hold)
 
     def restore(self, st):
-        self.item, self.subject, self.me, self.panels["main"].tab, self.panels["home"].tab, self.collapsed = st
+        self.item, self.subject, self.me, self.panels["main"].tab, self.panels["home"].tab, self.collapsed, self.hold = st
         self.refresh_all()
 
     def set_item(self, nid, push=True):
@@ -2329,6 +2333,8 @@ class Tui:
             self.hist.append(self.snapshot())
             self.fwd = []
         self.item, self.subject, self.collapsed = nid, nid, set()
+        self.hold = True
+        self.panels["main"].top = 0
         self.refresh_all()
         self.fold_below(self.o.get("depth", 1))
 
@@ -2355,7 +2361,9 @@ class Tui:
         self.focus = "home"
 
     def update_subject(self):
-        """The main content follows the row under the cursor of the focused side panel."""
+        """The main content follows the row under the cursor of the focused side panel (unless held with x/Enter)."""
+        if self.hold:
+            return
         if self.focus in ("home", "links", "comments", "people"):
             r = self.panels[self.focus].current()
             nid = (r.jump if r and r.kind == "mention" and r.jump else (r.nid if r else None))
@@ -2465,8 +2473,9 @@ class Tui:
         elif self.focus == "links":
             self.set_item(r.nid)
         elif self.focus == "comments":
-            self.subject = r.nid
+            self.subject, self.hold = r.nid, True
             self.panels["main"].tab = 0
+            self.panels["main"].top = 0
             self.refresh_main()
             self.focus = "main"
         elif self.focus == "people":
@@ -2484,8 +2493,9 @@ class Tui:
                 if self.g.nodes[r.nid].kind == "person":
                     self.view_as([r.nid.lstrip("@")])
                 elif self.g.nodes[r.nid].kind == "comment":
-                    self.subject = r.nid
+                    self.subject, self.hold = r.nid, True
                     self.panels["main"].tab = 0
+                    self.panels["main"].top = 0
                     self.refresh_main()
                 else:
                     self.set_item(r.nid)
@@ -2754,6 +2764,12 @@ class Tui:
                 title += f" ‹ {t_} {cnt.get(k_, 0)} › {p.tab + 1}/{len(p.tabs)}"
             else:
                 title += " " + " ".join(f"[{t}]" if i == p.tab else t for i, t in enumerate(p.tabs))
+            if key == "main":
+                sub = self.g.nodes.get(self.subject) if self.subject else None
+                what = (self.g.label_num(sub) if sub and sub.kind == "item" else
+                        (f"comment on {self.g.label_num(self.g.nodes[sub.parent])}" if sub and sub.kind == "comment" else
+                         (self.subject or "")))
+                title += f"  {'⊙ hold' if self.hold else '~ follows cursor'} {what}"
         if hh == 0:                                  # collapsed to a title bar
             self.put(y, x, clip(f"{tl}{hz}{title}{hz}", 0, ww) + hz * max(0, ww - dw(title) - 3) + tr, attr)
             return
@@ -2780,11 +2796,11 @@ class Tui:
             self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
 
     HINTS = {
-        "home": "⏎ open item  [ ] section  / search  a ask  o browser  u view-as",
+        "home": "⏎ open item (main holds it)  x hold/follow  [ ] section  / search  a ask  o browser  u view-as",
         "links": "⏎ go to item  / search  a ask  o browser",
         "comments": "⏎ read in main  [ ] all/linked  / search  a ask  o browser",
         "people": "⏎ view as this person  a ask  o browser",
-        "main": "[ ] content/tree/log/answer  ⏎ re-root  Space fold  - = fold all/none  K J scroll",
+        "main": "[ ] content/tree/log/answer  ⏎ re-root  Space fold  - = fold all/none  K J scroll  x hold/follow",
         "repo": "r refetch  c t s p h toggles  T theme  $ tokens",
     }
 
@@ -3074,6 +3090,11 @@ class Tui:
             elif k == ord(" ") or k == c.KEY_LEFT or k == c.KEY_RIGHT:
                 if self.focus == "main":
                     self.toggle_fold(None if k == ord(" ") else (k == c.KEY_LEFT))
+            elif k == ord("x"):
+                self.hold = not self.hold
+                if not self.hold:
+                    self.update_subject()
+                self.msg = "main holds the current selection" if self.hold else "main follows the cursor again"
             elif k == ord("-"):
                 self.fold_below(1)
             elif k == ord("="):
