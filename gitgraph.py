@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -487,8 +487,8 @@ def resolve_stubs(repo, numbers, max_age_min):
         progress("stubs", i, len(need), repo)
         aliases = " ".join(
             f'n{n}: issueOrPullRequest(number:{n}){{ __typename '
-            f'... on Issue{{ number title state createdAt author{{login}} }} '
-            f'... on PullRequest{{ number title state isDraft createdAt author{{login}} }} }}'
+            f'... on Issue{{ number title state createdAt body author{{login}} }} '
+            f'... on PullRequest{{ number title state isDraft createdAt body author{{login}} }} }}'
             for n in batch)
         q = f'query {{ repository(owner:"{owner}", name:"{name}") {{ {aliases} }} }}'
         try:
@@ -503,7 +503,7 @@ def resolve_stubs(repo, numbers, max_age_min):
                 cache[str(n)] = {"fetched_at": now, "is_pr": s["__typename"] == "PullRequest",
                                  "title": s.get("title"), "state": s.get("state"),
                                  "draft": s.get("isDraft", False), "created": s.get("createdAt"),
-                                 "author": _login(s.get("author"))}
+                                 "author": _login(s.get("author")), "body": (s.get("body") or "")[:SUM_BODY_CHARS]}
             else:
                 cache[str(n)] = {"fetched_at": now, "missing": True}
     with open(p, "w") as f:
@@ -545,10 +545,37 @@ def _plausible_small_ref(line, m, is_url=False):
     return words[-1].lower() in REF_WORDS
 
 
-def parse_refs(text, default_repo):
+SNIPPET_CHARS = 160
+
+
+def snippet(line, start, end):
+    """The sentence-ish context around line[start:end], collapsed to one line of ~SNIPPET_CHARS."""
+    line = line.strip().lstrip("> ").strip()
+    if len(line) <= SNIPPET_CHARS:
+        return re.sub(r"\s+", " ", line)
+    a = max(0, start - SNIPPET_CHARS // 2)
+    b = min(len(line), end + SNIPPET_CHARS // 2)
+    return ("…" if a else "") + re.sub(r"\s+", " ", line[a:b]).strip() + ("…" if b < len(line) else "")
+
+
+def parse_refs_ctx(text, default_repo):
+    """[((repo, num), snippet)] — every #N / owner/name#N / URL reference with the sentence it appears in."""
     out = []
     host = repo_host(default_repo)
-    for line in _clean_lines(text):
+    paras, cur = [], []
+    for ln in _clean_lines(text):          # hard-wrapped markdown: a paragraph is one sentence source
+        if ln.strip() and not ln.lstrip().startswith(("#", "|", "- ", "* ", "```")):
+            cur.append(ln.strip().lstrip("> ").strip())
+        else:
+            if cur:
+                paras.append(" ".join(cur))
+                cur = []
+            if ln.strip():
+                paras.append(ln)
+    if cur:
+        paras.append(" ".join(cur))
+    for raw in paras:
+        line = raw
         for m in URL_RE.finditer(line):
             num = int(m.group("num"))
             if num <= SMALL_REF and not _plausible_small_ref(line, m, is_url=True):
@@ -556,19 +583,24 @@ def parse_refs(text, default_repo):
             h = m.group("host").lower()
             if h.startswith("www."):
                 h = h[4:]
-            out.append((make_repo(h, *m.group("repo").split("/", 1)), num))
+            out.append(((make_repo(h, *m.group("repo").split("/", 1)), num), snippet(raw, m.start(), m.end())))
         line = URL_RE.sub(" ", line)
         for m in REF_RE.finditer(line):
             num = int(m.group("num"))
             if num <= SMALL_REF and not _plausible_small_ref(line, m):
                 continue
-            out.append((qualify(m.group("repo"), host) if m.group("repo") else default_repo, num))
+            out.append(((qualify(m.group("repo"), host) if m.group("repo") else default_repo, num),
+                        snippet(raw, m.start(), m.end())))
     seen, res = set(), []
-    for r in out:
+    for r, snip in out:
         if r[1] > 0 and r not in seen:
             seen.add(r)
-            res.append(r)
+            res.append((r, snip))
     return res
+
+
+def parse_refs(text, default_repo):
+    return [r for r, _ in parse_refs_ctx(text, default_repo)]
 
 
 def parse_mentions(text):
@@ -701,8 +733,9 @@ def claude_json(prompt, n, phase="translate"):
 
 SUM_BATCH_CHARS = 40000
 SUM_BODY_CHARS = 4000
-SUM_PROMPT = """Summarize each GitHub comment in the JSON array below in ONE line of {lang}, at most 70 characters. \
-Say what the comment does: a finding, a question, a request, a decision, a status update, a measurement, an ack. \
+SUM_PROMPT = """Summarize each GitHub text in the JSON array below (kind = issue, pull request or comment) in ONE line \
+of {lang}, at most 70 characters. For an issue/PR say what it is about (the problem or the change); for a comment say \
+what it does: a finding, a question, a request, a decision, a status update, a measurement, an ack. \
 Keep identifiers, #numbers, file names, function names and technical terms in English. Never use Chinese characters. \
 Output ONLY a JSON array of strings, same length and same order as the input, no code fence, no commentary.
 
@@ -806,18 +839,53 @@ def ask_claude(g, nid, question, model=ASK_MODEL, lang=TR_LANG):
     return out
 
 
+TR_FULL_CHARS = 12000
+TR_FULL_PROMPT = """Translate the following GitHub {kind} text into {lang}. Keep the markdown structure, code blocks, \
+identifiers, file names, function names, #numbers, @logins and URLs exactly as they are; translate only the prose. \
+Output only the translation, no commentary.
+
+{body}"""
+
+
+def translate_body(n, g, lang=TR_LANG):
+    """Full-text translation of an item/comment body (cached in translations_full.json). Returns the text."""
+    body = (n.body or "")[:TR_FULL_CHARS]
+    if not body.strip():
+        return ""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    p = os.path.join(CACHE_DIR, "translations_full.json")
+    cache = {}
+    if os.path.exists(p):
+        with open(p) as f:
+            cache = json.load(f)
+    key = f"{lang}:{hashlib.sha1(body.encode('utf-8')).hexdigest()}"
+    if key in cache:
+        return cache[key]
+    kind = "comment" if n.kind == "comment" else ("pull request" if n.is_pr else "issue")
+    out = claude_call(TR_FULL_PROMPT.format(kind=kind, lang=lang, body=body), TR_MODEL, "translate", timeout=600).strip()
+    if out:
+        cache[key] = out
+        with open(p, "w") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    return out
+
+
 def prepare_summaries(g):
-    """Attach a one-line summary to every comment node of g. Returns the number summarized."""
+    """Attach a one-line summary to every comment and item node of g that has a body. Returns the count."""
     g.summarized = 0
     entries, targets = {}, defaultdict(list)
     for n in g.nodes.values():
-        if n.kind != "comment" or not n.body.strip():
+        if n.kind not in ("comment", "item") or not (n.body or "").strip():
             continue
-        key = hashlib.sha1(n.body.encode("utf-8")).hexdigest()
+        key = hashlib.sha1((n.kind + ":" + n.body).encode("utf-8")).hexdigest()
         if key not in entries:
-            parent = g.nodes.get(n.parent)
-            entries[key] = {"item": (parent.tr_title or parent.title) if parent else "",
-                            "author": n.author, "body": n.body[:SUM_BODY_CHARS]}
+            if n.kind == "comment":
+                parent = g.nodes.get(n.parent)
+                entries[key] = {"kind": "comment", "item": (parent.tr_title or parent.title) if parent else "",
+                                "author": n.author, "body": n.body[:SUM_BODY_CHARS]}
+            else:
+                entries[key] = {"kind": "pull request" if n.is_pr else "issue", "item": n.tr_title or n.title or "",
+                                "author": n.author, "body": n.body[:SUM_BODY_CHARS]}
         targets[key].append(n)
     if not entries:
         return 0
@@ -911,6 +979,7 @@ class Node:
         self.inline_mentions = []             # shown as text when people=False
         self.mention_count = 0                # person nodes
         self.tr_title = None                  # translated title / excerpt (see prepare_translations)
+        self.tr_body = None                   # full-text translation of the body (tui: i)
         self.tr_excerpt = None
         self.summary = None                   # one-line comment summary (see prepare_summaries)
         self.summary_pending = False          # tui: a summary for this comment is being generated
@@ -941,6 +1010,7 @@ class Graph:
         self.fetched_at = None
         self.translated = 0
         self.summarized = 0
+        self.ctx = {}            # (src node id, dst item id) -> sentence in which src references dst
 
     def item_id(self, repo, number):
         return f"{repo}#{number}"
@@ -1026,10 +1096,11 @@ def build_graph(repos, state, max_age_min, refresh=False):
     parsed_pairs = set()   # (src item id, dst item id) already covered by body/comment parsing
     for it in all_items:
         iid = g.item_id(it["repo"], it["number"])
-        for repo, num in parse_refs(it["body"], it["repo"]):
+        for (repo, num), snip in parse_refs_ctx(it["body"], it["repo"]):
             t = g.ensure_item(repo, num)
             g.add_edge(iid, t.id, "ref")
             parsed_pairs.add((iid, t.id))
+            g.ctx.setdefault((iid, t.id), snip)
         for login in parse_mentions(it["body"]):
             g.add_edge(iid, g.ensure_person(login).id, "mention")
         for c in it["closes"]:
@@ -1042,10 +1113,11 @@ def build_graph(repos, state, max_age_min, refresh=False):
                                 body=c["body"], created=c["created"], url=c["url"], author=c["author"],
                                 ckind=c["kind"], review_state=c["review_state"])
             g.add_edge(cid, iid, "comment")
-            for repo, num in parse_refs(c["body"], it["repo"]):
+            for (repo, num), snip in parse_refs_ctx(c["body"], it["repo"]):
                 t = g.ensure_item(repo, num)
                 g.add_edge(cid, t.id, "ref")
                 parsed_pairs.add((iid, t.id))
+                g.ctx.setdefault((cid, t.id), snip)
             for login in parse_mentions(c["body"]):
                 g.add_edge(cid, g.ensure_person(login).id, "mention")
     # incoming cross references not explained by parsed bodies (closed / other-repo sources)
@@ -1069,6 +1141,7 @@ def build_graph(repos, state, max_age_min, refresh=False):
                 continue
             n.is_pr, n.title, n.state = v["is_pr"], v["title"], v["state"]
             n.draft, n.created, n.author = v["draft"], v["created"], v["author"]
+            n.body = v.get("body") or n.body
     g.finalize()
     g.fetched_at = fetched_at
     return g
@@ -1079,6 +1152,7 @@ def apply_filters(g, comments="linked", people=True, closed_neighbors=True):
     h = Graph(g.primary)
     h.fetched_at = g.fetched_at
     h.show_linked = comments != "none"
+    h.ctx = g.ctx
     keep = set(g.nodes)
     if not people:
         keep -= {i for i, n in g.nodes.items() if n.kind == "person"}
@@ -1153,7 +1227,7 @@ def focus(g, root, hops):
 
 def subgraph(g, ids):
     h = Graph(g.primary)
-    h.fetched_at, h.show_linked = g.fetched_at, g.show_linked
+    h.fetched_at, h.show_linked, h.ctx = g.fetched_at, g.show_linked, g.ctx
     h.nodes = {i: g.nodes[i] for i in ids}
     h.edges = {e for e in g.edges if e[0] in ids and e[1] in ids}
     h.finalize()
@@ -1283,7 +1357,7 @@ THEMES = {
         "out": (4, 4, False, False), "in": (5, 5, False, False), "closes": (4, 4, True, False), "closedby": (5, 5, True, False),
         "issue": (2, 2, True, False), "pr": (12, 4, True, False), "draft": (12, 4, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
-        "fold": (3, 3, True, False), "sum": (180, 3, False, False),
+        "url": (39, 6, True, False), "fold": (3, 3, True, False), "sum": (180, 3, False, False),
         "people": ([39, 208, 42, 205, 226, 51, 141, 203, 118, 214, 81, 171, 190, 99, 209, 45], [1, 2, 3, 4, 5, 6]),
     },
     "light": {  # light background: darker tones, grey instead of dim
@@ -1292,7 +1366,7 @@ THEMES = {
         "out": (4, 4, False, False), "in": (5, 5, False, False), "closes": (4, 4, True, False), "closedby": (5, 5, True, False),
         "issue": (22, 2, True, False), "pr": (4, 4, True, False), "draft": (4, 4, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (30, 6, False, False),
-        "fold": (130, 3, True, False), "sum": (94, 3, False, False),
+        "url": (4, 4, True, False), "fold": (130, 3, True, False), "sum": (94, 3, False, False),
         "people": ([18, 88, 22, 90, 130, 24, 54, 94, 28, 124, 30, 91, 52, 58, 23, 89], [1, 2, 3, 4, 5, 6]),
     },
     "basic": {  # 8 colours only, no dim, no dark blue: PuTTY and other plain terminals
@@ -1301,7 +1375,7 @@ THEMES = {
         "out": (6, 6, False, False), "in": (5, 5, False, False), "closes": (6, 6, True, False), "closedby": (5, 5, True, False),
         "issue": (2, 2, True, False), "pr": (3, 3, True, False), "draft": (3, 3, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
-        "fold": (7, 7, True, False), "sum": (7, 7, False, False),
+        "url": (6, 6, True, False), "fold": (7, 7, True, False), "sum": (7, 7, False, False),
         "people": ([2, 3, 5, 6, 1, 7], [2, 3, 5, 6, 1, 7]),
     },
 }
@@ -1336,7 +1410,7 @@ def style_spec(st):
 
 def ansi_style(st):
     fg, bold, dim = style_spec(st)
-    codes = (["1"] if bold else []) + (["2"] if dim else [])
+    codes = (["1"] if bold else []) + (["2"] if dim else []) + (["4"] if st == "url" else [])
     if fg is not None:
         codes.append(f"3{fg}" if fg < 8 else f"9{fg - 8}" if fg < 16 else f"38;5;{fg}")
     return f"\033[{';'.join(codes)}m" if codes else ""
@@ -1355,6 +1429,10 @@ def segments(row, g):
         return [(t, "head")]
     if row.kind in ("link", "conn"):
         return [(t, "link")]
+    if row.kind == "note":
+        return [(t, "sum" if t.lstrip().startswith("↳ »") else "meta")]
+    if row.kind == "url":
+        return [(t, "url")]
     if row.kind == "mention":
         i = t.find("  ← ")
         head = segments(Row(t[:i] if i >= 0 else t, row.nid), g)
@@ -1783,6 +1861,9 @@ def render_show(g, nid, width=100):
         if t == "comment" and n.kind == "item":
             continue
         out.append(f"  {EDGE_LABEL[(t, o)]}{node_label(g, g.nodes[m], width)}")
+        ctx = g.ctx.get((nid, m)) if o else g.ctx.get((m, nid))
+        if ctx:
+            out.append(f"      ↳ \"{ctx}\"")
     if n.kind == "item":
         cs = g.comments_of(nid)
         if cs or n.comments_total:
@@ -1872,8 +1953,8 @@ def wrap(text, width):
 
 HELP = """gg tui — lazygit style layout
 
-  side column: 1 Repo  2 Home  3 Links  4 Comments  5 People      main: 0 (tabs: content · tree · log · answer)
-  1-5 / 0         jump to a panel            Tab / Shift-Tab  next / previous panel
+  side column: 1 Repo  2 Item  3 Home  4 Links  5 Comments  6 People      main: 0 (content · tree · log · answer)
+  1-6 / 0         jump to a panel            Tab / Shift-Tab  next / previous panel
   [ / ]           previous / next tab in the focused panel (Home sections, Comments all/linked, main tabs)
   + / _           screen mode normal -> half (focused side panel fills the column) -> full (only that panel)
   Up/k Down/j     move            PgUp/PgDn , .   page       g/G < >  top / bottom      H / L  scroll sideways
@@ -1885,11 +1966,12 @@ HELP = """gg tui — lazygit style layout
                   in the side panels do not change it; x releases it so main follows the cursor again
   Space / Left / Right   fold / unfold a tree node      - / =   fold to depth 1 / unfold all
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
+  i               translate the main content (issue/PR body or comment) in full; press again for the original
   Esc / b         back (previous item and perspective)     f  forward
   u               view Home as another person       r  refetch from GitHub
   c t s p h       comments mode · translation · summaries · people nodes · hops 1/2/3
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
-  mouse           click = focus panel + select; double-click = Enter; right click = open in browser;
+  mouse           click = focus panel + select; double-click = Enter;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
                   drag the border between the side column and main to resize (gg config side_width keeps it)
   O               options menu (comments / translation / summaries / people / hops / theme / screen)
@@ -1974,7 +2056,7 @@ class Panel:
 
 
 class Tui:
-    SIDE = ["repo", "home", "links", "comments", "people"]
+    SIDE = ["repo", "item", "home", "links", "comments", "people"]
     HOME_TABS = [("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
     MAIN_TABS = ["content", "tree", "log", "answer"]
@@ -1989,6 +2071,9 @@ class Tui:
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
         self.hold = False   # True: main keeps showing the chosen item/comment instead of following the cursor
+        self.show_tr = False   # main content: show the full-text translation (i toggles; runs claude on demand)
+        self.last_side = "home"   # the side list panel that stays expanded while main is focused
+        self.tr_thread, self.tr_pending = None, None
         self.collapsed = set()
         self.focus, self.screen = "home", cfg("screen_mode") if cfg("screen_mode") in ("normal", "half", "full") else "normal"
         self.side_width = float(cfg("side_width") or 0.33)
@@ -1997,6 +2082,7 @@ class Tui:
         self.border = BORDERS.get(cfg("border"), BORDERS["rounded"])
         self.panels = {
             "repo": Panel("repo", "Repo"),
+            "item": Panel("item", "Item"),
             "home": Panel("home", "Home", [t for _, t in self.HOME_TABS]),
             "links": Panel("links", "Links"),
             "comments": Panel("comments", "Comments", ["all", "linked"]),
@@ -2047,13 +2133,17 @@ class Tui:
 
     def busy(self):
         return (self.worker is not None and self.worker.is_alive()) or \
-               (self.ask_thread is not None and self.ask_thread.is_alive())
+               (self.ask_thread is not None and self.ask_thread.is_alive()) or \
+               (self.tr_thread is not None and self.tr_thread.is_alive())
 
     def progress_text(self):
         sp = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time() * 8) % 10]
         if self.ask_thread is not None and self.ask_thread.is_alive():
             el = int(time.time() - self.ask_state["t0"])
             return f"{sp} asking {model_label(ASK_MODEL)} about {self.ask_state['label']}  {el}s"
+        if self.tr_thread is not None and self.tr_thread.is_alive():
+            el = int(time.time() - self.tr_pending[1])
+            return f"{sp} translating {self.tr_pending[0]} in full ({model_label(TR_MODEL)})  {el}s"
         p = self.progress or {}
         el = int(time.time() - self.t0)
         els = f"{el // 60}m{el % 60:02d}s" if el >= 60 else f"{el}s"
@@ -2115,6 +2205,7 @@ class Tui:
         self.panels["repo"].rows = self.repo_rows()
         self.panels["home"].set_rows(self.home_rows(), keep)
         self.panels["links"].set_rows(self.links_rows(), keep)
+        self.panels["item"].rows = self.item_rows()
         self.panels["comments"].set_rows(self.comments_rows(), keep)
         self.panels["people"].set_rows(self.people_rows(), keep)
         self.refresh_main(keep)
@@ -2127,12 +2218,25 @@ class Tui:
         n_items = sum(1 for n in g.nodes.values() if n.kind == "item" and not n.stub)
         fa = datetime.fromtimestamp(g.fetched_at).strftime("%H:%M") if g.fetched_at else "?"
         me = ",".join("@" + m for m in self.me) or "-"
-        cur = self.g.nodes.get(self.item)
         return [Row(f"{g.primary}  {n_items} open  fetched {fa}  me={me}", kind="head"),
-                Row(f"item: {item_label(g, cur, 60, with_meta=False) if cur else '(none — pick one in Home)'}", kind="head"),
                 Row(f"theme={THEME} comments={self.o['comments']} translate={self.o['translate']} "
-                    f"summary={'on' if self.o['summary'] else 'off'} hops={self.o['hops']}", kind="head"),
-                Row(usage_line(), kind="head")]
+                    f"summary={'on' if self.o['summary'] else 'off'} hops={self.o['hops']}  {usage_line()}", kind="head")]
+
+    def item_rows(self):
+        """The current item: label, metadata, one-line summary, url — Enter shows it in main."""
+        g, w = self.g, self.o["width"]
+        n = g.nodes.get(self.item)
+        if not n:
+            return [Row("(no current item — Enter on a row in Home)", kind="head")]
+        n_links = sum(1 for r in self.panels["links"].rows if r.kind == "")
+        meta = [f"updated {short_date(n.updated)}" if n.updated else "", ", ".join(n.labels),
+                f"{n.comments_total} comments" if n.comments_total else "", f"{n_links} links" if n_links else ""]
+        summ = ("» " + n.summary) if n.summary else ("» " + PENDING_TEXT if n.summary_pending else
+                                                     (excerpt(n.body, 200) if (n.body or "").strip() else "(no body)"))
+        return [Row(item_label(g, n, w), n.id),
+                Row("  " + " · ".join(x for x in meta if x), n.id, kind="note"),
+                Row("  " + summ, n.id, kind="note"),
+                Row("  " + (n.url or ""), n.id, kind="url")]
 
     def home_sections(self):
         """{key: [Row]} for every home section (same rules as the old single-screen home)."""
@@ -2222,7 +2326,26 @@ class Tui:
             n = g.nodes[m]
             via = "" if src.kind == "item" else f" (via {rel_days(src, g)} comment)"
             rows.append(Row(EDGE_LABEL[(t, o)] + node_label(g, n, w) + via, m))
+            rows.append(Row("   ↳ " + self.link_note(src, n, t, o), m, kind="note"))
         return rows or [Row("(no links)", kind="head")]
+
+    def link_note(self, src, n, t, o):
+        """Why this link exists: the sentence that made the reference, else a one-line summary of the other item."""
+        g = self.g
+        if t == "closes":
+            return "PR closes the issue (closingIssuesReferences)" if o else "closed by this PR"
+        ctx = g.ctx.get((src.id, n.id)) if o else None
+        if not o:      # incoming: the other side (n, an item or a comment) references our item
+            ctx = g.ctx.get((n.id, self.item))
+        if ctx:
+            return f"\"{ctx}\""
+        if n.kind == "comment":
+            return "» " + n.summary if n.summary else ("» " + PENDING_TEXT if n.summary_pending else excerpt(n.body, 120))
+        if n.summary:
+            return "» " + n.summary
+        if n.summary_pending:
+            return "» " + PENDING_TEXT
+        return "(referenced via GitHub's timeline; no text available)" if not (n.body or "").strip() else excerpt(n.body, 120)
 
     def comments_rows(self):
         if not self.item:
@@ -2266,7 +2389,8 @@ class Tui:
         tab = self.MAIN_TABS[p.tab]
         if tab == "content":
             p.scroll_only = True
-            p.rows = [Row(t) for t in self.content_lines(self.subject, max(p.rect[3], 40))]
+            p.rows = [Row(t, kind="url" if re.match(r"https?://\S+$", t) else "")
+                      for t in self.content_lines(self.subject, max(p.rect[3], 40))]
         elif tab == "answer":
             p.scroll_only = True
             p.rows = [Row(t) for t in wrap(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))]
@@ -2288,14 +2412,14 @@ class Tui:
         g = self.g
         out, body = [], ""
         if n.kind == "item":
+            if n.url:
+                out.append(n.url)
             out.append(f"{g.label_num(n)} {kind_tag(n)} {n.tr_title or n.title or '(unresolved)'}")
             if n.tr_title:
                 out.append(f"original: {n.title}")
             meta = [f"@{n.author}" if n.author else "", short_date(n.created),
                     f"updated {short_date(n.updated)}" if n.updated else "", ", ".join(n.labels)]
             out.append("  ".join(x for x in meta if x))
-            if n.url:
-                out.append(n.url)
             if n.stub:
                 out.append("(not fetched: closed item or other repo — press o to open it)")
             body = n.body
@@ -2305,21 +2429,60 @@ class Tui:
                 head += f"  [{(n.review_state or 'review').lower()}]"
             elif n.ckind == "review_comment":
                 head += "  [inline review comment]"
+            if n.url:
+                out.append(n.url)
             out.append(head)
             if n.summary:
                 out.append(f"» {n.summary}")
-            if n.url:
-                out.append(n.url)
             body = n.body
         else:
             out.append(f"{n.id}  mentioned {n.mention_count} times:")
             for m, t, o in sorted(g.adj[nid], key=lambda e: -g.nodes[e[0]].time):
                 if t == "mention":
                     out.append("  " + node_label(g, g.nodes[m], 120))
+        if self.show_tr and n.kind in ("item", "comment"):
+            if n.tr_body:
+                out.append(f"(translated to {TR_LANG} — i shows the original)")
+                body = n.tr_body
+            elif self.tr_thread is not None and self.tr_thread.is_alive() and self.tr_pending and self.tr_pending[2] == nid:
+                out.append(f"({PENDING_TEXT.replace('요약', '번역') if TR_LANG.lower().startswith('korean') else 'translating…'})")
         if body.strip():
             out.append("")
             out.extend(wrap(body, width))
         return out
+
+    def translate_content(self):
+        """i: toggle between the original and a full translation of the main content (translated on demand)."""
+        nid = self.subject or self.item
+        n = self.g.nodes.get(nid) if nid else None
+        if not n or n.kind not in ("item", "comment") or not (n.body or "").strip():
+            self.msg = "nothing to translate here"
+            return
+        if self.show_tr:
+            self.show_tr = False
+            self.refresh_main()
+            return
+        self.show_tr = True
+        self.panels["main"].tab = 0
+        if n.tr_body:
+            self.refresh_main()
+            return
+        if self.tr_thread is not None and self.tr_thread.is_alive():
+            self.msg = "a translation is still running"
+            return
+        import threading
+        label = self.g.label_num(n) if n.kind == "item" else f"comment on {self.g.label_num(self.g.nodes[n.parent])}"
+        self.tr_pending = (label, time.time(), nid)
+
+        def work():
+            try:
+                n.tr_body = translate_body(n, self.g) or None
+            except Exception as e:  # noqa: BLE001
+                self.msg = f"translation failed: {e}"
+
+        self.tr_thread = threading.Thread(target=work, daemon=True)
+        self.tr_thread.start()
+        self.refresh_main()
 
     # ------------------------------------------------------------------ selection / history
     def snapshot(self):
@@ -2368,7 +2531,7 @@ class Tui:
         """The main content follows the row under the cursor of the focused side panel (unless held with x/Enter)."""
         if self.hold:
             return
-        if self.focus in ("home", "links", "comments", "people"):
+        if self.focus in ("item", "home", "links", "comments", "people"):
             r = self.panels[self.focus].current()
             nid = (r.jump if r and r.kind == "mention" and r.jump else (r.nid if r else None))
             if nid and nid != self.subject:
@@ -2474,6 +2637,12 @@ class Tui:
             return
         if self.focus == "home":
             self.set_item(r.nid)
+        elif self.focus == "item":
+            self.subject, self.hold = self.item, True
+            self.panels["main"].tab = 0
+            self.panels["main"].top = 0
+            self.refresh_main()
+            self.focus = "main"
         elif self.focus == "links":
             self.set_item(r.nid)
         elif self.focus == "comments":
@@ -2749,6 +2918,8 @@ class Tui:
     # ------------------------------------------------------------------ layout
     def layout(self):
         """Assign content rects to the visible panels for the current screen mode / terminal size."""
+        if self.focus in ("home", "links", "comments", "people"):
+            self.last_side = self.focus
         h, w = self.scr.getmaxyx()
         H = h - 1                                   # bottom line
         portrait = w <= 84
@@ -2777,16 +2948,18 @@ class Tui:
                     place(side_key, 0, 0, H, side_w)
                     place("main", 0, side_w, H, w - side_w)
         else:
-            repo_h = 6
-            rest = H - repo_h
+            repo_h, item_h = 4, 6
+            rest = H - repo_h - item_h
             lists = ["home", "links", "comments", "people"]
             if rest < 4 * 3:
                 # too small: only the focused list panel gets space, the others collapse to their title bar
                 y = 0
                 place("repo", y, 0, repo_h, side_w)
                 y += repo_h
+                place("item", y, 0, item_h, side_w)
+                y += item_h
                 for k in lists:
-                    hh = rest - 2 * 3 if k == (self.focus if self.focus in lists else "home") else 2
+                    hh = rest - 2 * 3 if k == (self.focus if self.focus in lists else self.last_side) else 2
                     if hh >= 3:
                         place(k, y, 0, hh, side_w)
                         y += hh
@@ -2794,11 +2967,14 @@ class Tui:
                         self.panels[k].rect = (y, 0, 0, side_w)   # title bar only
                         y += 2
             else:
-                weights = [self.expanded_weight if (self.expand_focused and k == self.focus) else 1.0 for k in lists]
+                grow = self.focus if self.focus in lists else self.last_side
+                weights = [self.expanded_weight if (self.expand_focused and k == grow) else 1.0 for k in lists]
                 total = sum(weights)
                 y = 0
                 place("repo", y, 0, repo_h, side_w)
                 y += repo_h
+                place("item", y, 0, item_h, side_w)
+                y += item_h
                 heights = [max(3, int(rest * wt / total)) for wt in weights]
                 heights[-1] = max(3, rest - sum(heights[:-1]))
                 for k, hh in zip(lists, heights):
@@ -2853,6 +3029,8 @@ class Tui:
             a |= c.A_DIM
         if st == "pending":
             a |= getattr(c, "A_ITALIC", 0)
+        if st == "url":
+            a |= c.A_UNDERLINE
         return a
 
     def dim(self):
@@ -2951,8 +3129,9 @@ class Tui:
         "links": "⏎ go to item  / search  a ask  o browser",
         "comments": "⏎ read in main  [ ] all/linked  / search  a ask  o browser",
         "people": "⏎ view as this person  a ask  o browser",
-        "main": "[ ] content/tree/log/answer  ⏎ re-root  Space fold  - = fold all/none  K J scroll  x hold/follow",
+        "main": "[ ] content/tree/log/answer  i translate  ⏎ re-root  Space fold  - = fold all/none  K J scroll  x hold",
         "repo": "r refetch  c t s p h toggles  T theme  $ tokens",
+        "item": "⏎ read in main  i translate  a ask  o browser  d details",
     }
 
     def draw(self):
@@ -3074,13 +3253,6 @@ class Tui:
         if base == 129:
             self.forward()
             return
-        if base == 2:
-            if key and key != "repo":
-                self.focus = key
-                self.click_row(key, y)
-                self.update_subject()
-            self.open_browser()
-            return
         if base != 0 or not key:
             return
         self.focus = key
@@ -3129,6 +3301,7 @@ class Tui:
         ("*", "+ _", "screen mode normal / half / full", ord("+")),
         ("*", "x", "hold / follow the main content", ord("x")),
         ("*", "a", "ask claude about the selection", ord("a")),
+        ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
         ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Home as another person", ord("u")),
         ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
@@ -3169,6 +3342,9 @@ class Tui:
             if self.ask_thread is not None and not self.ask_thread.is_alive():
                 self.ask_thread = None
                 self.refresh_main()
+            if self.tr_thread is not None and not self.tr_thread.is_alive():
+                self.tr_thread = None
+                self.refresh_main()
             self.scr.timeout(150 if self.busy() else -1)
             self.draw()
             k = self.read_key()
@@ -3194,7 +3370,7 @@ class Tui:
         if k == c.KEY_RESIZE:
             return True
         # ---- panels ----
-        if ord("1") <= k <= ord("5"):
+        if ord("1") <= k <= ord("6"):
             self.focus = self.SIDE[k - ord("1")]
             return True
         if k == ord("0"):
@@ -3282,6 +3458,8 @@ class Tui:
             self.forward()
         elif k == ord("a"):
             self.ask()
+        elif k == ord("i"):
+            self.translate_content()
         elif k == ord("d"):
             self.details()
         elif k == ord("o"):
