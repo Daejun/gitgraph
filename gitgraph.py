@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -3153,6 +3153,38 @@ def tui(opts):
     except SystemExit as e:
         if isinstance(e.code, str):
             print(e.code)
+
+
+# --------------------------------------------------------------------------
+# request handling (shared by CLI and MCP)
+# --------------------------------------------------------------------------
+def graph_rows(repos=None, layout="tree", state="open", comments="linked", people=True,
+               closed_neighbors=True, root=None, hops=2, max_age_min=15, refresh=False, width=60,
+               translate=None, summary=False):
+    """(rows, rendered graph) for the overview or a focus view."""
+    repos = resolve_repos(repos)
+    translate = translate or DEFAULT_TRANSLATE
+    g = build_graph(repos, state, max_age_min, refresh)
+    g2 = apply_filters(g, comments, people, closed_neighbors)
+    if root:
+        rid = resolve_root(g, root)
+        if rid not in g2.nodes:
+            raise ValueError(f"{rid} was filtered out (comments={comments}, people={people})")
+        g2 = subgraph(g2, focus(g2, rid, hops))
+    prepare_translations(g2, translate)
+    if summary:
+        prepare_summaries(g2)
+    if root:
+        return focus_rows(g2, rid, layout, width), g2
+    return overview_rows(g2, layout, width), g2
+
+
+def do_show(id_, repos=None, state="open", max_age_min=15, refresh=False, translate=None):
+    repos = resolve_repos(repos)
+    g = build_graph(repos, state, max_age_min, refresh)
+    nid = resolve_root(g, id_)
+    prepare_translations(subgraph(g, {nid} | {m for m, t, o in g.adj[nid]}), translate or DEFAULT_TRANSLATE)
+    return render_show(g, nid)
 
 
 # --------------------------------------------------------------------------
