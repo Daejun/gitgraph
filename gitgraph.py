@@ -243,10 +243,13 @@ def graphql(query, variables=None, host=DEFAULT_HOST):
         if "NOT_FOUND" in types or "Could not resolve" in (r.stderr or ""):
             continue  # try next account
         if TRANSIENT_RE.search(r.stderr or ""):
-            raise GhError(f"cannot reach api.github.com: {r.stderr.strip().splitlines()[-1][:160]}\n"
+            raise GhError(f"cannot reach {host}: {r.stderr.strip().splitlines()[-1][:160]}\n"
                           "  check: `gh api user` works? proxy needed (export HTTPS_PROXY=http://host:port)? "
                           "VPN/DNS? retries: GITGRAPH_RETRIES (default 3)")
         break
+    if isinstance(last_err, list) and last_err and all(e.get("type") == "NOT_FOUND" for e in last_err):
+        msg = last_err[0].get("message", "not found")
+        raise GhError(f"{msg} on {host} with any gh account ({', '.join(gh_accounts(host)) or 'none logged in — gh auth login -h ' + host})")
     raise GhError(f"graphql failed: {last_err}")
 
 
