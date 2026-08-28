@@ -146,7 +146,8 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `y` | copy the URL of the selection to the clipboard |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser (the URL is also the first, underlined line of the content) |
 | Esc / `b` · `f` | back (previous item and perspective) · forward |
-| `u` · `r` | view Inbox as another person · refetch |
+| `u` | view Inbox as another person |
+| `r` · `R` | refresh from GitHub in the background: only what changed (also automatic every `--max-age` minutes) · everything |
 | `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | search in the focused panel · colour theme · token usage · quit |
 | `C` | open Claude Code next to gg (a tmux pane, else full screen). Through the `gg mcp` server it sees what you look at (`gg_state`, `gg_context`), your marks (`gg_todo`) and can drive gg (`gg_open`, `gg_mark`) and tick off marks it has handled (`gg_todo_done`). Register once: `claude mcp add -s user gg -- gg mcp` |
