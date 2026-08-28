@@ -31,13 +31,14 @@ git repo 안이나 repo들이 모여 있는 dir(2단계 아래까지)에서 `gg`
 ## 사용법
 
 ```
-gg                        # open 항목 전체 개요 (tree)
-gg -l log                 # git log --graph 식 시간축
-gg 768 --hops 1           # #768 주변 1-hop (#768, owner/repo#768 도 됨)
-gg @someone               # 사람 기준
+gg                        # TUI (기본)
+gg 768                    # #768에서 시작하는 TUI (owner/repo#768, @someone 도 됨)
+gg tutorial               # 화면 안내 투어와 함께 TUI (안에서는 F2)
+gg graph                  # 텍스트 그래프: open 항목 전체 개요 (tree)
+gg graph -l log           # git log --graph 식 시간축
+gg graph 768 --hops 1     # #768 주변 텍스트 그래프
 gg show 748               # 노드 상세: edge 전부(참조가 나온 문장 포함), 코멘트, 본문
 gg ask 4563 "왜 #3859를 언급해?"   # 그 항목(본문+코멘트 전체)을 context로 claude에게 단발 질문
-gg tui [768]              # 대화형 화면; 숫자를 주면 그 tree에서 시작
 gg config [KEY [VALUE]]   # 설정 저장
 gg todo                   # tui에서 m으로 표시한 것들의 markdown 출력
 gg check [-r owner/name]  # 진단: host별 gh 계정, 계정별 접근 여부, open 수, GraphQL 필드
@@ -94,7 +95,7 @@ code fence 안과 kernel log / stack trace 줄(`[ 123.4]`, `Tainted:`, `PID:`, `
 
 ## TUI
 
-lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links · Comments · People)과, 선택한 것을 보여주는 오른쪽 main panel.
+lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Inbox · Comments · Links · People)과, 선택한 것을 보여주는 오른쪽 main panel.
 
 ```
 ╭─1 Repo──────────────────────╮╭─0 Main [content] answer───────────────────────────────╮
@@ -104,12 +105,13 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links
 │ 2026-08-13 #750 [PR] mtfs: …││                                                       │
 │   » one-line summary        ││                                                       │
 ╰─────────────────────────────╯│                                                       │
-╭─3 Home ‹ my turn 2 › 1/9────╮│ Running the device out of space under concurrent …   │
+╭─3 Inbox ‹ my turn 2 › 1/10──╮│ Running the device out of space under concurrent …   │
 │ 2026-08-17 #763 [I] xfstest…││                                                       │
-╭─4 Links─────────────────────╮│                                                       │
-│ → refs 2026-08-13 #748 [I] …││                                                       │
-╭─5 Comments──────────────────╮│                                                       │
+╭─4 Comments──────────────────╮│                                                       │
 │ +0d o @Daejun7Park » …      ││                                                       │
+╭─5 Links─────────────────────╮│                                                       │
+│ → refs 2026-08-13 #748 [I] …││                                                       │
+│   ↳ #748의 후반부 구현 …     ││                                                       │
 ╭─6 People────────────────────╮│                                                       │
 │ @Daejun7Park  author        ││                                                       │
 ╰─────────────────────────────╯╰───────────────────────────────────────────────────────╯
@@ -120,10 +122,10 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Home · Links
 |---|---|---|
 | 1 Repo | repo, open 수, fetch 시각, "나", 토글 상태, 토큰 사용량 | – |
 | 2 Item | 현재 item: 제목, 메타, `» 한 줄 요약`(없으면 본문 첫 줄), 코멘트/링크 수, URL | main에서 읽기 |
-| 3 Home | 한 번에 한 섹션(`[` `]`): my turn · todo · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`). my turn / active / waiting / PRs 행에서는 커서가 **마지막 코멘트**를 미리 보여줌(main에 코멘트가 뜨는 이유); my turn 행 끝에 왜 내 차례인지 표시: `⟵ @who mentioned +5d`, `@who on my PR +14d`, `@who replied +2d` | **현재 item**으로 설정 — Item, Links, Comments, People이 따라옴 |
-| 4 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄에 **이유**를 짧게: 참조가 나온 문장을 요약기가 40자 이내 한 줄로 바꾼 것(예: `충돌 여부를 확인한 관련 PR`; 오기 전이거나 요약이 꺼져 있으면 `#N` 주변 짧은 인용), 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 본문을 받아온 뒤 코멘트와 같은 요약기로; 대기 중엔 `» 요약 중…`) | 그 item으로 이동; 코멘트 행이면 그 item으로 가고 커서는 그 코멘트에(`b`/Esc로 복귀) |
-| 5 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`, 최신이 위 | main에서 읽기 |
-| 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람, 최근 활동 순 | 그 사람 관점으로 Home 보기 |
+| 3 Inbox | 한 번에 한 섹션(`[` `]`): my turn · todo · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`). my turn / active / waiting / PRs 행에서는 커서가 **마지막 코멘트**를 미리 보여줌(main에 코멘트가 뜨는 이유); my turn 행 끝에 왜 내 차례인지 표시: `⟵ @who mentioned +5d`, `@who on my PR +14d`, `@who replied +2d` | **현재 item**으로 설정 — Item, Links, Comments, People이 따라옴 |
+| 5 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄(최대 두 줄)에 **이유**: 참조가 나온 문장을 요약기가 40자 이내 한 줄로 바꾼 것(예: `충돌 여부를 확인한 관련 PR`; 오기 전이거나 요약이 꺼져 있으면 `#N` 주변 짧은 인용), 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 본문을 받아온 뒤 코멘트와 같은 요약기로; 대기 중엔 `» 요약 중…`) | 그 item으로 이동; 코멘트 행이면 그 item으로 가고 커서는 그 코멘트에(`b`/Esc로 복귀) |
+| 4 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`, 최신이 위 | main에서 읽기 |
+| 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람, 최근 활동 순 | 그 사람 관점으로 Inbox 보기 |
 | 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(URL이 첫 줄에 밑줄로; 본문+메타 또는 코멘트) — main에 포커스가 있는 동안은 그대로 유지; **answer** = 마지막 `a` 질문의 답. 둘 다 markdown 렌더링: 제목, 코드 블록·`code`, **굵게**, 링크, 인용, 글머리표 | – |
 
 Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄이고 폭이 바뀌면(드래그·리사이즈·screen mode) 다시 맞춤; 포커스된 side panel이 더 높고(`expand_focused`, `expanded_weight`) main으로 포커스가 가도 그 크기를 유지해 다음 선택이 쉬움; `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`.
@@ -137,13 +139,13 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 | `K` `J` | 어디서든 main panel 스크롤 |
 | Enter | 위 표 참조 |
 | `i` | main content(issue/PR 본문 또는 코멘트)를 `lang`으로 전문 번역; 다시 누르면 원문(`translations_full.json` 캐시) |
-| `m` | 선택한 issue/PR 또는 코멘트를 다음 작업으로 표시하고 메모를 적음; 표시된 행에 `✎`, Home의 **todo** 섹션(my turn 다음 탭), 그리고 markdown 파일 `todo_file`(기본 `~/gitgraph-todo.md`; `gg todo`로 출력)이 다시 써져서 다음 세션이나 Claude가 그 문서를 보고 일을 이어갈 수 있음. 표시된 행에서 다시 `m`: 메모 수정 / 완료 / 삭제. 원본은 `~/.config/gitgraph/todo.json` |
+| `m` | 선택한 issue/PR 또는 코멘트를 다음 작업으로 표시하고 메모를 적음; 표시된 행에 `✎`, Inbox의 **todo** 섹션(my turn 다음 탭), 그리고 markdown 파일 `todo_file`(기본 `~/gitgraph-todo.md`; `gg todo`로 출력)이 다시 써져서 다음 세션이나 Claude가 그 문서를 보고 일을 이어갈 수 있음. 표시된 행에서 다시 `m`: 메모 수정 / 완료 / 삭제. 원본은 `~/.config/gitgraph/todo.json` |
 | `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기(URL은 content 첫 줄에 밑줄로도 표시) |
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
-| `u` · `r` | Home을 다른 사람 관점으로 · 재조회 |
+| `u` · `r` | Inbox을 다른 사람 관점으로 · 재조회 |
 | `c` `t` `s` `p` `h` | comments 모드 · 번역 · 요약 · 사람 노드 · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | 포커스 panel 검색 · 색 테마 · 토큰 사용량 · 종료 |
-| `?` · `O` · F1 | 포커스 panel의 키 메뉴(Enter로 실행) · 옵션 메뉴(comments / 번역 / 요약 / 사람 / hops / 테마 / screen) · 전체 도움말 |
+| `?` · `O` · F1 · F2 | 포커스 panel의 키 메뉴(Enter로 실행) · 옵션 메뉴(comments / 번역 / 요약 / 사람 / hops / 테마 / screen) · 전체 도움말 · 화면 안내 투어(첫 실행 때 한 번 제안; `gg tutorial`도 같음) |
 | 한글 IME | 한/영 전환을 안 해도 단축키가 먹음: 들어온 자모·음절을 2벌식 자판 키로 되돌림(`ㅓ` = j, `ㅏ` = k, `자` = w k) |
 | 마우스 | 클릭 = 포커스 + 선택 · URL 줄 클릭 = 브라우저로 열기 · 더블클릭 = Enter · 휠 = 커서는 두고 그 panel 스크롤 · 뒤로/앞으로 버튼 · side/main 경계 드래그로 폭 조절(`gg config side_width`로 저장) |
 
