@@ -29,7 +29,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -3028,6 +3028,10 @@ class Tui:
                 rows.append(Row(t, kind="url"))
                 prev_table = False
                 continue
+            if t.startswith("⟳ "):
+                rows.append(Row(t, kind="head"))
+                prev_table = False
+                continue
             if not in_code and t.startswith(("│", "├")):
                 r = Row(t, kind="md_table")
                 if not prev_table:
@@ -3107,7 +3111,10 @@ class Tui:
                 out.append(f"(translated to {TR_LANG} — i shows the original)")
                 body = n.tr_body
             elif self.tr_thread is not None and self.tr_thread.is_alive() and self.tr_pending and self.tr_pending[2] == nid:
-                out.append(f"({PENDING_TEXT.replace('요약', '번역') if TR_LANG.lower().startswith('korean') else 'translating…'})")
+                el = int(time.time() - self.tr_pending[1])
+                ko = TR_LANG.lower().startswith("korean")
+                out.append((f"⟳ 번역 중… {el}s ({model_label(TR_MODEL)}) — 아래는 원문, 끝나면 바뀝니다" if ko else
+                            f"⟳ translating… {el}s ({model_label(TR_MODEL)}) — original below until it is done"))
         if body.strip():
             out.append("")
             out.extend(render_markdown(self.reflow(body), width))
@@ -3860,9 +3867,10 @@ class Tui:
                         (f"comment on {self.g.label_num(self.g.nodes[sub.parent])}" if sub and sub.kind == "comment" else
                          (self.subject or "")))
                 title += f"  · {what}  "
-                btn = "[i 원문]" if self.show_tr else "[i 번역]"
-                if not TR_LANG.lower().startswith("korean"):
-                    btn = "[i original]" if self.show_tr else "[i translate]"
+                busy_tr = self.tr_thread is not None and self.tr_thread.is_alive()
+                ko = TR_LANG.lower().startswith("korean")
+                btn = ("[번역 중…]" if ko else "[translating…]") if busy_tr else \
+                      (("[i 원문]" if self.show_tr else "[i 번역]") if ko else ("[i original]" if self.show_tr else "[i translate]"))
                 zones.append((dw(title), dw(title) + dw(btn), ("translate", 0)))
                 title += btn
         self.title_zones[key] = [(x - 1 + 2 + a, x - 1 + 2 + b, act) for a, b, act in zones]   # screen columns
@@ -4379,6 +4387,10 @@ class Tui:
             if self.tr_thread is not None and not self.tr_thread.is_alive():
                 self.tr_thread = None
                 self.refresh_main()
+            elif self.tr_thread is not None and self.MAIN_TABS[self.panels["main"].tab] == "content":
+                top = self.panels["main"].top
+                self.refresh_main()
+                self.panels["main"].top = top
             self.scr.timeout(400 if self.busy() else 500)
             self.draw()
             k = self.read_key()
