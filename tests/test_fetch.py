@@ -502,6 +502,39 @@ class TestResolveStubs(FetchCase):
         self.assertEqual(again[42]["title"], "referenced issue")
         self.assertEqual(len(self.gh_calls()), before, "the stub cache serves the second lookup")
 
+    def test_many_repos_and_many_numbers_go_through_one_pool(self):
+        """Every repo's batches are looked up together: a repo referencing hundreds of closed items used
+        to do STUB_BATCH per query, one after another (8s of a 21s cold build on a 584-item repo)."""
+        n = gg.STUB_BATCH * 2 + 5
+        big = {str(i): node(i, f"issue {i}") for i in range(1, n + 1)}
+        self.write_fixture({"other/side": {"issues": big, "pulls": {}},
+                            "third/one": {"issues": {"7": node(7, "seven")}, "pulls": {}}})
+        got = gg.resolve_stubs_many({"other/side": list(range(1, n + 1)), "third/one": [7]}, 60)
+        self.assertEqual(len(got["other/side"]), n)
+        self.assertEqual(got["third/one"][7]["title"], "seven")
+        self.assertEqual(got["other/side"][n]["title"], f"issue {n}")
+        queries = [c for c in self.gh_calls() if c.get("query_head")]
+        self.assertEqual(len(queries), 4, "3 batches for the big repo + 1 for the small one")
+
+    def test_each_repo_gets_its_own_cache_file_and_is_not_asked_twice(self):
+        self.write_fixture({"other/side": {"issues": {"1": node(1, "one")}, "pulls": {}},
+                            "third/one": {"issues": {"7": node(7, "seven")}, "pulls": {}}})
+        gg.resolve_stubs_many({"other/side": [1], "third/one": [7]}, 60)
+        for repo in ("other/side", "third/one"):
+            path = gg._cache_path("stubs", repo)
+            self.assertTrue(os.path.exists(path), path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        before = len(self.gh_calls())
+        again = gg.resolve_stubs_many({"other/side": [1], "third/one": [7]}, 60)
+        self.assertEqual(len(self.gh_calls()), before, "the cached stubs must not be asked again")
+        self.assertEqual(again["third/one"][7]["title"], "seven")
+
+    def test_one_failing_repo_does_not_lose_the_others(self):
+        self.write_fixture({"third/one": {"issues": {"7": node(7, "seven")}, "pulls": {}}})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])       # the only account: every query fails
+        got = gg.resolve_stubs_many({"third/one": [7]}, 60)
+        self.assertEqual(got["third/one"], {}, "a failed lookup is simply unresolved, not an exception")
+
     def test_a_number_that_does_not_exist_is_marked_missing(self):
         got = gg.resolve_stubs("other/side", [999], 60)
         self.assertTrue(got[999].get("missing"))

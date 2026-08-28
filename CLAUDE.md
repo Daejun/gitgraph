@@ -74,7 +74,8 @@ network), so the shape of the fetch is what costs time. A cold cache lists the o
 (`list_open`, both connections paged at once) and then pulls the records in aliased batches through
 `fetch_groups`, `FETCH_PARALLEL` queries at a time with the batch size chosen to fill every slot;
 pagination inside one connection is the only part that must stay sequential. Past `--max-age` the same
-listing feeds `refresh_items`, which re-fetches just what changed. Retried on transient errors, with
+listing feeds `refresh_items`, which re-fetches just what changed. The referenced-but-not-fetched
+items of every repo are looked up together by `resolve_stubs_many`, in the same parallel shape. Retried on transient errors, with
 multi-account fallback: on `NOT_FOUND` the other accounts `gh auth status` knows for that host are tried
 with their own token, without switching the global gh account. Which account can see a repo is worth
 knowing *before* the first call — a wrong first guess costs a whole round trip — so it comes from the

@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.20.1"
+VERSION = "0.20.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -836,20 +836,36 @@ def load_items(repo, state, max_age_min, refresh=False, on_batch=None):
     return items, time.time()
 
 
+STUB_BATCH = 50
+
+
 def resolve_stubs(repo, numbers, max_age_min):
-    """Look up title/state for referenced-but-unfetched items, cached per repo."""
-    p = _cache_path("stubs", repo)
-    cache = {}
-    if os.path.exists(p):
-        with open(p) as f:
-            cache = json.load(f)
+    """Look up title/state for referenced-but-unfetched items of one repo, cached per repo."""
+    return resolve_stubs_many({repo: numbers}, max_age_min).get(repo, {})
+
+
+def resolve_stubs_many(by_repo, max_age_min):
+    """{repo: numbers} -> {repo: {number: info}}, cached per repo under stubs__<repo>.json.
+
+    Every repo's batches go through one pool, FETCH_PARALLEL queries at a time: a repo that references
+    hundreds of closed items used to look them up STUB_BATCH at a time, one query after another, which
+    was the last sequential stretch of a cold start (8s of a 21s build on a 584-item repo)."""
+    from concurrent.futures import ThreadPoolExecutor
     now = time.time()
-    need = [n for n in numbers if str(n) not in cache
-            or now - cache[str(n)].get("fetched_at", 0) > max_age_min * 60]
-    host, owner, name = split_repo(repo)
-    for i in range(0, len(need), 50):
-        batch = need[i:i + 50]
-        progress("stubs", i, len(need), repo)
+    caches, jobs = {}, []
+    for repo, numbers in by_repo.items():
+        cache = read_json(_cache_path("stubs", repo)) or {}
+        caches[repo] = cache
+        need = [n for n in numbers if str(n) not in cache
+                or now - cache[str(n)].get("fetched_at", 0) > max_age_min * 60]
+        for i in range(0, len(need), STUB_BATCH):
+            jobs.append((repo, need[i:i + STUB_BATCH]))
+
+    done = [0]
+
+    def fetch(job):
+        repo, batch = job
+        host, owner, name = split_repo(repo)
         aliases = " ".join(
             f'n{n}: issueOrPullRequest(number:{n}){{ __typename '
             f'... on Issue{{ number title state createdAt body author{{login}} }} '
@@ -860,20 +876,36 @@ def resolve_stubs(repo, numbers, max_age_min):
             data = graphql(q, host=host)
         except GhError as e:
             log(f"stub resolve failed for {repo}: {e}")
-            break
+            return repo, {}
         rep = (data or {}).get("repository") or {}
+        out = {}
         for n in batch:
             s = rep.get(f"n{n}")
             if s:
-                cache[str(n)] = {"fetched_at": now, "is_pr": s["__typename"] == "PullRequest",
-                                 "title": s.get("title"), "state": s.get("state"),
-                                 "draft": s.get("isDraft", False), "created": s.get("createdAt"),
-                                 "author": _login(s.get("author")), "body": (s.get("body") or "")[:SUM_BODY_CHARS]}
+                out[str(n)] = {"fetched_at": now, "is_pr": s["__typename"] == "PullRequest",
+                               "title": s.get("title"), "state": s.get("state"),
+                               "draft": s.get("isDraft", False), "created": s.get("createdAt"),
+                               "author": _login(s.get("author")), "body": (s.get("body") or "")[:SUM_BODY_CHARS]}
             else:
-                cache[str(n)] = {"fetched_at": now, "missing": True}
-    with open(p, "w") as f:
-        json.dump(cache, f)
-    return {int(k): v for k, v in cache.items() if str(k) in {str(n) for n in numbers}}
+                out[str(n)] = {"fetched_at": now, "missing": True}
+        done[0] += len(batch)
+        progress("stubs", done[0], sum(len(b) for _, b in jobs), repo)
+        return repo, out
+
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(FETCH_PARALLEL, len(jobs))) as pool:
+            for repo, part in pool.map(fetch, jobs):
+                caches[repo].update(part)
+        for repo in {r for r, _ in jobs}:
+            path = _cache_path("stubs", repo)
+            with open(path, "w") as f:
+                json.dump(caches[repo], f)
+            secure(path)
+    out = {}
+    for repo, numbers in by_repo.items():
+        want = {str(n) for n in numbers}
+        out[repo] = {int(k): v for k, v in caches[repo].items() if k in want}
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1751,14 +1783,10 @@ def assemble_graph(primary_repo, all_items, max_age_min=None, resolve=True):
     for n in g.nodes.values() if resolve else ():
         if n.kind == "item" and n.stub and (n.title is None or n.state is None):
             by_repo[n.repo].append(n.number)
-    if by_repo:      # one query per referenced repo, all at once (they are independent)
-        from concurrent.futures import ThreadPoolExecutor
-        jobs = [(repo, sorted(set(nums))) for repo, nums in by_repo.items()]
-        with ThreadPoolExecutor(max_workers=min(FETCH_PARALLEL, len(jobs))) as pool:
-            resolved = list(pool.map(lambda j: (j[0], resolve_stubs(j[0], j[1], max(max_age_min, 24 * 60))), jobs))
-    else:
-        resolved = []
-    for repo, info in resolved:      # referenced items are kept a day
+    # every repo's referenced items in one pool (they are kept a day)
+    resolved = resolve_stubs_many({r: sorted(set(nums)) for r, nums in by_repo.items()},
+                                  max(max_age_min or 0, 24 * 60)).items() if by_repo else []
+    for repo, info in resolved:
         for num, v in info.items():
             n = g.nodes[g.item_id(repo, num)]
             if v.get("missing"):
