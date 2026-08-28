@@ -29,7 +29,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2459,7 +2459,8 @@ HELP = """gg tui — lazygit style layout
   F2              guided tour of the screen (also: gg tutorial)
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
-  Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, 자 = w k …)
+  Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, ㅁ = a …); the Enter/Space
+                  the IME needs to commit a lone consonant is ignored, so ㅁ⏎ opens the question box like a
   y               copy the URL of the selection to the clipboard
   mouse           drag in main = select text and copy it on release (OSC 52 + wl-copy/xclip/xsel/pbcopy; in tmux
                   turn on set-clipboard; Shift+drag still uses the terminal's own selection);
@@ -3499,6 +3500,9 @@ class Tui:
                 except c.error:
                     continue
                 if isinstance(ch, str):
+                    if ch in ("\n", "\r", " ") and not buf and time.time() < getattr(self, "ime_until", 0):
+                        self.ime_until = 0                 # Enter/Space that only committed the Hangul shortcut
+                        continue
                     if ch in ("\n", "\r"):
                         return text.strip()
                     if ch == "\x1b":
@@ -4091,8 +4095,12 @@ class Tui:
             if keys:
                 for extra in reversed(keys[1:]):
                     c.ungetch(ord(extra))
+                self.ime_until = time.time() + 0.4      # the IME commit key (Enter/Space) that follows is not a command
                 return ord(keys[0])
             return ord(ch) if len(ch) == 1 else k
+        if k in (10, 13, 32) and time.time() < getattr(self, "ime_until", 0):
+            self.ime_until = 0
+            return -1
         if k == c.KEY_MOUSE:
             self.mouse_ev = None
             self.scr.nodelay(True)
