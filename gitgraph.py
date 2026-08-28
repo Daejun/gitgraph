@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2181,6 +2181,17 @@ def dw(s):
     return sum(_cw(c) for c in s)
 
 
+def char_at(s, col):
+    """The character drawn at display column col of s ('' beyond the end)."""
+    c = 0
+    for ch in s:
+        w = _cw(ch)
+        if c <= col < c + w:
+            return ch
+        c += w
+    return ""
+
+
 def clip(s, start, width):
     """The part of s that occupies display columns [start, start+width)."""
     out, col = [], 0
@@ -3878,8 +3889,11 @@ class Tui:
         if 0 <= y - p.rect[0] < p.rect[2] and ridx < len(p.rows) and p.rows[ridx].kind == "url":
             text = p.rows[ridx].text
             url = text.strip()
+            xr = x - p.rect[1]                                        # column inside the panel
             c0 = dw(text[:len(text) - len(text.lstrip())]) - p.hs      # column where the URL starts
-            on_url = c0 <= (x - p.rect[1]) < c0 + dw(url)
+            visible_end = min(c0 + dw(url), p.rect[3])                # the URL may be clipped by the panel edge
+            ch = char_at(text, xr + p.hs)                             # what is actually drawn under the pointer
+            on_url = c0 <= xr < visible_end and ch not in ("", " ")
             if url.startswith("http") and on_url:
                 try:
                     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
