@@ -121,7 +121,7 @@ def main():
         check("border drag widens the side column", nbx is not None and nbx > bx + 5)
     else:
         check("border found", False)
-    s.key("3"); s.key("j", 0.4)
+    s.key("3"); s.key("]", 0.5); s.key("j", 0.4)
     s.key("m", 0.6)
     check("mark prompt or menu", "my note" in s.text() or "is marked" in s.text())
     s.key("\x1b", 0.5)

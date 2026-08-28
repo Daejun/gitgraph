@@ -25,7 +25,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2307,7 +2307,7 @@ class Panel:
 
 class Tui:
     SIDE = ["repo", "item", "home", "links", "comments", "people"]
-    HOME_TABS = [("todo", "todo"), ("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
+    HOME_TABS = [("turn", "my turn"), ("todo", "todo"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
     MAIN_TABS = ["content", "answer"]
     COMMENTS_CYCLE = ["linked", "all", "none"]
