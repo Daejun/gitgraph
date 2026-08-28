@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.10.2"
+VERSION = "0.10.3"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2469,7 +2469,7 @@ class Panel:
 
 class Tui:
     SIDE = ["repo", "item", "home", "comments", "links", "people"]
-    HOME_TABS = [("turn", "my turn"), ("todo", "todo"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
+    HOME_TABS = [("todo", "todo"), ("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
     MAIN_TABS = ["content", "answer"]
     COMMENTS_CYCLE = ["linked", "all", "none"]
@@ -2501,6 +2501,7 @@ class Tui:
             "people": Panel("people", "People"),
             "main": Panel("main", "Main", self.MAIN_TABS, scroll_only=True),
         }
+        self.panels["home"].tab = 1        # todo is the first tab, but the Inbox opens on my turn
         self.visible = []                  # panel keys drawn in the current layout
         self.title_zones = {}              # panel -> [(x0, x1, action)] clickable parts of its title bar
         self.msg, self.answer = "", None
@@ -3643,13 +3644,13 @@ class Tui:
                     zones.append((dw(title), dw(title) + dw(lab), ("tab", i)))
                     title += lab + " "
                 title = title.rstrip()
-        self.title_zones[key] = [(x - 1 + 2 + a, x - 1 + 2 + b, act) for a, b, act in zones]   # screen columns
             if key == "main":
                 sub = self.g.nodes.get(self.subject) if self.subject else None
                 what = (self.g.label_num(sub) if sub and sub.kind == "item" else
                         (f"comment on {self.g.label_num(self.g.nodes[sub.parent])}" if sub and sub.kind == "comment" else
                          (self.subject or "")))
                 title += f"  · {what}"
+        self.title_zones[key] = [(x - 1 + 2 + a, x - 1 + 2 + b, act) for a, b, act in zones]   # screen columns
         if hh == 0:                                  # collapsed to a title bar
             self.put(y, x, clip(f"{tl}{hz}{title}{hz}", 0, ww) + hz * max(0, ww - dw(title) - 3) + tr, attr)
             return
