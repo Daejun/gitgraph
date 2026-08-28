@@ -9,6 +9,7 @@ the network, per the task's instruction ("either monkeypatch that call or skip t
 Run: python3 -m unittest tests.test_repo -v
 """
 import os
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -176,6 +177,37 @@ class TestUnfork(unittest.TestCase):
         with mock.patch.object(gg, "parent_repo", return_value=None):
             self.assertEqual(gg.unfork(["owner/name", "owner/name"]), ["owner/name"])
 
+
+
+class TestRemoteUrls(unittest.TestCase):
+    """github_remotes() reads the *configured* URL: `git remote -v` prints it after applying any
+    url.<base>.insteadOf rewrite, which would hide a GitHub remote behind an internal mirror path."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="gg-remote-test-")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"}
+        subprocess.run(["git", "init", "-q", self.tmp], check=True, capture_output=True, env=self.env)
+
+    def git(self, *a):
+        subprocess.run(["git", "-C", self.tmp] + list(a), check=True, capture_output=True, env=self.env)
+
+    def test_remote_urls_are_the_configured_ones(self):
+        self.git("remote", "add", "origin", "https://github.com/me/fork.git")
+        self.git("remote", "add", "upstream", "git@github.com:them/proj.git")
+        self.assertEqual(dict(gg.remote_urls(self.tmp)),
+                         {"origin": "https://github.com/me/fork.git",
+                          "upstream": "git@github.com:them/proj.git"})
+
+    def test_a_rewritten_remote_is_still_recognised(self):
+        self.git("remote", "add", "origin", "https://github.com/them/proj.git")
+        self.git("config", "url./srv/mirror/proj.git.insteadOf", "https://github.com/them/proj.git")
+        self.assertEqual(gg.github_remotes(self.tmp), [(0, "them/proj")])
+
+    def test_a_directory_that_is_not_a_repo_gives_nothing(self):
+        self.assertEqual(gg.remote_urls(os.path.join(self.tmp, "nope")), [])
 
 if __name__ == "__main__":
     unittest.main()

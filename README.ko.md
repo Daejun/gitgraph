@@ -69,6 +69,7 @@ gg update                 # 설치 갱신
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | 캐시를 채울 때(첫 실행·갱신) 동시에 도는 `gh` 쿼리 수. GitHub 왕복 한 번이 무엇을 묻든 ~0.4s라 첫 실행 속도를 좌우한다. open 항목이 수백 개인 repo에서는 12로 올리면 더 빨라진다 |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (아래 참조) |
+| `review_model` · `review_timeout` · `review_max_bytes` | `GITGRAPH_REVIEW_MODEL` · `GITGRAPH_REVIEW_TIMEOUT` · `GITGRAPH_REVIEW_MAX_BYTES` | `sonnet` · `900` · `400000` | 리뷰 모드: 리뷰를 돌릴 모델(claude 전용), 한 번의 호출 상한(초), 이보다 큰 diff는 파일 단위로 쪼개 병렬로 돈다 |
 | `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | 리뷰 모드: Files·Findings 열의 폭 |
 | `worktree_keep_days` · `worktree_max` | `GITGRAPH_WORKTREE_KEEP_DAYS` · `GITGRAPH_WORKTREE_MAX` | `7` · `5` | 리뷰 모드: PR worktree를 얼마나 오래, 몇 개까지 두는지. 커널 체크아웃 하나가 1G를 훌쩍 넘으니 형식적인 값이 아니다 — `gg cache`가 실제 용량과 함께 보여준다 |
 | `review_subjective` | `GITGRAPH_REVIEW_SUBJECTIVE` | `auto` | 리뷰 모드: style/design 의견 — `auto`는 확정된 결함이 있는 동안 감춘다, `always`, `never` |
@@ -203,18 +204,22 @@ PR 위에서 `v`를 누르면 화면 전체가 Files · Diff · Findings 세 패
 | `1` `2` `3` · Tab | Files · Diff · Findings · 순환 |
 | Enter | 위 표 참고 |
 | `x` | 이 지적을 무시 / 무시 취소 (PR별로 기억되며 새 커밋이 와도 유지) |
-| `r` · `R` | PR과 diff를 다시 읽기 · 이 head에 캐시된 것을 무시하고 다시 받기 |
+| `R` · `r` | 리뷰를 돌린다(먼저 물어본다) · PR과 diff만 다시 읽는다(캐시된 지적은 유지) |
 | `o` · `y` | PR을(커서가 줄 위에 있으면 그 파일·줄을) 브라우저로 · 그 URL 복사 |
 | `/` `n` `N` · `?` | 포커스된 패널에서 검색 · 그 패널의 키 메뉴 |
 
 ```
 gg review 779             # PR #779의 리뷰 모드로 TUI 시작
-gg review 779 --print     # PR과 변경 파일, 캐시된 지적을 stdout으로
+gg review 779 --print     # 리뷰를 돌려 결과를 stdout으로 (--no-ai: diff만, AI 호출 없음)
 gg review 779 --json      # 같은 내용을 JSON으로
 gg review 779 --refresh   # 이 head에 캐시된 것을 무시하고 다시 읽기
 ```
 
-지적을 만들어 내는 AI 단계는 아직 붙지 않았다(설계는 `docs/PLAN-review-mode.md`). 그때까지 Findings 패널은 GitHub의 리뷰 스레드와 예전에 캐시된 것을 보여준다. 나머지는 AI CLI 없이 전부 동작한다.
+`R`이 리뷰를 돌린다. gg는 프롬프트가 아니라 절차를 안고 있다 — 커널 리뷰 프롬프트 모음에서 뽑아낸 규율이다. hunk를 판단하기 전에 그 hunk가 든 함수 전체를 읽고(worktree가 그래서 있다), diff를 CHANGE-N 단위로 — 루프 하나, 락 하나, 할당 하나, 바뀐 반환값 하나 — 쪼갠 뒤 하나씩 본다. 먼저 바뀐 코드가 설명이 말하는 용례로 실행되기는 하는지 따지고, 저자가 틀렸다고 가정한 뒤 옳다는 증거를 요구하며, `file:line -> file:line`으로 짚지 못하는 지적은 버린다. 응답은 고정 필드로만 받고, gg는 저장하기 전에 모든 지적을 diff가 실제로 건드린 줄에 못 박는다(GitHub은 그 밖의 줄을 거부한다). `review_max_bytes`를 넘는 diff는 파일 단위로 쪼개 병렬로 돈다.
+
+돈과 시간이 드니 저절로 시작하지 않는다. `R`은 먼저 묻고(파일 수와 호출 수를 보여준다), 결과는 head SHA에 묶여 캐시되며, `r`은 PR만 다시 읽는다. private 커널형 저장소에서 claude sonnet으로 각 1회 호출 실측: 2파일 +163 −166이 7분 14초에 지적 0건, 4파일 +466 −155가 6분 39초에 1건 — 같은 PR이 만든 형제 함수 둘이 오류 코드를 다르게 다루는 것으로, 근거가 4단계로 붙고 적용 가능한 diff까지 나왔다.
+
+리뷰 모드의 나머지는 AI CLI가 아예 없어도 동작한다.
 
 리뷰 모드가 열려 있으면 `gg mcp`도 그것을 보고한다. `gg_state`가 어떤 PR인지, 파일 목록과 지적 개수, 커서 아래 지적을 알려주고, `gg_context`는 `finding:<fid>`로 지적 전문을, `file:<path>`로 worktree에 있는 그 파일을 그대로 준다.
 

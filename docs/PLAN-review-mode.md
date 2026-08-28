@@ -1,6 +1,6 @@
 # gg에 PR 리뷰 모드를 넣는 계획
 
-상태: 1·2단계 구현됨(0.22.0) — `gg review <PR>`와 TUI의 `v`가 worktree를 펼치고 diff를 3열로 그린다. AI 단계(3~7)와 게시가 남았고, 그쪽은 0.23.0으로 간다.
+상태: 1~3단계 구현됨 — `gg review <PR>`와 TUI의 `v`가 worktree를 펼쳐 diff를 3열로 그리고, `R`이 내장 프로토콜로 pass 1을 돌린다. 4~7단계(검증 pass, 게시, 증분, review_cmd)가 남았다.
 
 결정된 것(인터뷰):
 
@@ -423,7 +423,18 @@ gg review <PR> --post --dry-run  보낼 mutation 페이로드만 출력하고 �
 7. **`review_cmd` 오버라이드** — 저장소별 매핑 파서, 슬래시 커맨드 미설치 시 내장으로 1회 폴백 + 안내.
 8. **문서** — 1·2단계 몫은 0.22.0에 이미 반영됨(리뷰 모드 절, 키 표, worktree 용량, `?` 메뉴, `HINTS`). 남은 것: 설정 키 나머지와 게시가 사용자 계정으로 서명 없이 나간다는 사실, `VERSION`/`pyproject.toml` 0.23.0.
 
-3·4단계는 프롬프트 작업이라 실측이 필요하다 — 실제 PR 서너 개(작은 것, 락이 얽힌 것, rename이 섞인 것)로 돌려 보고 `REVIEW_PROMPT`를 조인다. false-positive-guide.md의 각 절이 pass 2에서 실제로 발동하는지 하나씩 확인하는 게 이 단계의 완료 조건이다.
+3·4단계는 프롬프트 작업이라 실측이 필요하다 — 실제 PR로 돌려 보고 `REVIEW_PROMPT`를 조인다.
+
+3단계 실측(claude sonnet, 1회 호출):
+
+| PR | 규모 | 시간 | reachability | CHANGE | findings |
+|---|---|---|---|---|---|
+| vivo-samsung/filesystem_mtfs#779 | 2파일 +163 -166 | 7m14s | confirmed | 7 | 0 |
+| vivo-samsung/filesystem_mtfs#760 | 4파일 +466 -155 | 6m39s | confirmed | 8 | 1 |
+
+#760에서 나온 하나는 같은 PR이 만든 형제 함수 둘이 `-ENOMEM`을 서로 다르게 다루는 것으로, 근거가 `gc.c:508-521 → 1087-1095 → 889-896 → 1323-1324` 네 단계로 붙고 적용 가능한 diff까지 나왔다. #779의 0건은 침묵이 맞는 쪽으로 보인다(리팩터링 성격). CHANGE 분류는 두 PR 모두 파일이 아니라 락·자원·제어흐름 단위로 갈렸다.
+
+4단계 완료 조건: false-positive-guide.md의 각 절이 pass 2에서 실제로 발동하는지 하나씩 확인.
 
 ---
 

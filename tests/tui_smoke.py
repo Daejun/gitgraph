@@ -19,6 +19,7 @@ import os
 import pty
 import re
 import select
+import subprocess
 import sys
 import time
 
@@ -56,7 +57,7 @@ def normalise(text):
 
 
 class Session:
-    def __init__(self, args=(), home=None, rows=ROWS, cols=COLS, **envextra):
+    def __init__(self, args=(), home=None, rows=ROWS, cols=COLS, cwd=None, **envextra):
         self.home = home or testenv.make_home()
         envextra.setdefault("FAKE_GH_MODE", "script")
         if "FAKE_GH_FIXTURE" not in envextra:      # (not setdefault: it would build one either way)
@@ -68,6 +69,8 @@ class Session:
         self.env = env
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            if cwd:
+                os.chdir(cwd)          # review mode looks for a clone of the repo under the cwd
             os.execve(sys.executable, [sys.executable, GITGRAPH, "tui", "--no-tour",
                                        "--max-age", str(testenv.FIXTURE_MAX_AGE_MIN)] + list(args), env)
         self.set_size(rows, cols)      # before the child reaches curses init
@@ -697,6 +700,85 @@ def ai_failure_popup():
         s.kill()
 
 
+def fake_clone(home):
+    """A real git clone of `test/repo` inside the temp HOME, with the PR's head in refs/pull/5/head.
+
+    Its origin URL is the github.com one gg parses to recognise the repo, but an `insteadOf` rewrite in
+    the clone's own config sends every fetch to the bare repository next door — so review mode goes
+    through the real git plumbing (fetch, merge-base, worktree add, diff) and still touches no network.
+    Returns the directory to start gg in.
+    """
+    root = os.path.join(home, "clones")
+    origin, work, clone = (os.path.join(root, n) for n in ("origin.git", "seed", "repo"))
+    os.makedirs(work)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+    def git(cwd, *a):
+        r = subprocess.run(["git", "-C", cwd] + list(a), capture_output=True, text=True, env=env)
+        assert r.returncode == 0, f"git {a}: {r.stderr}"
+        return r.stdout.strip()
+
+    subprocess.run(["git", "init", "-q", "-b", "main", work], check=True, capture_output=True, env=env)
+    for text in ("static int f2fs_write_page(void)\n{\n\treturn 0;\n}\n",
+                 "static int f2fs_write_page(void)\n{\n\tspin_lock(&lock);\n\treturn -ENOMEM;\n}\n"):
+        with open(os.path.join(work, "data.c"), "w") as fh:
+            fh.write(text)
+        git(work, "add", "-A")
+        git(work, "commit", "-qm", "change")
+    base, head = git(work, "rev-parse", "HEAD~1"), git(work, "rev-parse", "HEAD")
+    subprocess.run(["git", "clone", "-q", "--bare", work, origin], check=True, capture_output=True, env=env)
+    git(origin, "update-ref", "refs/heads/main", base)
+    git(origin, "update-ref", "refs/pull/5/head", head)
+    subprocess.run(["git", "clone", "-q", origin, clone], check=True, capture_output=True, env=env)
+    git(clone, "remote", "set-url", "origin", "https://github.com/test/repo.git")
+    git(clone, "config", f"url.{origin}.insteadOf", "https://github.com/test/repo.git")
+    return root
+
+
+def review_with_a_clone():
+    """0.23.0: with a checkout present, v builds a worktree and draws the real diff, and R runs the
+    review through the (fake) AI CLI and anchors its findings onto changed lines."""
+    home = testenv.make_home()
+    root = fake_clone(home)
+    s = Session(["--no-summary", "-t", "none", "5"], home=home, cwd=root)
+    try:
+        s.wait_for("6 People", 30)
+        s.settle()
+        s.key("v", 25)
+        s.settle()
+        txt = s.text()
+        check("the worktree is built and the diff is drawn", "data.c" in txt and "@@" in txt, txt[:700])
+        check("the removed and added lines are both there",
+              "- \treturn 0;" in txt.replace("\t", "\t") or "return 0;" in txt, txt[:700])
+        st = (s.cache("state.json") or {}).get("review") or {}
+        check("state.json lists the changed file", st.get("files") == ["data.c"], str(st)[:300])
+        check("no review has been run on its own", "no review yet" in txt, txt[:700])
+
+        s.key("R", 1.0)                       # confirm popup: it costs money, so it always asks
+        check("R asks before spending anything", "Review test/repo#5" in s.text(), s.text()[:500])
+        s.key("k", 0.4)                       # the popup starts on "no": spending is never one keypress
+        s.key("\r", 12.0)
+        s.settle()
+        txt = s.text()
+        check("the finding lands in the Findings panel", "fake finding 1 in data.c" in txt, txt[:900])
+        st = (s.cache("state.json") or {}).get("review") or {}
+        f = st.get("finding") or {}
+        check("state.json carries the finding for gg mcp",
+              f.get("path") == "data.c" and f.get("severity") in ("bug", "style"), str(st)[:400])
+        check("its line is one the diff touches", (st.get("counts") or {}).get("open", 0) >= 1, str(st))
+
+        s.key("2", 0.6)                       # the Diff panel flags the line
+        check("the flagged line is marked in the diff", "⚠" in s.text(), s.text()[:900])
+        s.key("3", 0.6)
+        s.key("x", 1.0)                       # ignore it
+        check("x ignores a finding", "ignored" in s.text(), s.text()[:300])
+        check("no traceback with a real worktree", "Traceback" not in s.log(),
+              "\n".join(l for l in s.log().splitlines() if "Traceback" in l or "Error" in l)[:600])
+    finally:
+        s.kill()
+
+
 def review_mode():
     """0.22.0: v opens the three-column review of a PR. The fixture home has no clone of test/repo, so
     this also pins what happens when the worktree cannot be made: an explanation, not a traceback."""
@@ -779,6 +861,7 @@ def main():
 
     review_mode()
     review_mode_narrow()
+    review_with_a_clone()
     cold_start_paints_early()
     cross_repo_mark()
     portrait_and_theme()

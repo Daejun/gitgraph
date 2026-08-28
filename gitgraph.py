@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.22.0"
+VERSION = "0.23.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -59,6 +59,10 @@ CONFIG_KEYS = {
     "border": ("GITGRAPH_BORDER", "rounded", "tui: rounded | single | double | bold | hidden"),
     "worktree_keep_days": ("GITGRAPH_WORKTREE_KEEP_DAYS", "7", "review: drop a PR worktree unused for this many days"),
     "worktree_max": ("GITGRAPH_WORKTREE_MAX", "5", "review: how many PR worktrees to keep (oldest go first)"),
+    "review_model": ("GITGRAPH_REVIEW_MODEL", "sonnet", "review: model for the review pass (claude only)"),
+    "review_timeout": ("GITGRAPH_REVIEW_TIMEOUT", "900", "review: seconds one AI review call may take"),
+    "review_max_bytes": ("GITGRAPH_REVIEW_MAX_BYTES", "400000",
+                         "review: split the diff by file and review the parts in parallel beyond this size"),
     "review_subjective": ("GITGRAPH_REVIEW_SUBJECTIVE", "auto",
                           "review: style/design remarks — auto (hidden while a confirmed defect stands) | always | never"),
     "review_files_width": ("GITGRAPH_REVIEW_FILES_WIDTH", "0.22", "review: fraction of the width for the Files column"),
@@ -296,18 +300,28 @@ def git_account_hint(d, host, url=""):
     return next((h for h in hinted if h in known), None)
 
 
+def remote_urls(d):
+    """[(remote name, url)] as *configured*. Not `git remote -v`, which prints the URL after applying
+    any url.<base>.insteadOf rewrite — a checkout that rewrites github.com to an internal mirror would
+    otherwise look like it has no GitHub remote at all."""
+    r = subprocess.run(["git", "-C", d, "config", "--get-regexp", r"^remote\..*\.url$"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        key, _, url = line.partition(" ")
+        parts = key.split(".")
+        if len(parts) >= 3 and url.strip():
+            out.append((".".join(parts[1:-1]), url.strip()))
+    return out
+
+
 def github_remotes(d):
     """[(rank, repo)] for every remote of the git repo at d whose URL points at a GitHub host.
     rank: 0 = origin, 1 = a remote named github*, 2 = anything else."""
-    r = subprocess.run(["git", "-C", d, "remote", "-v"], capture_output=True, text=True)
-    if r.returncode != 0:
-        return []
     out, seen = [], set()
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or (len(parts) > 2 and parts[2] != "(fetch)"):
-            continue
-        name, url = parts[0], parts[1]
+    for name, url in remote_urls(d):
         m = _REMOTE_RE.match(url)
         if not m:
             SKIPPED_REMOTES.append((d, name, url, "URL not understood"))
@@ -1159,21 +1173,37 @@ def installed_ais(exclude=None):
     return [n for n in AI_BACKENDS if n != exclude and shutil.which(n)]
 
 
-def claude_call(prompt, model, phase, timeout=300):
-    """Run the configured AI CLI non-interactively; return the reply text and add its usage (claude only) to USAGE."""
+def claude_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
+    """Run the configured AI CLI non-interactively; return the reply text and add its usage (claude only) to USAGE.
+
+    cwd: the directory the CLI runs in — a PR worktree for review, so the model can read the code.
+    tools: tool names it may use there (claude/codex only); empty means the text-only default.
+    """
     try:
-        return _ai_call(prompt, model, phase, timeout)
+        return _ai_call(prompt, model, phase, timeout, cwd, tools)
     except Exception as e:  # noqa: BLE001
         AI_FAILURES.append({"bin": CLAUDE_BIN, "msg": str(e)[:200], "t": time.time()})
         raise
 
 
-def _ai_call(prompt, model, phase, timeout=300):
+def _ai_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
     kind = ai_backend()
     outfile = None
+    stdin_text = None
     if kind == "claude":
         # no --bare: bare mode skips the stored login and answers "Not logged in"
-        cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json", "--model", model, prompt]
+        cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json", "--model", model]
+        if tools:
+            cmd += ["--allowedTools"] + list(tools)
+        if cwd:
+            cmd += ["--add-dir", cwd]
+        if tools or cwd:
+            # --allowedTools and --add-dir are variadic, so a prompt after them is swallowed as one of
+            # their values ("Input must be provided either through stdin or as a prompt argument").
+            # stdin also keeps a review prompt — a whole diff — clear of ARG_MAX.
+            stdin_text = prompt
+        else:
+            cmd.append(prompt)
     elif kind == "codex":
         os.makedirs(CACHE_DIR, exist_ok=True)
         outfile = os.path.join(CACHE_DIR, f"codex_last_{os.getpid()}_{int(time.time() * 1000)}.txt")
@@ -1182,8 +1212,10 @@ def _ai_call(prompt, model, phase, timeout=300):
     else:                                   # gemini, grok, anything else that takes -p PROMPT
         cmd = [CLAUDE_BIN, "-p", prompt]
     try:
-        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
-                           start_new_session=True)   # no controlling terminal: the child cannot touch our screen
+        r = subprocess.run(cmd, input=stdin_text,
+                           stdin=None if stdin_text is not None else subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=timeout,
+                           cwd=cwd or None, start_new_session=True)   # no controlling terminal: the child cannot touch our screen
     except FileNotFoundError:
         raise ValueError(f"{CLAUDE_BIN} not found (gg ai to pick an AI CLI)") from None
     if kind != "claude":
@@ -2193,6 +2225,7 @@ class Review:
         self.repo, self.number = repo, number
         self.pr_id = kw.get("pr_id")
         self.title = kw.get("title", "")
+        self.body = kw.get("body", "")
         self.state = kw.get("state")
         self.draft = kw.get("draft", False)
         self.author = kw.get("author")
@@ -2303,14 +2336,11 @@ def clone_remote_for(clone, repo):
     """The remote of `clone` that points at `repo`, else an https URL for it (git's credential helper —
     what `gh auth setup-git` installs — supplies the token). The clone is often a fork, so the remote
     we want is not necessarily origin."""
-    for line in git_out(clone, "remote", "-v", check=False).splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        m = _REMOTE_RE.match(parts[1])
+    for name, url in remote_urls(clone):
+        m = _REMOTE_RE.match(url)
         if m and make_repo(resolve_ssh_alias(m.group("host").lower()), m.group("owner"),
                            m.group("name")) == repo:
-            return parts[0]
+            return name
     host, owner, name = split_repo(repo)
     return f"https://{host}/{owner}/{name}.git"
 
@@ -2437,7 +2467,7 @@ def prune_worktrees(keep=None):
 PR_META_Q = """
 query($owner:String!,$name:String!,$number:Int!){
  repository(owner:$owner,name:$name){ pullRequest(number:$number){
-  id number title state isDraft url headRefName baseRefName headRefOid baseRefOid
+  id number title state isDraft url body headRefName baseRefName headRefOid baseRefOid
   author{login} headRepository{ nameWithOwner }
   reviewThreads(first:100){ nodes{ id isResolved isOutdated path line diffSide
    comments(first:10){ nodes{ author{login} body createdAt url } } } } } } }
@@ -2460,7 +2490,8 @@ def pr_meta(repo, number):
                         "comments": [{"author": ((c.get("author") or {}).get("login") or "?"),
                                       "body": c.get("body") or "", "created": c.get("createdAt"),
                                       "url": c.get("url")} for c in cs]})
-    return {"pr_id": pr.get("id"), "title": pr.get("title") or "", "state": pr.get("state"),
+    return {"pr_id": pr.get("id"), "title": pr.get("title") or "", "body": pr.get("body") or "",
+            "state": pr.get("state"),
             "draft": bool(pr.get("isDraft")), "url": pr.get("url"),
             "author": ((pr.get("author") or {}).get("login") or "?"),
             "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName"),
@@ -2595,6 +2626,280 @@ def standards_files(worktree):
             if os.path.isfile(os.path.join(worktree or "", n))]
 
 
+
+# ---------------------------------------------------------------- the review pass
+# The protocol below is distilled from the kernel review prompts in ~/.claude/review-prompts (9,000
+# lines of them) — not their kernel knowledge, which belongs in a `review_cmd` skill, but their
+# discipline: read the whole function before judging a hunk, split the change into categories first,
+# check the changed code is reachable at all, and refuse to report anything you cannot point at.
+REVIEW_MODEL = cfg("review_model")
+REVIEW_TIMEOUT = int(cfg("review_timeout") or 900)
+REVIEW_MAX_BYTES = int(cfg("review_max_bytes") or 400000)
+REVIEW_TOOLS = ("Read", "Grep", "Glob", "Bash(git *)")
+
+REVIEW_PROMPT = """You are reviewing one pull request. You are standing in a git worktree with its head
+checked out, so you can open any file in the tree — not only the lines in the diff.
+
+{pr}
+
+Work these steps in order. The first three exist to stop you judging a hunk before you understand it.
+
+STEP 1 — context.
+- Read the pull request description above and decide what it is trying to do.
+- Read the diff line by line, all of it, before looking anything up.
+- For every function the diff touches, open the whole function in the tree. Never reason about a
+  fragment: a hunk that looks wrong is usually a hunk whose surroundings you have not read.
+- Follow what matters: callers of a changed function, what it calls, the error and cleanup paths, and
+  the project conventions in {standards}.
+
+STEP 2 — split the change up.
+Break the diff into small categories and name them CHANGE-1, CHANGE-2, … Make a separate category for
+each of: one loop, one changed return value or condition, one allocation/free pair, one object
+initialisation, one lock, one API or signature change, one data-format change, build files, docs.
+A file is not a category; "refactoring" is not a category.
+
+STEP 3 — reachability gate.
+Can the changed code run at all for the use the description claims? Check the flags, config, callers
+and protocol constraints that would keep it from executing. If it cannot run, say so — that outranks
+every other finding, and its severity is "reach".
+
+STEP 4 — look for defects, one category at a time.
+Assume the author is wrong and demand proof they are right. Comments, commit text and variable names
+are claims, not evidence; verify each against the code. Weigh at least:
+- control flow: a path that now returns, breaks or continues where it did not, and what the caller
+  does with it
+- resources: an allocation with no matching free on some path, a free with a later use, an object used
+  before it is fully initialised
+- locking: a path that leaves a lock held or takes it twice; before reporting one, read the callers
+  and say which of them already holds it
+- boundaries: off-by-one, truncation, signedness, overflow, an empty or maximal input
+- concurrency and ordering: a value read outside the lock that protects it, a wait with no wake
+- compatibility: a changed on-disk or on-wire format, a changed API with callers you have not updated
+- tests: new logic with no test, when the project's own convention is to add one
+
+STEP 5 — evidence.
+Every finding needs a concrete path stated as file:line — where the value comes from, and where it
+goes wrong. If you cannot write that path down, drop the finding. A finding with no `evidence` field
+is worthless and will be thrown away.
+
+STEP 6 — remarks, at most three.
+Only after the defects: things that are not wrong but read badly — a comment that restates the code,
+a symbol nothing uses, duplication of an existing helper, a name that fights the file's own
+convention. Judge against the neighbouring code, not an ideal. If a competent author had a plausible
+reason to write it that way, stay silent. severity "style" or "design".
+
+Do not report:
+- a defensive check for input you cannot show reaching the code
+- theoretical misuse of an API with no caller that does it
+- anything outside the lines this pull request changed
+- praise, summaries, or "consider whether…" with no concrete claim
+- something already raised in the review threads listed above
+
+Write `title` and `body` in English: they may be posted to the pull request verbatim.
+"""
+
+REVIEW_CONTRACT = """
+When you are done, print nothing after these markers but the object between them. Use exactly these
+fields and invent no others.
+
+<<<GG_REVIEW
+{"reachability": {"verdict": "confirmed|blocked", "reason": "one sentence"},
+ "changes": [{"cid": "CHANGE-1", "kind": "control-flow|return|resource|init|locking|api|data|build|doc",
+              "path": "path/from/the/diff.c", "symbol": "function_name", "summary": "one line"}],
+ "findings": [{"cid": "CHANGE-1",
+               "severity": "reach|bug|regress|logic|style|design",
+               "path": "path/from/the/diff.c", "line": 222, "end_line": 222, "side": "RIGHT",
+               "title": "one line, at most 70 characters",
+               "body": "what is wrong and what to do instead, 1-4 sentences",
+               "evidence": "the concrete path, as file:line -> file:line",
+               "diff": "optional unified diff that applies to path"}]}
+GG_REVIEW>>>
+
+- `line` is a line number in the new file when `side` is "RIGHT", in the old file when it is "LEFT",
+  and it must be a line this diff actually touches. Comments cannot be attached anywhere else.
+- Never name a `path` that is not in the diff.
+- `findings` may be empty. An empty list is a fine answer; a padded one is not.
+"""
+
+
+def _json_block(text, marker):
+    """The object between <<<MARKER and MARKER>>>, else the last {...} in the reply, else None."""
+    m = re.search(rf"<<<{marker}\s*(.+?)\s*{marker}>>>", text or "", re.S)
+    blobs = [m.group(1)] if m else []
+    if not blobs:
+        starts = [i for i, ch in enumerate(text or "") if ch == "{"]
+        blobs = [text[i:] for i in reversed(starts[:200])]
+    for blob in blobs:
+        blob = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", blob.strip())
+        try:
+            d = json.loads(blob)
+        except json.JSONDecodeError:
+            try:                                   # trailing prose after the object
+                d, _ = json.JSONDecoder().raw_decode(blob)
+            except ValueError:
+                continue
+        if isinstance(d, dict):
+            return d
+    return None
+
+
+def parse_review_reply(text):
+    """The reply of one review call -> (reachability, [Change], [Finding]). Raises when unusable."""
+    d = _json_block(text, "GG_REVIEW")
+    if d is None:
+        raise ValueError("the review did not end with a GG_REVIEW block")
+    changes = [Change.from_json(c) for c in (d.get("changes") or []) if isinstance(c, dict)]
+    findings = []
+    for raw in (d.get("findings") or []):
+        if not isinstance(raw, dict) or not (raw.get("title") or "").strip():
+            continue
+        sev = raw.get("severity")
+        findings.append(Finding(
+            cid=raw.get("cid"), severity=sev if sev in SEVERITIES else "logic",
+            path=raw.get("path"), line=raw.get("line"), end_line=raw.get("end_line"),
+            side="LEFT" if str(raw.get("side", "")).upper() == "LEFT" else "RIGHT",
+            title=str(raw.get("title", "")).strip(), body=str(raw.get("body", "")).strip(),
+            evidence=str(raw.get("evidence") or "").strip() or None,
+            diff=raw.get("diff") or None))
+    reach = d.get("reachability") if isinstance(d.get("reachability"), dict) else None
+    return reach, changes, findings
+
+
+def diff_text(rv, paths=None):
+    """The diff as the review sees it, rebuilt from the parsed files so both halves agree."""
+    out = []
+    for f in rv.files:
+        if paths is not None and f.path not in paths:
+            continue
+        head = f"diff --git a/{f.old_path} b/{f.path}"
+        if f.status != "modified":
+            head += f"   ({f.status})"
+        out.append(head)
+        if f.binary:
+            out.append("(binary)")
+            continue
+        for h in f.hunks:
+            out.append(h.header)
+            for tag, _, _, text in h.lines:
+                out.append(tag + text)
+    return "\n".join(out)
+
+
+def review_chunks(rv):
+    """[[path, …]] — one chunk when the diff is small, else file groups under REVIEW_MAX_BYTES."""
+    sizes = [(f.path, len(diff_text(rv, {f.path}))) for f in rv.files]
+    total = sum(s for _, s in sizes)
+    if total <= REVIEW_MAX_BYTES or len(sizes) < 2:
+        return [[f.path for f in rv.files]]
+    chunks, cur, cur_size = [], [], 0
+    for path, size in sizes:
+        if cur and cur_size + size > REVIEW_MAX_BYTES:
+            chunks.append(cur)
+            cur, cur_size = [], 0
+        cur.append(path)
+        cur_size += size
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def pr_header(rv, paths, body):
+    threads = "\n".join(f"  {t.get('path')}:{t.get('line')} @{(t.get('comments') or [{}])[0].get('author', '?')}: "
+                        f"{trunc((t.get('comments') or [{}])[0].get('body', ''), 160)}"
+                        for t in rv.threads if not t.get("resolved"))
+    parts = [f"Pull request {rv.repo}#{rv.number} by @{rv.author}: {rv.title}",
+             f"branch {rv.head_ref} onto {rv.base_ref}, head {(rv.head_oid or '')[:12]}"]
+    if len(paths) < len(rv.files):
+        parts.append(f"You are reviewing {len(paths)} of its {len(rv.files)} files; the rest is being "
+                     f"reviewed separately. Report only on the files below.")
+    if body:
+        parts += ["", "--- description ---", trunc_lines(body, 120)]
+    if threads:
+        parts += ["", "--- review threads already on this pull request (do not repeat them) ---", threads]
+    parts += ["", f"--- diff ({', '.join(paths)}) ---", diff_text(rv, set(paths))]
+    return "\n".join(parts)
+
+
+def trunc_lines(text, n):
+    lines = (text or "").splitlines()
+    return "\n".join(lines[:n]) + (f"\n… ({len(lines) - n} more lines)" if len(lines) > n else "")
+
+
+def review_prompt(rv, paths, body=""):
+    std = ", ".join(standards_files(rv.worktree)) or "the surrounding code (no conventions file found)"
+    return REVIEW_PROMPT.format(pr=pr_header(rv, paths, body), standards=std) + REVIEW_CONTRACT
+
+
+def run_review(rv, body="", on_step=None):
+    """Pass 1: categorise, gate on reachability, look for defects. Fills rv in place."""
+    if not rv.files:
+        rv.status, rv.error = "failed", "nothing to review: the diff is empty"
+        return rv
+    if not ai_available():
+        rv.status, rv.error = "failed", f"{CLAUDE_BIN} is not installed (gg ai picks another)"
+        return rv
+    chunks = review_chunks(rv)
+    rv.status, rv.error, rv.t0 = "running", None, time.time()
+    rv.engine, rv.model = f"builtin:{ai_backend()}", REVIEW_MODEL
+    changes, findings, reach, errors = [], [], None, []
+
+    def one(paths):
+        return claude_call(review_prompt(rv, paths, body), REVIEW_MODEL, "review",
+                           timeout=REVIEW_TIMEOUT, cwd=rv.worktree, tools=REVIEW_TOOLS)
+
+    from concurrent.futures import ThreadPoolExecutor
+    done = 0
+    progress("review", 0, len(chunks), "reviewing")
+    with ThreadPoolExecutor(max_workers=max(1, min(AI_PARALLEL, len(chunks)))) as pool:
+        for paths, out in zip(chunks, pool.map(_safe, ((one, c) for c in chunks))):
+            done += 1
+            progress("review", done, len(chunks), "reviewing")
+            if on_step:
+                on_step(done, len(chunks))
+            if isinstance(out, Exception):
+                errors.append(str(out))
+                continue
+            try:
+                r, ch, fi = parse_review_reply(out)
+            except ValueError as e:
+                errors.append(f"{', '.join(paths)}: {e}")
+                continue
+            reach = reach or r
+            changes += ch
+            findings += fi
+    if errors and not findings:
+        rv.status, rv.error = "failed", "; ".join(errors)[:500]
+        return rv
+    for i, c in enumerate(changes, 1):          # one numbering across chunks
+        c.cid = f"CHANGE-{i}"
+    rv.reachability, rv.changes = reach, changes
+    rv.findings = dedupe_findings(findings)
+    rv.status, rv.t1 = "done", time.time()
+    rv.error = ("; ".join(errors)[:300]) if errors else None
+    anchor_findings(rv)
+    apply_history(rv)
+    save_review(rv)
+    return rv
+
+
+def _safe(job):
+    fn, arg = job
+    try:
+        return fn(arg)
+    except Exception as e:  # noqa: BLE001
+        return e
+
+
+def dedupe_findings(findings):
+    """Same digest twice (two chunks noticing one thing): keep the one with evidence."""
+    best = {}
+    for f in findings:
+        cur = best.get(f.digest)
+        if cur is None or (not cur.evidence and f.evidence):
+            best[f.digest] = f
+    return list(best.values())
+
+
 # ---------------------------------------------------------------- CLI
 PR_TARGET_RE = re.compile(r"^(?:(?P<repo>[\w.-]+/[\w.-]+(?:/[\w.-]+)?)?#|#?)(?P<num>\d+)$")
 
@@ -2645,10 +2950,25 @@ def review_summary_rows(rv):
     return rows
 
 
-def do_review(target, repos, refresh=False, as_json=False, color=True):
-    """gg review <PR> — stage 1: the worktree and the parsed diff. The AI passes land in 0.22.0."""
+def do_review(target, repos, refresh=False, as_json=False, no_ai=False, to_tui=False, opts=None,
+              color=True):
+    """gg review <PR>: the TUI in review mode, or the result on stdout (--print / --json)."""
     repo, number = parse_pr_target(target, repos)
+    if to_tui:
+        tui({"repos": repos, "state": opts.state, "comments": opts.comments or "all",
+             "people": not opts.no_people, "closed_neighbors": not opts.no_closed_neighbors,
+             "max_age_min": opts.max_age, "width": opts.width, "translate": opts.translate,
+             "layout": opts.layout, "hops": opts.hops, "root": None, "summary": not opts.no_summary,
+             "depth": opts.depth, "days": opts.days, "start_tour": False, "tutorial": False,
+             "review": (repo, number)})
+        return 0
     rv = review_load(repo, number, refresh=refresh)
+    if not no_ai and not rv.error and not rv.findings and not rv.engine and ai_available():
+        log(f"reviewing {repo}#{number} with {CLAUDE_BIN} {REVIEW_MODEL} "
+            f"({len(rv.files)} files, {len(review_chunks(rv))} call(s))…")
+        run_review(rv, rv.body)
+        if USAGE["calls"]:
+            log(usage_line())          # do_review returns before main()'s own usage line
     if as_json:
         d = rv.to_json()
         d.update({"repo": rv.repo, "number": rv.number, "head_oid": rv.head_oid,
@@ -3916,6 +4236,7 @@ class Tui:
         self.focus, self.screen = "home", cfg("screen_mode") if cfg("screen_mode") in ("normal", "half", "full") else "normal"
         self.mode = "browse"               # browse (the graph) | review (one PR's diff and findings)
         self.rv, self.rv_path, self._new_rv = None, None, None
+        self._told_review = False
         self.rv_folded, self.rv_checked = set(), set()
         self.mode_focus = {"browse": "home", "review": "rfiles"}
         self.review_files_width = float(cfg("review_files_width") or 0.22)
@@ -4075,6 +4396,11 @@ class Tui:
         if self.g is None:
             raise SystemExit(f"gg: cannot load the graph: {self.bg_error}")
         self.rebuild_graph()
+        if self.o.get("review"):
+            repo, number = self.o["review"]
+            self.mode, self.focus = "review", "rfiles"
+            self.mode_focus["browse"] = "home"
+            self.load_review(repo, number)
         if self.o.get("root") and self.item is None:
             try:
                 self.item = resolve_root(self.g, self.o["root"])
@@ -4084,7 +4410,7 @@ class Tui:
             except ValueError as e:
                 self.msg = str(e)
         self.refresh_all()
-        if self.item is None:
+        if self.item is None and self.mode == "browse":
             self.focus = "home"
         if not CONFIG.get("tutorial_done") and self.o.get("tutorial", True):
             if self.popup_menu("first run — take a 2-minute tour of the screen? (F2 later)", [("yes", True), ("no", False)]) is True:
@@ -4199,7 +4525,7 @@ class Tui:
         node = self.g.nodes.get(f"{repo}#{number}")
         self.rv = Review(repo, number, status="worktree", title=(node.title if node else ""),
                          state=(node.state if node else None), author=(node.author if node else None))
-        self.rv_path, self.rv_folded = None, set()
+        self.rv_path, self.rv_folded, self._told_review = None, set(), True
         self.refresh_review(keep=False)
 
         def job():
@@ -4234,6 +4560,26 @@ class Tui:
             self.rv_folded ^= {r.nid}
             self.refresh_review()
 
+    def run_review_bg(self):
+        """R: the AI review of this PR, in the background. It costs real money and minutes, so it is
+        never started on its own — the cache is used until you ask for a new one."""
+        rv = self.rv
+        if rv is None or rv.status in ("running", "verifying", "worktree"):
+            return
+        if not rv.files:
+            self.msg = rv.error or "nothing to review yet"
+            return
+        if not ai_available():
+            self.msg = f"{CLAUDE_BIN} is not installed — gg ai picks another AI CLI"
+            return
+        n = len(review_chunks(rv))
+        if not self.confirm(f"Review {rv.repo}#{rv.number} with {CLAUDE_BIN} {REVIEW_MODEL}? "
+                            f"({len(rv.files)} files, {n} call{'s' if n != 1 else ''})"):
+            return
+        rv.status, rv.error, self._told_review = "running", None, False
+        self.refresh_review(keep=False)
+        self.run_bg(lambda: run_review(rv, rv.body), "review")
+
     def review_finding(self):
         r = self.panels["rfind"].current()
         fid = r.nid[8:] if r and (r.nid or "").startswith("finding:") else None
@@ -4246,8 +4592,11 @@ class Tui:
             return True
         if self.rv is None:
             return None
-        if k in (ord("r"), ord("R")):
-            self.load_review(self.rv.repo, self.rv.number, refresh=k == ord("R"))
+        if k == ord("r"):
+            self.load_review(self.rv.repo, self.rv.number)
+            return True
+        if k == ord("R"):
+            self.run_review_bg()
             return True
         if k == ord("x") and self.focus == "rfind":
             f = self.review_finding()
@@ -6114,8 +6463,14 @@ class Tui:
                 if self._new_rv is not None:                        # the worktree and diff are ready
                     self.rv, self._new_rv = self._new_rv, None
                     self.rv_path = None
-                    if self.rv.error:
-                        self.msg = f"review failed: {self.rv.error.splitlines()[0]}"
+                if self.rv is not None and self.rv.status == "done" and self.rv.t1 and not self._told_review:
+                    self._told_review = True
+                    cnt = self.rv.counts()          # not `c`: that is the curses module in this loop
+                    self.msg = (f"review done in {int(self.rv.t1 - (self.rv.t0 or self.rv.t1))}s: "
+                                f"{cnt['open']} open, {cnt['dropped']} dropped"
+                                + (f"  ({self.rv.error})" if self.rv.error else ""))
+                elif self.rv is not None and self.rv.error and self.rv.status == "failed":
+                    self.msg = f"review failed: {self.rv.error.splitlines()[0]}"
                 self.refresh_all()                                  # rows + next enrich jobs
             if not self.busy() and time.time() - getattr(self, "last_refresh", self.t0) > self.o["max_age_min"] * 60:
                 self.refresh_bg()                                   # auto: every max-age minutes, incrementally
@@ -7012,6 +7367,9 @@ def main(argv=None):
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="ANSI colours (auto = when stdout is a terminal)")
     ap.add_argument("--json", action="store_true", help="review: the review as JSON on stdout")
+    ap.add_argument("--print", action="store_true", dest="print_",
+                    help="review: print the result instead of opening the TUI")
+    ap.add_argument("--no-ai", action="store_true", help="review: the diff only, never call the AI CLI")
     a = ap.parse_intermixed_args(argv)
     cache_hygiene()
     if a.theme:
@@ -7084,7 +7442,8 @@ def main(argv=None):
         elif a.cmd == "review":
             if not a.arg:
                 ap.error('review needs a PR: gg review 123 (also #123, owner/name#123, a pull request URL)')
-            return do_review(a.arg, a.repo, refresh=a.refresh, as_json=a.json,
+            return do_review(a.arg, a.repo, refresh=a.refresh, as_json=a.json, no_ai=a.no_ai,
+                             to_tui=not (a.print_ or a.json), opts=a,
                              color=a.color == "always" or (a.color == "auto" and sys.stdout.isatty()))
         elif a.cmd == "show":
             if not a.arg:

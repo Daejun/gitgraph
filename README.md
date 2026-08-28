@@ -69,6 +69,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | how many `gh` queries run at the same time while filling the cache (first run, refresh). A round trip to GitHub costs ~0.4s whatever it asks for, so this is what makes a cold start fast; on a repo with hundreds of open items raising it to 12 is measurably quicker still |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
+| `review_model` · `review_timeout` · `review_max_bytes` | `GITGRAPH_REVIEW_MODEL` · `GITGRAPH_REVIEW_TIMEOUT` · `GITGRAPH_REVIEW_MAX_BYTES` | `sonnet` · `900` · `400000` | review mode: the model the review runs on (claude only), how long one call may take, and the diff size beyond which it is split by file and run in parallel |
 | `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | review mode: width of the Files and Findings columns |
 | `worktree_keep_days` · `worktree_max` | `GITGRAPH_WORKTREE_KEEP_DAYS` · `GITGRAPH_WORKTREE_MAX` | `7` · `5` | review mode: how long a PR worktree is kept, and how many. A kernel checkout is well over a gigabyte, so these are not a formality — `gg cache` lists them with their real size |
 | `review_subjective` | `GITGRAPH_REVIEW_SUBJECTIVE` | `auto` | review mode: style/design remarks — `auto` hides them while a confirmed defect stands, `always`, `never` |
@@ -203,18 +204,22 @@ The screen adapts: three columns while the diff can keep 56 of them, otherwise F
 | `1` `2` `3` · Tab | Files · Diff · Findings · cycle |
 | Enter | see the table above |
 | `x` | ignore this finding, or take the ignore back (remembered per PR, across new commits) |
-| `r` · `R` | reload the PR and its diff · refetch, ignoring what is cached for this head |
+| `R` · `r` | run the review (it asks first) · reload the PR and its diff, keeping the cached findings |
 | `o` · `y` | open the PR — or the exact file and line under the cursor — in the browser · copy that URL |
 | `/` `n` `N` · `?` | search the focused panel · key menu for it |
 
 ```
 gg review 779             # the TUI in review mode on PR #779
-gg review 779 --print     # the PR, its files and any cached findings, to stdout
+gg review 779 --print     # run the review and print it (--no-ai: the diff only, no AI call)
 gg review 779 --json      # the same as JSON (files, hunks are re-read from the worktree)
 gg review 779 --refresh   # ignore what is cached for this head and read it again
 ```
 
-Findings are produced by an AI pass that is not wired up yet (`docs/PLAN-review-mode.md` has the design); until it lands the Findings panel shows GitHub's own review threads and whatever was cached earlier. Everything else here works without an AI CLI.
+`R` runs the review itself. gg carries the protocol rather than a prompt, distilled from the kernel review prompt sets: read the whole function a hunk sits in before judging it (that is what the worktree is for), split the diff into CHANGE-N categories — one loop, one lock, one allocation, one changed return value — and analyse them one at a time, gate first on whether the changed code can run at all for the use the description claims, assume the author is wrong and demand proof, and drop any finding you cannot point at with a concrete `file:line -> file:line` path. The reply has to come back in fixed fields, and gg pins every finding onto a line the diff really touches before storing it — GitHub refuses an inline comment anywhere else. A diff over `review_max_bytes` is split by file and reviewed in parallel.
+
+It costs real money and minutes, so it is never started on its own: `R` asks first (with the file and call count), the result is cached against the head SHA, and `r` only reloads the PR. Two measured runs on a private kernel-style repo, claude sonnet, one call each: 2 files / +163 -166 took 7m14s and reported nothing, 4 files / +466 -155 took 6m39s and reported one real inconsistency between two sibling functions the same PR added, with a four-hop evidence chain and an applicable diff.
+
+Everything else in review mode works without an AI CLI at all.
 
 While review mode is open, `gg mcp` reports it: `gg_state` names the PR, its files, the finding counts and the finding under the cursor, and `gg_context` takes `finding:<fid>` for one finding in full or `file:<path>` for the reviewed file straight out of the worktree.
 

@@ -13,6 +13,8 @@ What it answers:
         strings (translation)        -> "TR:<original>"
         {"kind","text",...} (summary)-> "SUM:<first 40 chars of text>"
         {"ref","sentence"} (why)     -> "WHY:<ref>"
+  * a review prompt (it carries the GG_REVIEW contract) -> a GG_REVIEW block naming the files that
+    are actually in the diff it was given, with one finding on the first changed line of each
   * anything else (TR_FULL_PROMPT full-text translation, ASK_PROMPT question) -> plain text:
         full-text translation        -> "TRFULL:" + the body that followed the prompt header
         question                     -> "ANSWER: <the question line>"
@@ -22,11 +24,14 @@ Env vars (all optional):
   FAKE_AI_BAD_LEN=1  return an array of the wrong length                        (-> claude_json raises)
   FAKE_AI_IS_ERROR=1 return a well-formed JSON reply with is_error true
   FAKE_AI_SLEEP=N    sleep N seconds first (pending markers: "» 요약 중…", "⟳ 번역 중…")
+  FAKE_AI_REVIEW=S   the raw reply for a review prompt (one whose contract marker it carries), instead
+                     of the generated one — for malformed-answer tests
   FAKE_AI_LOG=PATH   append one JSON line per call {argv, prompt} so tests can assert batch sizes,
                      context contents and that a cached second call did NOT reach the CLI
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -52,9 +57,46 @@ def answer_for(entry):
     return f"TR:{entry}"
 
 
+def review_reply(prompt):
+    """A pass-1 review answer for the files the prompt's diff actually names, so the anchoring and
+    per-file bookkeeping in gitgraph.py are exercised with real paths. FAKE_AI_REVIEW overrides the
+    whole reply (a raw string) — used for the malformed-answer tests."""
+    override = os.environ.get("FAKE_AI_REVIEW")
+    if override is not None:
+        return override
+    paths, first_add = [], {}
+    cur = None
+    for line in prompt.splitlines():
+        if line.startswith("diff --git a/"):
+            cur = line.split(" b/", 1)[-1].split("   (")[0]
+            paths.append(cur)
+        elif line.startswith("@@") and cur:
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", line)
+            if m:
+                first_add.setdefault(cur, int(m.group(1)))
+        elif line.startswith("+") and cur and cur not in first_add:
+            first_add[cur] = 1
+    findings = []
+    for i, path in enumerate(paths[:2], 1):
+        findings.append({"cid": f"CHANGE-{i}", "severity": "bug" if i == 1 else "style",
+                         "path": path, "line": first_add.get(path, 1), "side": "RIGHT",
+                         "title": f"fake finding {i} in {path}",
+                         "body": "the fake AI CLI always says this.",
+                         "evidence": f"{path}:{first_add.get(path, 1)}"})
+    body = {"reachability": {"verdict": "confirmed", "reason": "fake"},
+            "changes": [{"cid": "CHANGE-1", "kind": "control-flow", "path": p, "symbol": "fake_fn",
+                         "summary": "fake category"} for p in paths],
+            "findings": findings}
+    return "here is the review.\n\n<<<GG_REVIEW\n" + json.dumps(body) + "\nGG_REVIEW>>>\n"
+
+
 def main():
     argv = sys.argv[1:]
-    prompt = argv[-1] if argv else ""
+    # gitgraph sends a review prompt on stdin (--allowedTools / --add-dir are variadic and would
+    # swallow a trailing prompt argument); everything else still comes as the last argv element.
+    prompt = "" if sys.stdin.isatty() else sys.stdin.read()
+    if not prompt:
+        prompt = argv[-1] if argv else ""
 
     log_path = os.environ.get("FAKE_AI_LOG")
     if log_path:
@@ -75,6 +117,8 @@ def main():
         if os.environ.get("FAKE_AI_BAD_LEN"):
             out = out[:-1] if len(out) > 1 else out + ["extra"]
         result = json.dumps(out, ensure_ascii=False)
+    elif "GG_REVIEW>>>" in prompt:
+        result = review_reply(prompt)
     elif "=== question ===" in prompt:
         question = prompt.rsplit("=== question ===", 1)[-1].strip()
         result = f"ANSWER: {question}"
