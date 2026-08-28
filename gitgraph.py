@@ -25,7 +25,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.7.3"
+VERSION = "0.7.4"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -653,8 +653,8 @@ def parse_refs_ctx(text, default_repo):
             if num <= SMALL_REF and not _plausible_small_ref(line, m, is_url=True):
                 continue
             h = m.group("host").lower()
-            if h.startswith("www."):
-                h = h[4:]
+            if h.startswith("www.") or h.endswith(".github.com"):     # redirect.github.com (dependabot) etc.
+                h = "github.com"
             out.append(((make_repo(h, *m.group("repo").split("/", 1)), num), snippet(raw, m.start(), m.end())))
         line = URL_RE.sub(" ", line)
         for m in REF_RE.finditer(line):
@@ -1016,12 +1016,25 @@ Output ONLY a JSON array of strings, same length and order as the input, no code
 
 
 def around(ctx, ref, n=40):
-    """The part of ctx within n characters of the first occurrence of ref (a short quote for narrow panels)."""
+    """The part of ctx within ~n characters of ref, cut at word boundaries (a short quote for narrow panels)."""
     i = ctx.find(ref)
     if i < 0:
         return trunc(ctx, 2 * n)
     a, b = max(0, i - n), min(len(ctx), i + len(ref) + n)
+    if a > 0:
+        sp = ctx.rfind(" ", 0, a + 12)
+        a = sp + 1 if sp >= 0 and sp + 1 <= i else a
+    if b < len(ctx):
+        sp = ctx.find(" ", b - 12)
+        b = sp if sp >= i + len(ref) else b
     return ("…" if a else "") + ctx[a:b].strip() + ("…" if b < len(ctx) else "")
+
+
+WEAK_WHY = re.compile(r"^(선행(하는)?\s*)?(관련|연관|참조|언급)?\s*(된|한)?\s*(PR|issue|이슈|항목|커밋)?\s*$", re.I)
+
+
+def weak_why(text):
+    return not text or len(text) < 8 or bool(WEAK_WHY.match(text))
 
 
 def summarize_whys(entries, lang=TR_LANG):
@@ -1735,9 +1748,11 @@ def segments(row, g):
         if m3:
             segs.append((m3.group(0), style))
             t = t[m3.end():]
-        if t.startswith("⟵ ") and " · " in t:
-            why, t = t.split(" · ", 1)
-            segs.append((why + " · ", "in"))
+        if "  ⟵ " in t:
+            t, why = t.split("  ⟵ ", 1)
+            segs.append((t, "stub" if n.stub else ""))
+            segs.append(("  ⟵ " + why, "in"))
+            return [x for x in segs if x[0]]
         i = t.find("  ")
         if i >= 0:
             segs.append((t[:i], "stub" if n.stub else ""))
@@ -2510,9 +2525,9 @@ class Tui:
         n_items = sum(1 for n in g.nodes.values() if n.kind == "item" and not n.stub)
         fa = datetime.fromtimestamp(g.fetched_at).strftime("%H:%M") if g.fetched_at else "?"
         me = ",".join("@" + m for m in self.me) or "-"
-        return [Row(f"{g.primary}  {n_items} open  fetched {fa}  me={me}", kind="head"),
-                Row(f"theme={THEME} comments={self.o['comments']} translate={self.o['translate']} "
-                    f"summary={'on' if self.o['summary'] else 'off'} hops={self.o['hops']}  {usage_line()}", kind="head")]
+        return [Row(f"{g.primary}  {n_items} open  {fa}  me={me}", kind="head"),
+                Row(f"{THEME} c={self.o['comments']} t={self.o['translate']} s={'on' if self.o['summary'] else 'off'} "
+                    f"h={self.o['hops']} | {usage_line().replace('tokens ', '')}", kind="head")]
 
     def item_rows(self):
         """The current item: label, metadata, one-line summary, url — Enter shows it in main."""
@@ -2554,22 +2569,21 @@ class Tui:
                 or mentions_me(n) is not None
 
         def my_turn_reason(n, lc):
-            """Why this item is on me: what the last comment did relative to me."""
+            """Why this item is on me, compactly: what the last comment did relative to me."""
             who, when = f"@{lc.author}", rel_days(lc, g)
             if any(t == "mention" and o and m[1:].lower() in me for m, t, o in g.adj[lc.id]):
-                return f"{who} mentioned me {when}"
+                return f"{who} mentioned {when}"
             if (n.author or "").lower() in me:
-                return f"{who} commented on my {'PR' if n.is_pr else 'issue'} {when}"
+                return f"{who} on my {'PR' if n.is_pr else 'issue'} {when}"
             if any((c.author or "").lower() in me for c in g.comments_of(n.id)):
-                return f"{who} replied after me {when}"
-            return f"{who} commented (I was mentioned) {when}"
+                return f"{who} replied {when}"
+            return f"{who} commented {when}"
 
         def item_row(n, src=None, reason=None):
             deg = item_degree(cg, n.id) if n.id in cg.nodes else 0
             if reason:
-                head = item_label(g, n, w, with_meta=False).split(" ", 1)
-                label = f"{head[0]} {head[1].split(' ', 2)[0]} {head[1].split(' ', 2)[1]} ⟵ {reason} · " + \
-                        trunc(n.tr_title or n.title, w)
+                tw = max(12, w - dw(reason) - 4)      # the title keeps what the reason leaves
+                label = item_label(g, n, tw, with_meta=False) + f"  ⟵ {reason}"
             else:
                 label = item_label(g, n, w)
             r = Row(self.mark_prefix(n.id) + label + (f"  ⇢ {deg}" if deg else ""), n.id)
@@ -2624,10 +2638,10 @@ class Tui:
             n = g.nodes.get(e["item"])
             head = item_label(g, n, w, with_meta=False) if n else f"{e['item_num']} {trunc(e['title'], w)}"
             text = f"✎ {head}"
+            if e.get("comment"):
+                text += f"  ← @{e['comment_author']} {e['comment_when']}"
             if e.get("note"):
                 text += f"  · {e['note']}"
-            if e.get("comment"):
-                text += f"  ← @{e['comment_author']} {e['comment_when']} {trunc(e['comment_text'], w)}"
             r = Row(text, e["item"] if n else None, e.get("comment") if e.get("comment") in g.nodes else None,
                     "mention" if e.get("comment") in g.nodes else "")
             rows.append(r)
@@ -2684,7 +2698,7 @@ class Tui:
         ctx = g.ctx.get(pair)
         if ctx:
             why = g.why.get(pair)
-            if why:
+            if why and not weak_why(why):
                 return why
             ref = g.label_num(g.nodes[pair[1]]) if pair[1] in g.nodes else ""
             return f"\"{around(ctx, ref)}\"" + ("  (» …)" if self.o["summary"] and pair in getattr(self, "why_pending", set()) else "")
@@ -2753,6 +2767,29 @@ class Tui:
                 in_code = not in_code
         p.rows = rows
 
+    @staticmethod
+    def reflow(body):
+        """Join hard-wrapped prose lines into paragraphs; code fences, lists, tables, quotes, headings stay as they are."""
+        out, para, in_code = [], [], False
+
+        def flush():
+            if para:
+                out.append(" ".join(x.strip() for x in para))
+                para.clear()
+
+        for ln in body.splitlines():
+            st = ln.strip()
+            if st.startswith("```"):
+                flush(); out.append(ln); in_code = not in_code; continue
+            special = in_code or not st or st.startswith(("#", "|", ">", "- ", "* ", "+ ", "```")) or \
+                re.match(r"^\d+[.)] ", st) or ln.startswith(("    ", "\t"))
+            if special:
+                flush(); out.append(ln)
+            else:
+                para.append(ln)
+        flush()
+        return "\n".join(out)
+
     def content_lines(self, nid, width):
         n = self.g.nodes.get(nid) if nid else None
         if not n:
@@ -2798,7 +2835,7 @@ class Tui:
                 out.append(f"({PENDING_TEXT.replace('요약', '번역') if TR_LANG.lower().startswith('korean') else 'translating…'})")
         if body.strip():
             out.append("")
-            out.extend(wrap(body, width))
+            out.extend(wrap(self.reflow(body), width))
         return out
 
     def translate_content(self):
@@ -2990,6 +3027,10 @@ class Tui:
             return
         if self.focus == "home":
             self.set_item(r.nid)
+            if r.kind == "mention" and r.jump in self.g.nodes:      # the comment that put it here / was marked
+                self.subject = r.jump
+                self.panels["comments"].goto_nid(r.jump)
+                self.refresh_main()
         elif self.focus == "item":
             self.subject = self.item
             self.panels["main"].tab = 0
@@ -3003,8 +3044,10 @@ class Tui:
                 self.panels["comments"].goto_nid(n.id)
                 self.subject = n.id
                 self.refresh_main()
+                self.focus = "comments"
             else:
                 self.set_item(r.nid)
+                self.focus = "item"
         elif self.focus == "comments":
             self.subject = r.nid
             self.panels["main"].tab = 0
@@ -3532,7 +3575,8 @@ class Tui:
         elif self.msg:
             bottom, attr = self.msg, c.A_BOLD
         else:
-            bottom = f"{self.HINTS.get(self.focus, '')}   1-6 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit"
+            bottom = (f"{self.HINTS.get(self.focus, '')}   1-6 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit"
+                      if w >= 110 else f"{self.HINTS.get(self.focus, '')[:max(0, w - 30)]}  1-6 0 Tab  + _  ? q")
             attr = self.dim()
         self.put(h - 1, 0, bottom, attr, fill=w - 1)
         scr.refresh()
@@ -3757,7 +3801,8 @@ class Tui:
             k = self.read_key()
             if k == -1:
                 continue
-            self.msg = ""
+            if not (k == c.KEY_MOUSE and self.mouse_ev and not self.mouse_ev[3]):   # a button release keeps the message
+                self.msg = ""
             if not self.handle_key(k):
                 return
 
