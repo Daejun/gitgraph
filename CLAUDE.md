@@ -76,8 +76,10 @@ network), so the shape of the fetch is what costs time. A cold cache lists the o
 pagination inside one connection is the only part that must stay sequential. Past `--max-age` the same
 listing feeds `refresh_items`, which re-fetches just what changed. Retried on transient errors, with
 multi-account fallback: on `NOT_FOUND` the other accounts `gh auth status` knows for that host are tried
-with their own token (`_prefer_account` remembers the one that worked), without switching the global gh
-account. Cached per repo under `~/.cache/gitgraph/`.
+with their own token, without switching the global gh account. Which account can see a repo is worth
+knowing *before* the first call — a wrong first guess costs a whole round trip — so it comes from the
+checkout's git config (`git_account_hint`) and is then remembered per repo in `accounts.json`
+(`_prefer_account`). Cached per repo under `~/.cache/gitgraph/`.
 
 **Graph model** (`Node`, `Graph`, `build_graph`) — three node kinds (`item`, `comment`, `person`) and four
 edge types (`ref`, `closes`, `mention`, `comment`). Edges come from parsing bodies and comments

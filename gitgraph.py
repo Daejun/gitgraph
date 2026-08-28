@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.19.0"
+VERSION = "0.19.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -261,6 +261,32 @@ def resolve_ssh_alias(host):
 SKIPPED_REMOTES = []   # (dir, remote name, url, reason) — shown when nothing usable was found
 
 
+_ACCT_IN_HELPER = re.compile(r"username=([A-Za-z0-9](?:[A-Za-z0-9-]*))|(?:auth token\s+)?-u\s+([A-Za-z0-9](?:[A-Za-z0-9-]*))")
+
+
+def git_account_hint(d, host, url=""):
+    """Which gh account this checkout uses for `host`, from its own git config: the standard
+    credential.<host>.username, a gh credential helper that names one (`gh auth token -u LOGIN`, what
+    `gh auth setup-git -u` writes), or a user@ in the remote URL. None when nothing says so.
+
+    Worth reading because the active gh account is often not the one a private repo is shared with, and
+    this is known before the first API call — the cache in accounts.json only learns it after one."""
+    m = re.match(r"https?://([^@/]+)@", url or "")
+    hinted = [m.group(1)] if m else []
+    r = subprocess.run(["git", "-C", d, "config", "--get-regexp",
+                        r"^credential\.https://" + re.escape(host) + r"\."], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        key, _, val = line.partition(" ")
+        if key.endswith(".username"):
+            hinted.insert(0, val.strip())
+        elif key.endswith(".helper"):
+            mm = _ACCT_IN_HELPER.search(val)
+            if mm:
+                hinted.append(mm.group(1) or mm.group(2))
+    known = gh_accounts(host)
+    return next((h for h in hinted if h in known), None)
+
+
 def github_remotes(d):
     """[(rank, repo)] for every remote of the git repo at d whose URL points at a GitHub host.
     rank: 0 = origin, 1 = a remote named github*, 2 = anything else."""
@@ -285,6 +311,10 @@ def github_remotes(d):
         if repo in seen:
             continue
         seen.add(repo)
+        hint = git_account_hint(d, host, url)
+        if hint:      # a first guess for graphql(); anything already verified in accounts.json wins
+            _pref_map().setdefault(host, {}).setdefault(repo, hint)
+            _acct_hint.setdefault(host, hint)      # also for the repos this one references
         out.append((0 if name == "origin" else 1 if name.lower().startswith("github") else 2, repo))
     return sorted(out)
 
@@ -347,11 +377,29 @@ def unfork(repos):
     return out
 
 
+def seed_account_hints(repos, d=None):
+    """For repos named on the command line (or in $GITGRAPH_REPOS) there is no discovery step, so take
+    the account hint from the git repo we are standing in: its credential config is host-scoped and is
+    usually the checkout of one of these repos. Only a first guess — accounts.json wins if it holds a
+    verified one, and a wrong guess costs the same single fallback it costs today."""
+    d = d or os.getcwd()
+    if not os.path.isdir(os.path.join(d, ".git")):
+        return
+    for repo in repos:
+        host = repo_host(repo)
+        hint = git_account_hint(d, host)
+        if hint:
+            _pref_map().setdefault(host, {}).setdefault(repo, hint)
+            _acct_hint.setdefault(host, hint)
+
+
 def resolve_repos(explicit=None, interactive=False):
     """-r > $GITGRAPH_REPOS > repos found under cwd (ask if several; forks -> their parent)."""
     if explicit:
+        seed_account_hints(explicit)
         return list(explicit)
     if ENV_REPOS:
+        seed_account_hints(ENV_REPOS)
         return ENV_REPOS
     cands = discover_repos(os.getcwd())
     cands = [(r, d) for r, d in cands]
@@ -434,11 +482,45 @@ def gh_api(args, body, env):
     return r
 
 
-def _prefer_account(host, user):
-    """Remember the account that could see this host's repos, so later queries try it first."""
+_acct_pref = None       # {host: {repo: login}} — which account could actually see a repo, across runs
+_acct_hint = {}         # {host: login} — this run's guess from git config, for repos we know nothing about
+
+
+def _accounts_path():
+    return os.path.join(CACHE_DIR, "accounts.json")     # resolved per call, like the other caches
+
+
+def _pref_map():
+    global _acct_pref
+    if _acct_pref is None:
+        _acct_pref = read_json(_accounts_path()) or {}
+    return _acct_pref
+
+
+def _query_repo(query, variables):
+    """owner/name the query is about, for remembering which account can see it."""
+    if variables and variables.get("owner") and variables.get("name"):
+        return f"{variables['owner']}/{variables['name']}"
+    m = re.search(r'repository\(owner:"([^"]+)",\s*name:"([^"]+)"\)', query)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def _prefer_account(host, user, repo=None):
+    """Remember the account that could see this repo: first in this process, then in the cache, so the
+    next run does not spend a round trip discovering it again (the active gh account is often not the
+    one a private repo is shared with)."""
     if _accounts and user in _accounts.get(host, []):
         _accounts[host].remove(user)
         _accounts[host].insert(0, user)
+    if not repo or not user:
+        return
+    d = _pref_map().setdefault(host, {})
+    if d.get(repo) != user:
+        d[repo] = user
+        try:
+            write_json(_accounts_path(), _acct_pref)
+        except OSError:
+            pass
 
 
 def graphql(query, variables=None, host=DEFAULT_HOST):
@@ -449,6 +531,10 @@ def graphql(query, variables=None, host=DEFAULT_HOST):
     is moved to the front for the rest of the process.
     """
     accts = gh_accounts(host) or [None]
+    repo = _query_repo(query, variables)
+    fav = (_pref_map().get(host) or {}).get(repo) or _acct_hint.get(host)
+    if fav in accts and accts[0] != fav:                # the account that saw this repo last time
+        accts = [fav] + [a for a in accts if a != fav]
     body = json.dumps({"query": query, "variables": variables or {}})
     last_err = None
     for i, acct in enumerate(accts):
@@ -466,15 +552,15 @@ def graphql(query, variables=None, host=DEFAULT_HOST):
             data = {}
         errs = data.get("errors") or []
         if not errs and r.returncode == 0:
-            if i:
-                _prefer_account(host, accts[i])
+            if (_pref_map().get(host) or {}).get(repo) != acct:
+                _prefer_account(host, acct, repo)
             return data.get("data", {})
         types = {e.get("type") for e in errs}
         partial = data.get("data") or {}
         if errs and types <= {"NOT_FOUND"} and any(v is not None for v in partial.values()):
             # partial NOT_FOUND (e.g. one alias in a stub batch): usable; a null repository is not
-            if i:
-                _prefer_account(host, accts[i])
+            if (_pref_map().get(host) or {}).get(repo) != acct:
+                _prefer_account(host, acct, repo)
             return data.get("data", {})
         last_err = errs or r.stderr.strip() or f"gh exit {r.returncode}"
         if "NOT_FOUND" in types or "Could not resolve" in (r.stderr or ""):
@@ -5155,6 +5241,7 @@ CACHE_KINDS = {   # filename prefix -> (group, purpose)
     "summaries.json": ("ai", "one-line summaries of comments and items"),
     "whys.json": ("ai", "link reasons"),
     "tui.log": ("logs", "tui stderr / progress log"),
+    "accounts.json": ("state", "which gh account can see which repo (saves a round trip on start-up)"),
     "state.json": ("state", "what the tui shows now (read by gg mcp)"),
     "cmd.json": ("state", "command from gg mcp to the tui"),
     "cmd_result.json": ("state", "its result"),

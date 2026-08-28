@@ -175,6 +175,7 @@ gg가 보관하는 것은 모두 `~/.cache/gitgraph/`(디렉터리 0700, 파일 
 | `stubs__<repo>.json` | 참조된 항목(닫힌 것·다른 repo)의 제목/본문 | 하루 보관 |
 | `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI 결과(텍스트 해시 기준) | 상한(2만 건 넘으면 오래된 것부터 삭제) |
 | `tui.log` | tui stderr/진행 로그 | 1 MB 넘으면 잘라냄 |
+| `accounts.json` | 어느 gh 계정이 어느 repo를 볼 수 있는지 | 바뀔 때 덮어씀 |
 | `state.json`, `cmd*.json` | tui가 보는 것(`gg mcp`용) | 덮어씀 |
 | `~/.config/gitgraph/config.json`, `todo.json`(+ `todo_file` markdown) | 설정, 마킹 | 사용자 것 |
 
@@ -186,7 +187,7 @@ Enterprise host의 repo는 `host/owner/name`으로 쓴다(`-r ghe.example.com/te
 
 ## 계정, 네트워크, 캐시
 
-- private repo가 `NOT_FOUND`면 그 host에 등록된 다른 `gh` 계정 토큰으로 자동 재시도한다(전역 계정 전환 없음). 실패 시 host와 시도한 계정을 에러에 적는다.
+- private repo가 `NOT_FOUND`면 그 host에 등록된 다른 `gh` 계정 토큰으로 자동 재시도한다(전역 계정 전환 없음). 실패 시 host와 시도한 계정을 에러에 적는다. 성공한 계정은 repo별로 `accounts.json`에 기억하고, 그 전에는 체크아웃의 git config가 지목하는 계정을 쓴다(`credential.<host>.username`, `gh auth setup-git -u`가 쓰는 helper, remote URL의 `user@`). 그래서 첫 쿼리부터 맞는 계정으로 나가고, 계정을 찾느라 왕복 한 번을 버리지 않는다.
 - 일시적 네트워크 오류(`TLS handshake timeout`, connection reset, 5xx)는 `retries`회 backoff 재시도 후, 확인할 것(`gh api user`, `HTTPS_PROXY`, VPN/DNS)을 안내한다.
 - 캐시: `~/.cache/gitgraph/` — repo·state별 항목(`--max-age`, `--refresh`), 번역, 요약. TUI 로그(stderr)는 `~/.cache/gitgraph/tui.log`.
 

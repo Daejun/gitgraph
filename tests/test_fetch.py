@@ -11,6 +11,7 @@ Run: python3 -m unittest tests.test_fetch -v
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -57,6 +58,8 @@ class FetchCase(unittest.TestCase):
                          ("FAKE_GH_MODE", "FAKE_GH_FIXTURE", "FAKE_GH_LOG", "FAKE_GH_ACCOUNTS",
                           "FAKE_GH_DENY", "FAKE_GH_TRANSIENT_N")}
         os.environ.update(FAKE_GH_MODE="script", FAKE_GH_FIXTURE=self.fixture_path, FAKE_GH_LOG=self.gh_log)
+        gg._acct_pref = None      # accounts.json lives in this test's CACHE_DIR, not the previous one
+        gg._acct_hint = {}        # and the git-config guess is per run
         self.set_accounts({"github.com": ["alice"]})
         self.write_fixture({})
         self.addCleanup(self._restore)
@@ -68,7 +71,7 @@ class FetchCase(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        gg._accounts = None
+        gg._accounts, gg._acct_pref, gg._acct_hint = None, None, {}
         gg._tokens.clear()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -143,6 +146,48 @@ class TestGraphqlFallback(FetchCase):
         tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
         self.assertEqual(tried, ["alice", "carol", "carol"], "the second query goes straight to carol")
 
+    def test_the_working_account_is_remembered_across_runs(self):
+        """The active gh account is often not the one a private repo is shared with, so which account
+        could see it is written to accounts.json — a new process then starts with that one instead of
+        spending a round trip rediscovering it (measured: 2 wasted queries per cold start)."""
+        self.set_accounts({"github.com": ["alice", "carol"]})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
+        gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
+        path = os.path.join(gg.CACHE_DIR, "accounts.json")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"github.com": {"test/repo": "carol"}})
+
+        gg._accounts, gg._acct_pref = None, None       # a fresh process reads it back
+        gg._tokens.clear()
+        before = len(self.gh_calls())
+        gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
+        tried = [c["account"] for c in self.gh_calls()[before:] if c.get("query_head")]
+        self.assertEqual(tried, ["carol"], "the denied account must not be tried again")
+
+    def test_the_memory_is_per_repo(self):
+        self.set_accounts({"github.com": ["alice", "carol"]})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
+        gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
+        self.write_fixture({"test/repo": {"issues": {"1": node(1, "hello")}, "pulls": {}},
+                            "other/side": {"issues": {"2": node(2, "hi")}, "pulls": {}}})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["carol"])      # the other repo is the other way round
+        gg.graphql(gg.Q_ISSUES, {"owner": "other", "name": "side", "after": None, "states": ["OPEN"]})
+        with open(os.path.join(gg.CACHE_DIR, "accounts.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["github.com"], {"test/repo": "carol", "other/side": "alice"})
+
+    def test_a_stale_memory_falls_back_and_is_corrected(self):
+        path = os.path.join(gg.CACHE_DIR, "accounts.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"github.com": {"test/repo": "carol"}}, f)
+        gg._acct_pref = None
+        self.set_accounts({"github.com": ["alice", "carol"]})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["carol"])      # access changed hands
+        gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
+        tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
+        self.assertEqual(tried, ["carol", "alice"], "the remembered one first, then the fallback")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["github.com"]["test/repo"], "alice", "corrected for next time")
+
     def test_not_found_everywhere_names_the_host_and_the_accounts(self):
         self.set_accounts({"github.com": ["alice", "carol"]})
         os.environ["FAKE_GH_DENY"] = json.dumps(["alice", "carol"])
@@ -152,6 +197,81 @@ class TestGraphqlFallback(FetchCase):
         self.assertIn("github.com", msg)
         self.assertIn("alice", msg)
         self.assertIn("carol", msg)
+
+
+class TestGitAccountHint(FetchCase):
+    """Which gh account a checkout uses is usually written in its own git config — gg reads it so the
+    very first run (before accounts.json exists) does not spend a round trip on the wrong account."""
+
+    def git_repo(self, **config):
+        """A real `git init` repo (git only reads config from something it recognises as a repo)."""
+        d = os.path.join(self.tmp, f"repo{len(os.listdir(self.tmp))}")
+        os.makedirs(d)
+        subprocess.run(["git", "init", "-q", d], check=True, capture_output=True)
+        for key, value in config.items():
+            subprocess.run(["git", "-C", d, "config", key.replace("__", "."), value],
+                           check=True, capture_output=True)
+        return d
+
+    def setUp(self):
+        super().setUp()
+        self.set_accounts({"github.com": ["alice", "carol"]})
+
+    def test_credential_username(self):
+        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        self.assertEqual(gg.git_account_hint(d, "github.com"), "carol")
+
+    def test_a_gh_credential_helper_that_names_an_account(self):
+        # what `gh auth setup-git -u LOGIN` writes into a checkout
+        helper = '!f() { test "$1" = get && { echo username=carol; echo "password=$(gh auth token -u carol)"; }; }; f'
+        d = self.git_repo(**{"credential.https://github.com.helper": helper})
+        self.assertEqual(gg.git_account_hint(d, "github.com"), "carol")
+
+    def test_a_user_in_the_remote_url(self):
+        d = self.git_repo()
+        self.assertEqual(gg.git_account_hint(d, "github.com", "https://carol@github.com/test/repo.git"), "carol")
+
+    def test_nothing_to_go_on(self):
+        d = self.git_repo()
+        self.assertIsNone(gg.git_account_hint(d, "github.com"))
+
+    def test_an_account_gh_does_not_know_is_ignored(self):
+        d = self.git_repo(**{"credential.https://github.com.username": "stranger"})
+        self.assertIsNone(gg.git_account_hint(d, "github.com"))
+
+    def test_a_hint_from_another_host_does_not_leak(self):
+        d = self.git_repo(**{"credential.https://ghe.example.com.username": "carol"})
+        self.assertIsNone(gg.git_account_hint(d, "github.com"))
+
+    def test_the_hint_is_used_for_the_first_query(self):
+        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        self.write_fixture({"test/repo": {"issues": {"1": node(1, "hello")}, "pulls": {}}})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
+        gg.seed_account_hints(["test/repo"], d)
+        gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
+        tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
+        self.assertEqual(tried, ["carol"], "the denied active account must not be tried at all")
+
+    def test_the_hint_also_covers_repos_it_references(self):
+        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        gg.seed_account_hints(["test/repo"], d)
+        self.write_fixture({"other/side": {"issues": {"9": node(9, "x")}, "pulls": {}}})
+        os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
+        gg.graphql(gg.Q_ISSUES, {"owner": "other", "name": "side", "after": None, "states": ["OPEN"]})
+        tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
+        self.assertEqual(tried, ["carol"], "a stub repo of the same host gets the same first guess")
+
+    def test_a_verified_memory_beats_the_git_hint(self):
+        with open(os.path.join(gg.CACHE_DIR, "accounts.json"), "w", encoding="utf-8") as f:
+            json.dump({"github.com": {"test/repo": "alice"}}, f)
+        gg._acct_pref = None
+        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        gg.seed_account_hints(["test/repo"], d)
+        self.assertEqual(gg._pref_map()["github.com"]["test/repo"], "alice")
+
+    def test_a_directory_that_is_not_a_git_repo_is_skipped(self):
+        gg.seed_account_hints(["test/repo"], self.tmp)      # no .git: must not raise
+        self.assertNotIn("test/repo", gg._pref_map().get("github.com", {}))
 
 
 class TestRetries(FetchCase):
