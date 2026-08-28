@@ -146,7 +146,8 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 | `y` | 선택 항목의 URL을 클립보드로 |
 | `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기(URL은 content 첫 줄에 밑줄로도 표시) |
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
-| `u` · `r` | Inbox을 다른 사람 관점으로 · 재조회 |
+| `u` | Inbox를 다른 사람 관점으로 |
+| `r` · `R` | 백그라운드로 GitHub 갱신: 바뀐 것만(`--max-age`분마다 자동으로도) · 전체 |
 | `c` `t` `s` `p` `h` | comments 모드 · 번역 · 요약 · 사람 노드 · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | 포커스 panel 검색 · 색 테마 · 토큰 사용량 · 종료 |
 | `C` | gg 옆에 Claude Code를 띄움(tmux면 옆 pane, 아니면 전체 화면). `gg mcp` 서버를 통해 지금 보는 것(`gg_state`, `gg_context`)과 마킹(`gg_todo`)을 읽고 gg를 조작(`gg_open`, `gg_mark`)하고 처리한 마킹을 지울 수 있음(`gg_todo_done`). 한 번 등록: `claude mcp add -s user gg -- gg mcp` |
