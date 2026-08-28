@@ -39,6 +39,7 @@ gg show 748               # one node in detail: every edge, comments, body
 gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with the item as context
 gg tui [768]              # interactive TUI; a number starts on that tree
 gg config [KEY [VALUE]]   # persistent settings
+gg todo                   # print the markdown of everything marked with m in the tui
 gg update                 # update this installation
 ```
 
@@ -59,6 +60,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
+| `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | markdown written from the marks made with `m` |
 | `theme` | `GITGRAPH_THEME` | `dark` | colour theme, like vim's `bg=`: `dark` (256 colours), `light` (darker tones for a light background), `basic` (8 colours, no dim, no dark blue — PuTTY and other plain terminals). `--theme` for one run, `T` in the TUI to cycle |
 
 ## Line format
@@ -117,11 +119,11 @@ lazygit-style layout: a side column of panels (Repo · Item · Home · Links · 
 |---|---|---|
 | 1 Repo | repo, open count, fetch time, "me", toggles, token usage | – |
 | 2 Item | the current item: title, metadata, `» one-line summary` (or the first line of its body), comment/link counts, URL | read it in main |
-| 3 Home | one section at a time (`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — same rules as before ("my turn" = items I am in where someone else spoke last, `--days N` window, "me" = gh accounts / `-u` / `u`). In my turn / active / waiting / PRs rows the cursor previews the **latest comment** (that is why main shows a comment there); my turn rows say why it is on me: `⟵ @who mentioned me +5d ·`, `commented on my PR`, `replied after me` | make it the **current item** — Item, Links, Comments and People follow |
+| 3 Home | one section at a time (`[` `]`): todo · my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — same rules as before ("my turn" = items I am in where someone else spoke last, `--days N` window, "me" = gh accounts / `-u` / `u`). In my turn / active / waiting / PRs rows the cursor previews the **latest comment** (that is why main shows a comment there); my turn rows say why it is on me: `⟵ @who mentioned me +5d ·`, `commented on my PR`, `replied after me` | make it the **current item** — Item, Links, Comments and People follow |
 | 4 Links | every edge of the current item and its comments: `→ refs`, `← cited-by`, `→ closes`, `← closed-by` (via which comment). Under each link a `↳` note says **why**, briefly: a one-line reason written by the summarizer from the sentence that made the reference (e.g. `충돌 여부를 확인한 관련 PR`; a short quote around `#N` until it arrives, or when summaries are off), or — when there is no such text (references recorded only by GitHub's timeline, closed items) — a one-line summary of that issue/PR (`» …`, made by the same summarizer as comments once its body has been fetched; `» summarizing…` while pending) | go to that item; on a comment row: its item, with the cursor on that comment (back with `b`/Esc) |
 | 5 Comments | the current item's comments `+Nd o @who » summary`, newest on top | read it in main |
 | 6 People | author, commenters and mentioned people of the current item, most recently active first | view Home as that person |
-| 0 Main | tabs (`[` `]`): **content** = full text of the row under the cursor in the focused side panel (URL first, underlined; body + metadata, or a comment) — it stays put while main itself is focused; **answer** = the last `a` question | – |
+| 0 Main | tabs (`[` `]`): **content** = full text of the row under the cursor in the focused side panel (URL first, underlined; body + metadata, or a comment) — it stays put while main itself is focused; **answer** = the last `a` question. Both render markdown: headings, code blocks and `code`, **bold**, links, quotes, bullets | – |
 
 Layout: side column `side_width` (0.4) of the screen; titles are truncated to what fits and re-fitted whenever the widths change (drag, resize, screen mode); the focused side panel is taller (`expand_focused`, `expanded_weight`) and stays that way while main is focused, so the next pick is easy; `+`/`_` cycle screen modes normal → half (the focused panel fills its column) → full (only that panel); narrow terminals (≤ 84 columns) stack the focused side panel above the main panel; borders `border` (rounded · single · double · bold · hidden). Translation and summaries run in the background for the visible rows first (`batch` per call); `» summarizing…` marks a pending one.
 
@@ -134,6 +136,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `K` `J` | scroll the main panel from anywhere |
 | Enter | see the table above |
 | `i` | translate the main content (issue/PR body or comment) in full into `lang`; again = original (cached in `translations_full.json`) |
+| `m` | mark the selected issue/PR or comment for my next work and write a note; marked rows show `✎`, Home gets a **todo** section (first tab), and the markdown file `todo_file` (default `~/gitgraph-todo.md`; `gg todo` prints it) is rewritten so the next session — or Claude — can pick the work up. `m` again on a marked row: edit the note / mark done / remove. Source of truth: `~/.config/gitgraph/todo.json` |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser (the URL is also the first, underlined line of the content) |
 | Esc / `b` · `f` | back (previous item and perspective) · forward |
 | `u` · `r` | view Home as another person · refetch |
