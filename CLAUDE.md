@@ -69,11 +69,15 @@ repo discovery → gh GraphQL fetch + cache → graph model → filters → row 
 parent (that is where the issues live). Enterprise repos are written `host/owner/name`, and every repo id
 carries its host through the whole pipeline (`split_repo`/`qualify`/`repo_host`).
 
-**Fetch** (`graphql`, `load_items`) — one GraphQL query per repo, retried on transient errors, with
+**Fetch** (`graphql`, `load_items`) — every query is a `gh api graphql` process (~0.4s before any
+network), so the shape of the fetch is what costs time. A cold cache lists the open numbers first
+(`list_open`, both connections paged at once) and then pulls the records in aliased batches through
+`fetch_groups`, `FETCH_PARALLEL` queries at a time with the batch size chosen to fill every slot;
+pagination inside one connection is the only part that must stay sequential. Past `--max-age` the same
+listing feeds `refresh_items`, which re-fetches just what changed. Retried on transient errors, with
 multi-account fallback: on `NOT_FOUND` the other accounts `gh auth status` knows for that host are tried
-with their own token, without switching the global gh account. Cached per repo under
-`~/.cache/gitgraph/`; past `--max-age` only numbers + `updatedAt` are listed and just the changed items
-re-fetched (`refresh_items`).
+with their own token (`_prefer_account` remembers the one that worked), without switching the global gh
+account. Cached per repo under `~/.cache/gitgraph/`.
 
 **Graph model** (`Node`, `Graph`, `build_graph`) — three node kinds (`item`, `comment`, `person`) and four
 edge types (`ref`, `closes`, `mention`, `comment`). Edges come from parsing bodies and comments

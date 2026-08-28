@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.18.1"
+VERSION = "0.19.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -48,6 +48,7 @@ CONFIG_KEYS = {
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
     "ai_parallel": ("GITGRAPH_AI_PARALLEL", "3", "tui: how many AI CLI calls may run at the same time"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
+    "fetch_parallel": ("GITGRAPH_FETCH_PARALLEL", "6", "how many gh queries run at the same time when filling the cache"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
     "todo_file": ("GITGRAPH_TODO", "~/gitgraph-todo.md", "markdown written from the marks made with m in the tui (for the next session)"),
     "side_width": ("GITGRAPH_SIDE_WIDTH", "0.4", "tui: fraction of the width for the side column"),
@@ -575,45 +576,76 @@ query($owner:String!,$name:String!,$after:String,$states:[PullRequestState!]) {
   repository(owner:$owner,name:$name){ pullRequests(first:100, after:$after, states:$states){
     pageInfo{hasNextPage endCursor} nodes{ number updatedAt } } } }
 """
-ITEM_BATCH = 10
+ITEM_BATCH = 10             # numbers per query when only a few items changed
+MAX_ITEM_BATCH = 25         # cold start: how many may share one query (bigger = fewer `gh` processes)
+FETCH_PARALLEL = max(1, int(cfg("fetch_parallel") or 6))   # concurrent `gh api graphql` queries
 
 
 def list_open(repo):
-    """{(is_pr, number): updatedAt} for every open issue and PR — a light query (no bodies)."""
+    """{(is_pr, number): updatedAt} for every open issue and PR — light queries (no bodies). The issue
+    and pull-request connections are independent, so they are paged at the same time; only the pages
+    within one connection have to be sequential (each needs the previous cursor)."""
+    from concurrent.futures import ThreadPoolExecutor
     host, owner, name = split_repo(repo)
-    out = {}
-    for q, is_pr in ((Q_LIST, False), (Q_LIST_PR, True)):
-        after = None
+
+    def page_all(q, is_pr):
+        res, after = {}, None
         while True:
             d = graphql(q, {"owner": owner, "name": name, "after": after, "states": ["OPEN"]}, host)
             conn = (d.get("repository") or {}).get("pullRequests" if is_pr else "issues")
             if conn is None:
                 raise GhError(f"{repo}: repository not found on {host}")
             for n in conn["nodes"]:
-                out[(is_pr, n["number"])] = n["updatedAt"]
+                res[(is_pr, n["number"])] = n["updatedAt"]
             if not conn["pageInfo"]["hasNextPage"]:
-                break
+                return res
             after = conn["pageInfo"]["endCursor"]
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for res in pool.map(lambda a: page_all(*a), ((Q_LIST, False), (Q_LIST_PR, True))):
+            out.update(res)
     return out
 
 
-def fetch_items(repo, is_pr, numbers):
-    """Full records (bodies, comments, cross references) of the given issue or PR numbers, ITEM_BATCH per query."""
+def fetch_items(repo, is_pr, numbers, note="changed items", spread=False):
+    return fetch_groups(repo, [(is_pr, numbers)], note, spread)
+
+
+def fetch_groups(repo, groups, note="items", spread=False):
+    """Full records (bodies, comments, cross references) of the given issue or PR numbers: one query per
+    batch of numbers, FETCH_PARALLEL queries in flight (each batch is an independent query, so this is
+    where a cold start gets its speed — pagination cannot be parallelised, batches can).
+
+    Every query is a `gh` process, and that costs ~0.4s before any network happens, so `spread` (the
+    cold start) makes the batches as large as it can while still filling every parallel slot — a few
+    big queries beat many small ones. The incremental refresh keeps ITEM_BATCH: there the item count is
+    small and the batches are what limits the response size."""
+    from concurrent.futures import ThreadPoolExecutor
     host, owner, name = split_repo(repo)
-    fields = PR_FIELDS if is_pr else ISSUE_FIELDS
-    kind = "pullRequest" if is_pr else "issue"
-    items = []
-    for i in range(0, len(numbers), ITEM_BATCH):
-        batch = numbers[i:i + ITEM_BATCH]
+    total = sum(len(nums) for _, nums in groups)
+    size = ITEM_BATCH
+    if spread:      # one query per parallel slot rather than many small ones (each is a `gh` process)
+        size = max(ITEM_BATCH, min(MAX_ITEM_BATCH, -(-total // FETCH_PARALLEL)))
+    batches = [(is_pr, nums[i:i + size]) for is_pr, nums in groups for i in range(0, len(nums), size)]
+    done = [0]
+
+    def fetch(job):
+        is_pr, batch = job
+        fields = PR_FIELDS if is_pr else ISSUE_FIELDS
+        kind = "pullRequest" if is_pr else "issue"
         aliases = " ".join(f"n{n}: {kind}(number:{n}){{ {fields} }}" for n in batch)
         d = graphql(f'query {{ repository(owner:"{owner}", name:"{name}") {{ {aliases} }} }}', host=host)
         rep_ = d.get("repository") or {}
-        for n in batch:
-            node = rep_.get(f"n{n}")
-            if node:
-                items.append(_norm_item(repo, node, is_pr))
-        progress("fetch", len(items), len(numbers), f"{repo}: changed items")
-    return items
+        out = [_norm_item(repo, rep_[f"n{n}"], is_pr) for n in batch if rep_.get(f"n{n}")]
+        done[0] += len(batch)
+        progress("fetch", done[0], total, f"{repo}: {note}")
+        return out
+
+    if len(batches) <= 1 or FETCH_PARALLEL <= 1:
+        return [it for job in batches for it in fetch(job)]
+    with ThreadPoolExecutor(max_workers=min(FETCH_PARALLEL, len(batches))) as pool:
+        return [it for part in pool.map(fetch, batches) for it in part]   # in order; raises on failure
 
 
 def refresh_items(repo, cached):
@@ -637,6 +669,18 @@ def refresh_items(repo, cached):
 
 
 def fetch_repo(repo, state):
+    """Every issue/PR of a repo, for a cold cache. For the usual state="open" this lists the open
+    numbers first (one cheap query per 100) and then pulls the records in parallel batches; a full
+    `--state all` build still pages through the heavy connection query."""
+    if state == "open":
+        listing = list_open(repo)
+        groups = [(is_pr, sorted((n for p, n in listing if p == is_pr), reverse=True))
+                  for is_pr in (False, True)]
+        items = fetch_groups(repo, [g for g in groups if g[1]], "items", spread=True)
+        items.sort(key=lambda it: it["created"], reverse=True)
+        if not items:
+            log(f"{repo}: no open issues or PRs came back — run `gg check -r {repo}` to see why")
+        return items
     host, owner, name = split_repo(repo)
     items = []
     for q, is_pr, states in ((Q_ISSUES, False, ["OPEN"]), (Q_PRS, True, ["OPEN"])):
@@ -1598,8 +1642,14 @@ def build_graph(repos, state, max_age_min, refresh=False):
     for n in g.nodes.values():
         if n.kind == "item" and n.stub and (n.title is None or n.state is None):
             by_repo[n.repo].append(n.number)
-    for repo, nums in by_repo.items():
-        info = resolve_stubs(repo, sorted(set(nums)), max(max_age_min, 24 * 60))   # referenced items: a day
+    if by_repo:      # one query per referenced repo, all at once (they are independent)
+        from concurrent.futures import ThreadPoolExecutor
+        jobs = [(repo, sorted(set(nums))) for repo, nums in by_repo.items()]
+        with ThreadPoolExecutor(max_workers=min(FETCH_PARALLEL, len(jobs))) as pool:
+            resolved = list(pool.map(lambda j: (j[0], resolve_stubs(j[0], j[1], max(max_age_min, 24 * 60))), jobs))
+    else:
+        resolved = []
+    for repo, info in resolved:      # referenced items are kept a day
         for num, v in info.items():
             n = g.nodes[g.item_id(repo, num)]
             if v.get("missing"):
@@ -2133,11 +2183,12 @@ def comp_summary(g, comp):
 # rows: every renderer yields Row(text, nid, jump, kind) so the TUI can put a cursor on it
 # --------------------------------------------------------------------------
 class Row:
-    __slots__ = ("text", "nid", "jump", "kind")
+    __slots__ = ("text", "nid", "jump", "kind", "mark")
 
-    def __init__(self, text, nid=None, jump=None, kind=""):
-        self.text, self.nid, self.jump, self.kind = text, nid, jump, kind
+    def __init__(self, text, nid=None, jump=None, kind="", mark=None):
+        self.text, self.nid, self.jump, self.kind, self.mark = text, nid, jump, kind, mark
         # kind: "" node line | "head" section header | "link" cross-link line | "conn" log connector
+        # mark: todo entry id, for rows in the Inbox todo section (the item may be outside this graph)
 
 
 # --------------------------------------------------------------------------
@@ -3074,7 +3125,7 @@ class Tui:
             if e.get("note"):
                 text += f"  · {trunc(e['note'].splitlines()[0], w)}"
             r = Row(text, e["item"] if n else None, e.get("comment") if e.get("comment") in g.nodes else None,
-                    "mention" if e.get("comment") in g.nodes else "")
+                    "mention" if e.get("comment") in g.nodes else "", mark=e["id"])
             rows.append(r)
         return rows or [Row("(nothing marked — press m on an item or a comment)", kind="head")]
 
@@ -3778,12 +3829,16 @@ class Tui:
         On the answer tab: save the answer text itself into the mark's note."""
         nid = self.subject or self.item
         n = self.g.nodes.get(nid) if nid else None
-        if not n or n.kind not in ("item", "comment"):
+        e = self.selected_mark()
+        if e is not None and (self.marked(nid) if nid else None) is not e:
+            n, nid = None, None      # the cursor is on a mark whose item this graph does not hold
+        if e is None and (not n or n.kind not in ("item", "comment")):
             self.msg = "select an issue, PR or comment first"
             return
-        label = self.g.label_num(n) if n.kind == "item" else f"comment by @{n.author} on {self.g.label_num(self.g.nodes[n.parent])}"
-        e = self.marked(nid)
-        if self.focus == "main" and self.MAIN_TABS[self.panels["main"].tab] == "answer" and self.answer \
+        label = (self.g.label_num(n) if n.kind == "item"
+                 else f"comment by @{n.author} on {self.g.label_num(self.g.nodes[n.parent])}") if n \
+            else (e.get("item_num") or e["item"])
+        if n is not None and self.focus == "main" and self.MAIN_TABS[self.panels["main"].tab] == "answer" and self.answer \
                 and "(waiting for the answer" not in self.answer:
             if e is None:
                 e = todo_entry(self.g, nid, "")
@@ -3814,17 +3869,27 @@ class Tui:
             self.msg = f"todo updated → {save_todo(self.todo).replace(os.path.expanduser('~'), '~')}"
         self.refresh_all()
 
-    def unmark(self):
-        """Delete: drop the mark on the selection outright (m offers edit / done / remove instead)."""
+    def selected_mark(self):
+        """The mark the cursor is on, if any: in the Inbox todo section a row carries its entry id, so
+        marks whose item is not in this graph (another repo, a closed item) still work — such a row has
+        no node id, and m / Del used to act on whatever was selected before it. Otherwise: the mark on
+        the current selection."""
+        p = self.panels.get(self.focus)
+        r = p.current() if p else None
+        if r is not None and r.mark:
+            return next((e for e in self.todo if e.get("id") == r.mark and not e.get("done")), None)
         nid = self.subject or self.item
-        e = self.marked(nid) if nid else None
+        return self.marked(nid) if nid else None
+
+    def unmark(self):
+        """Delete: drop the mark under the cursor outright (m offers edit / done / remove instead)."""
+        e = self.selected_mark()
         if e is None:
             self.msg = "nothing marked here (m marks it)"
             return
-        n = self.g.nodes.get(nid)
-        label = self.g.label_num(n) if n and n.kind == "item" else nid
         self.todo.remove(e)
-        self.msg = f"mark removed: {label} → {save_todo(self.todo).replace(os.path.expanduser('~'), '~')}"
+        self.msg = (f"mark removed: {e.get('item_num') or e['item']} → "
+                    f"{save_todo(self.todo).replace(os.path.expanduser('~'), '~')}")
         self.refresh_all()
 
     def confirm(self, question):

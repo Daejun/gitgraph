@@ -559,6 +559,51 @@ def live_state(s):
     check("cmd.json moves the TUI (gg_open)", moved)
 
 
+def cross_repo_mark():
+    """A mark on an item this graph does not hold (another repo, a closed item) must still be editable
+    and deletable from the Inbox todo section. Reported bug: its row carries no node id, so Del acted
+    on whatever was selected before it and the entry stayed."""
+    home = testenv.make_home()
+    todo_path = os.path.join(home, ".config", "gitgraph", "todo.json")
+    os.makedirs(os.path.dirname(todo_path), exist_ok=True)
+    entries = [
+        {"id": "aaa-other-repo", "created": "2026-08-28T12:00", "repo": "elsewhere/repo",
+         "item": "elsewhere/repo#7", "item_num": "repo#7", "title": "a mark from another repo",
+         "url": "https://github.com/elsewhere/repo/issues/7", "note": "not in this graph", "done": False},
+        {"id": "bbb-this-repo", "created": "2026-08-27T12:00", "repo": testenv.FIXTURE_REPO,
+         "item": f"{testenv.FIXTURE_REPO}#5", "item_num": "#5", "title": "a mark from this repo",
+         "url": "", "note": "keep me", "done": False},
+    ]
+    with open(todo_path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False)
+
+    s = Session(["--no-summary", "-t", "none"], home=home)
+    try:
+        s.wait_for("6 People", 30)
+        s.key("3")
+        for _ in range(10):                       # the todo section
+            if "todo" in s.line(s.find_line("3 Inbox")):
+                break
+            s.key("[", 0.5)
+        # the row for an item in this graph shows its live label, the one from elsewhere its stored title
+        check("both marks are listed", "repo#7" in s.text() and "#5" in s.text(), s.text()[:600])
+        s.key("g", 0.6)                           # the newest mark: the one from the other repo
+        s.key("\x1b[3~", 1.5)                     # Del
+        with open(todo_path, encoding="utf-8") as f:
+            left = json.load(f)
+        check("Del removes the mark of an item outside this graph",
+              [e["id"] for e in left if not e.get("done")] == ["bbb-this-repo"],
+              json.dumps(left, ensure_ascii=False)[:400])
+        i = s.find_line("3 Inbox")
+        panel = "\n".join(s.text().splitlines()[i:i + 6])
+        check("the other mark survives in the list", "#5" in panel, panel)
+        check("its row is gone from the list", "repo#7" not in panel, panel)
+        check("the message names what was removed", "mark removed" in s.text(), s.text()[-200:])
+        check("no traceback", "Traceback" not in s.log())
+    finally:
+        s.kill()
+
+
 def portrait_and_theme():
     """A narrow terminal stacks the panels; --theme basic must not use dim/256 colours."""
     s = Session(["--theme", "basic", "--no-summary", "-t", "none"], cols=83, rows=30)
@@ -621,6 +666,7 @@ def main():
     finally:
         s.kill()
 
+    cross_repo_mark()
     portrait_and_theme()
     ai_failure_popup()
 
