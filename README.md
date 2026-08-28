@@ -41,6 +41,7 @@ gg show 748               # one node in detail: every edge, comments, body
 gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with the item as context
 gg config [KEY [VALUE]]   # persistent settings
 gg todo                   # print the markdown of everything marked with m in the tui
+gg todo done|remove 750   # tick off / delete a mark (also: clear-done); Claude does the same through gg_todo_done
 gg mcp                    # MCP server for Claude Code in another window (see the C key)
 gg cache [clear …]        # what is stored locally and how to remove it
 gg check [-r owner/name]  # diagnose: gh accounts for the host, access per account, open counts, GraphQL fields
@@ -148,7 +149,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `u` · `r` | view Inbox as another person · refetch |
 | `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | search in the focused panel · colour theme · token usage · quit |
-| `C` | open Claude Code next to gg (a tmux pane, else full screen). Through the `gg mcp` server it sees what you look at (`gg_state`, `gg_context`), your marks (`gg_todo`) and can drive gg (`gg_open`, `gg_mark`). Register once: `claude mcp add -s user gg -- gg mcp` |
+| `C` | open Claude Code next to gg (a tmux pane, else full screen). Through the `gg mcp` server it sees what you look at (`gg_state`, `gg_context`), your marks (`gg_todo`) and can drive gg (`gg_open`, `gg_mark`) and tick off marks it has handled (`gg_todo_done`). Register once: `claude mcp add -s user gg -- gg mcp` |
 | `?` · `O` · F1 · F2 | key menu for the focused panel (Enter runs the action) · options menu (comments / translation / summaries / people / hops / theme / screen) · full help text · guided tour (offered once on the first run; also `gg tutorial`; ⏎/→ next, ←/p prev, Esc stop) |
 | Hangul IME | shortcuts work while the keyboard is in Hangul mode: the jamo/syllable is mapped back to the 2-set layout keys (`ㅓ` = j, `ㅏ` = k, `자` = w k) |
 | mouse | drag inside Main = select text, copied to the clipboard on release (OSC 52 plus `wl-copy`/`xclip`/`xsel`/`pbcopy` when installed; tmux needs `set -g set-clipboard on`; Shift+drag keeps the terminal's own selection); click `‹` `›` in the Inbox title or a tab name in Main's title = switch tab; first click on another panel = focus it (its cursor stays); a click inside the focused panel = select that row; click on the URL text = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |

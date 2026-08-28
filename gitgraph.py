@@ -10,6 +10,7 @@ Usage:
   gg update                               update this installation from GitHub
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
   gg todo                                 print the markdown of everything marked with m in the tui
+  gg todo done|remove ID                  tick off / delete a mark (ID: 750, #750, owner/name#750, comment url); clear-done drops ticked ones
   gg check [-r owner/name]                diagnose: gh accounts for the host, access, open counts, GraphQL fields
   gg mcp                                  MCP stdio server for Claude Code in another window (claude mcp add -s user gg -- gg mcp)
   gg cache [clear all|items|ai|logs|REPO] what is stored locally (issue/PR bodies, AI results, logs) and how to remove it
@@ -28,7 +29,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.11.2"
+VERSION = "0.11.3"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -3968,6 +3969,10 @@ class Tui:
                 self.set_item(cmd["id"])
                 self.focus = "item"
                 msg = f"gg now shows {self.g.label_num(self.g.nodes[cmd['id']])}"
+            elif cmd.get("op") == "done":
+                msg = todo_finish(cmd.get("id", ""), bool(cmd.get("remove")))
+                self.todo = load_todo()
+                self.refresh_all()
             elif cmd.get("op") == "mark" and cmd.get("id") in self.g.nodes:
                 if not self.marked(cmd["id"]):
                     self.todo.append(todo_entry(self.g, cmd["id"], cmd.get("note", "")))
@@ -4641,6 +4646,38 @@ def save_todo(entries):
     return p
 
 
+def todo_find(entries, ref):
+    """Entries matching ref: an item id/number ('750', '#750', 'owner/name#750', node id), a comment node id or url."""
+    ref = (ref or "").strip()
+    num = re.sub(r"^.*#", "", ref) if "#" in ref or ref.isdigit() else None
+    hits = []
+    for e in entries:
+        if e.get("done"):
+            continue
+        if ref in (e.get("item"), e.get("comment"), e.get("url"), e.get("comment_url"), e.get("id")):
+            hits.append(e)
+        elif num and (e.get("item_num") == f"#{num}" or e.get("item", "").endswith(f"#{num}")):
+            hits.append(e)
+    return hits
+
+
+def todo_finish(ref, remove=False):
+    """Mark every open entry matching ref done (or remove it). Returns a message."""
+    entries = load_todo()
+    hits = todo_find(entries, ref)
+    if not hits:
+        return f"nothing marked matches {ref!r}"
+    for e in hits:
+        if remove:
+            entries.remove(e)
+        else:
+            e["done"] = True
+            e["done_at"] = datetime.now().isoformat(timespec="minutes")
+    path = save_todo(entries)
+    what = "removed" if remove else "marked done"
+    return f"{what} {len(hits)} entr{'y' if len(hits) == 1 else 'ies'} for {hits[0]['item_num']} -> {path}"
+
+
 def todo_entry(g, nid, note):
     n = g.nodes[nid]
     item = g.nodes[n.parent] if n.kind == "comment" else n
@@ -4866,6 +4903,10 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
     {"name": "gg_mark", "description": "Mark an issue/PR (or a comment url) in the user's gg todo list with a note.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}, "note": {"type": "string"}}}},
+    {"name": "gg_todo_done", "description": "Tick off (or remove) a mark in the user's gg todo list once you have handled it. "
+                                             "id: the item number/id or comment url as shown by gg_todo.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"},
+                                                                          "remove": {"type": "boolean", "description": "delete instead of ticking off (default false)"}}}},
 ]
 
 
@@ -4894,6 +4935,9 @@ def mcp_call(name, a):
         nid = resolve_root(g, a["id"])
         res = send_cmd({"op": "open", "id": nid})
         return res.get("msg", "done") if res else f"gg tui is not running; {nid} exists (gg {a['id']} opens it)"
+    if name == "gg_todo_done":
+        res = send_cmd({"op": "done", "id": a["id"], "remove": bool(a.get("remove"))})
+        return res.get("msg", "done") if res else todo_finish(a["id"], bool(a.get("remove")))
     if name == "gg_mark":
         nid = resolve_root(g, a["id"])
         res = send_cmd({"op": "mark", "id": nid, "note": a.get("note", "")})
@@ -4929,7 +4973,10 @@ def mcp_serve():
                                                               "'what I am looking at', 'this issue/PR/comment', 'in gg', or asks what to work "
                                                               "on next: call gg_state first, then gg_context for the full thread before "
                                                               "answering. gg_todo lists their marks (next work). gg_open changes what gg "
-                                                              "shows; gg_mark adds a mark with a note — do these only when asked.")}})
+                                                              "shows; gg_mark adds a mark with a note — do these only when asked. "
+                                                              "When you handle something from gg_todo (answer it, fix it, write the "
+                                                              "reply), call gg_todo_done for that entry so the user's list stays clean; "
+                                                              "use remove=true if they asked to delete handled marks.")}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}})
         elif method == "tools/call":
@@ -5075,6 +5122,15 @@ def main(argv=None):
         return 0
     if a.cmd == "cache":
         return cache_cmd([x for x in (a.arg, a.question) if x is not None] + (a.extra or []))
+    if a.cmd == "todo" and a.arg in ("done", "remove", "clear-done"):
+        if a.arg == "clear-done":
+            entries = [e for e in load_todo() if not e.get("done")]
+            print(f"kept {len(entries)} open entr{'y' if len(entries) == 1 else 'ies'} -> {save_todo(entries)}")
+            return 0
+        if not a.question:
+            ap.error(f"todo {a.arg} needs an id (750, #750, owner/name#750, a comment url)")
+        print(todo_finish(a.question, remove=a.arg == "remove"))
+        return 0
     if a.cmd == "todo":
         entries = load_todo()
         if not entries:
