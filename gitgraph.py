@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2108,6 +2108,7 @@ HELP = """gg tui — lazygit style layout
   u               view Home as another person       r  refetch from GitHub
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
+  Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, 자 = w k …)
   mouse           click = focus panel + select; double-click = Enter; click a URL line = open it in the browser;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
                   drag the border between the side column and main to resize (gg config side_width keeps it)
@@ -2120,6 +2121,31 @@ HELP = """gg tui — lazygit style layout
 """
 
 BORDERS = {"rounded": "╭╮╰╯─│", "single": "┌┐└┘─│", "double": "╔╗╚╝═║", "bold": "┏┓┗┛━┃", "hidden": "      "}
+
+# Korean 2-set keyboard: a shortcut typed while the IME is in Hangul mode arrives as jamo or a composed syllable;
+# map it back to the Latin keys that were pressed so j/k/Enter-style bindings keep working.
+JAMO_KEY = {"ㅂ": "q", "ㅈ": "w", "ㄷ": "e", "ㄱ": "r", "ㅅ": "t", "ㅛ": "y", "ㅕ": "u", "ㅑ": "i", "ㅐ": "o", "ㅔ": "p",
+            "ㅁ": "a", "ㄴ": "s", "ㅇ": "d", "ㄹ": "f", "ㅎ": "g", "ㅗ": "h", "ㅓ": "j", "ㅏ": "k", "ㅣ": "l",
+            "ㅋ": "z", "ㅌ": "x", "ㅊ": "c", "ㅍ": "v", "ㅠ": "b", "ㅜ": "n", "ㅡ": "m",
+            "ㅃ": "Q", "ㅉ": "W", "ㄸ": "E", "ㄲ": "R", "ㅆ": "T", "ㅒ": "O", "ㅖ": "P",
+            "ㅘ": "hk", "ㅙ": "ho", "ㅚ": "hl", "ㅝ": "nj", "ㅞ": "np", "ㅟ": "nl", "ㅢ": "ml",
+            "ㄳ": "rt", "ㄵ": "sw", "ㄶ": "sg", "ㄺ": "fr", "ㄻ": "fa", "ㄼ": "fq", "ㄽ": "ft", "ㄾ": "fx", "ㄿ": "fv",
+            "ㅀ": "fg", "ㅄ": "qt"}
+_CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+_JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+_JONG = " ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ"
+
+
+def hangul_keys(ch):
+    """Latin key sequence behind one Hangul character ('ㅓ' -> 'j', '자' -> 'wk'), or '' if not Hangul."""
+    if ch in JAMO_KEY:
+        return JAMO_KEY[ch]
+    o = ord(ch)
+    if 0xAC00 <= o <= 0xD7A3:
+        o -= 0xAC00
+        parts = [_CHO[o // 588], _JUNG[(o % 588) // 28], _JONG[o % 28].strip()]
+        return "".join(JAMO_KEY.get(j, "") for j in parts if j)
+    return ""
 LIST_KINDS = ("", "link", "mention", "sec")
 
 
@@ -3328,6 +3354,25 @@ class Tui:
     def read_key(self):
         c = self.curses
         k = self.scr.getch()
+        if 0xC2 <= k <= 0xF4:                      # a UTF-8 character: Hangul typed in IME mode?
+            n = 1 if k < 0xE0 else 2 if k < 0xF0 else 3
+            bs = bytes([k])
+            self.scr.nodelay(True)
+            try:
+                for _ in range(n):
+                    b = self.scr.getch()
+                    if b == -1:
+                        break
+                    bs += bytes([b])
+            finally:
+                self.scr.nodelay(False)
+            ch = bs.decode("utf-8", "replace")
+            keys = hangul_keys(ch)
+            if keys:
+                for extra in reversed(keys[1:]):
+                    c.ungetch(ord(extra))
+                return ord(keys[0])
+            return ord(ch) if len(ch) == 1 else k
         if k == c.KEY_MOUSE:
             self.mouse_ev = None
             self.scr.nodelay(True)

@@ -140,6 +140,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | search in the focused panel · colour theme · token usage · quit |
 | `?` · `O` · F1 | key menu for the focused panel (Enter runs the action) · options menu (comments / translation / summaries / people / hops / theme / screen) · full help text |
+| Hangul IME | shortcuts work while the keyboard is in Hangul mode: the jamo/syllable is mapped back to the 2-set layout keys (`ㅓ` = j, `ㅏ` = k, `자` = w k) |
 | mouse | click = focus + select; click a URL line = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
 
 Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$`, F1) open as centred popups; Esc closes them.
