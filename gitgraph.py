@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2271,7 +2271,8 @@ HELP = """gg tui — lazygit style layout
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
   Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, 자 = w k …)
-  mouse           click = focus panel + select; double-click = Enter; click a URL line = open it in the browser;
+  mouse           click = focus a panel (its cursor stays); a click inside the focused panel selects the row;
+                  double-click = Enter; click on a URL's text = open it in the browser;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
                   drag the border between the side column and main to resize (gg config side_width keeps it)
   O               options menu (comments / translation / summaries / people / hops / theme / screen)
@@ -3881,7 +3882,11 @@ class Tui:
             return
         if base != 0 or not key:
             return
-        self.focus = key
+        if key != self.focus:                    # first click on another panel: focus it, keep its cursor
+            self.focus = key
+            self.update_subject()
+            self.last_click = (0.0, -1, "")
+            return
         idx = self.click_row(key, y)
         self.update_subject()
         p = self.panels[key]

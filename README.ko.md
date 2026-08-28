@@ -150,7 +150,7 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 | `C` | gg 옆에 Claude Code를 띄움(tmux면 옆 pane, 아니면 전체 화면). `gg mcp` 서버를 통해 지금 보는 것(`gg_state`, `gg_context`)과 마킹(`gg_todo`)을 읽고 gg를 조작(`gg_open`, `gg_mark`)할 수 있음. 한 번 등록: `claude mcp add -s user gg -- gg mcp` |
 | `?` · `O` · F1 · F2 | 포커스 panel의 키 메뉴(Enter로 실행) · 옵션 메뉴(comments / 번역 / 요약 / 사람 / hops / 테마 / screen) · 전체 도움말 · 화면 안내 투어(첫 실행 때 한 번 제안; `gg tutorial`도 같음; ⏎/→ 다음, ←/p 이전, Esc 중단) |
 | 한글 IME | 한/영 전환을 안 해도 단축키가 먹음: 들어온 자모·음절을 2벌식 자판 키로 되돌림(`ㅓ` = j, `ㅏ` = k, `자` = w k) |
-| 마우스 | 클릭 = 포커스 + 선택 · URL 글자 위 클릭 = 브라우저로 열기 · 더블클릭 = Enter · 휠 = 커서는 두고 그 panel 스크롤 · 뒤로/앞으로 버튼 · side/main 경계 드래그로 폭 조절(`gg config side_width`로 저장) |
+| 마우스 | 다른 panel 첫 클릭 = 포커스만(커서 유지) · 포커스된 panel 안 클릭 = 그 행 선택 · URL 글자 위 클릭 = 브라우저로 열기 · 더블클릭 = Enter · 휠 = 커서는 두고 그 panel 스크롤 · 뒤로/앞으로 버튼 · side/main 경계 드래그로 폭 조절(`gg config side_width`로 저장) |
 
 입력(`a`, `/`, `u`)·메뉴(`?`, `O`)·확인(`r`)·텍스트(`d`, `$`, F1)는 중앙 팝업으로 뜨고 Esc로 닫는다.
 

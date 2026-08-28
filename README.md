@@ -150,7 +150,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `C` | open Claude Code next to gg (a tmux pane, else full screen). Through the `gg mcp` server it sees what you look at (`gg_state`, `gg_context`), your marks (`gg_todo`) and can drive gg (`gg_open`, `gg_mark`). Register once: `claude mcp add -s user gg -- gg mcp` |
 | `?` · `O` · F1 · F2 | key menu for the focused panel (Enter runs the action) · options menu (comments / translation / summaries / people / hops / theme / screen) · full help text · guided tour (offered once on the first run; also `gg tutorial`; ⏎/→ next, ←/p prev, Esc stop) |
 | Hangul IME | shortcuts work while the keyboard is in Hangul mode: the jamo/syllable is mapped back to the 2-set layout keys (`ㅓ` = j, `ㅏ` = k, `자` = w k) |
-| mouse | click = focus + select; click on the URL text = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
+| mouse | first click on another panel = focus it (its cursor stays); a click inside the focused panel = select that row; click on the URL text = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
 
 Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$`, F1) open as centred popups; Esc closes them.
 
