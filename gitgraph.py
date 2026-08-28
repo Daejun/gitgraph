@@ -29,7 +29,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.13.1"
+VERSION = "0.14.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2444,7 +2444,9 @@ HELP = """gg tui — lazygit style layout
   K / J           scroll the main panel from anywhere
   Enter           Inbox: make it the current item (Item, Comments, Links and People follow)
                   Item / Comments: read it in main      Links: go to that item      People: view as that person
-  a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
+  a               ask claude about the selection (answer tab in main); every answer is saved with its question,
+                  anchored to that issue/PR/comment (~/.config/gitgraph/qa.json) and shown again on its answer tab
+  d               details pager     o  open in browser
   i               translate the main content (issue/PR body or comment) in full; press again for the original
                   (also the [i 번역] button in Main's title bar)
   C               open Claude Code in a tmux pane (or full screen) that can see what gg shows: it uses the
@@ -2614,7 +2616,7 @@ class Tui:
         self.panels["home"].tab = 1        # todo is the first tab, but the Inbox opens on my turn
         self.visible = []                  # panel keys drawn in the current layout
         self.title_zones = {}              # panel -> [(x0, x1, action)] clickable parts of its title bar
-        self.msg, self.answer = "", None
+        self.msg, self.answer, self.answer_nid = "", None, None
         self.progress, self.worker, self.t0, self.bg_error = None, None, time.time(), None
         self.last_refresh, self._new_g = time.time(), None
         self.enriched = set()
@@ -2800,8 +2802,10 @@ class Tui:
         if not n:
             return [Row("(no current item — Enter on a row in Inbox)", kind="head")]
         n_links = sum(1 for r in self.panels["links"].rows if r.kind == "")
+        n_qa = len(load_qa().get(n.id, []))
         meta = [f"updated {short_date(n.updated)}" if n.updated else "", ", ".join(n.labels),
-                f"{n.comments_total} comments" if n.comments_total else "", f"{n_links} links" if n_links else ""]
+                f"{n.comments_total} comments" if n.comments_total else "", f"{n_links} links" if n_links else "",
+                f"{n_qa} Q&A" if n_qa else ""]
         summ = ("» " + n.summary) if n.summary else ("» " + PENDING_TEXT if n.summary_pending else
                                                      (excerpt(n.body, 200) if (n.body or "").strip() else "(no body)"))
         return [Row(self.mark_prefix(n.id) + item_label(g, n, w), n.id),
@@ -3020,7 +3024,7 @@ class Tui:
         if tab == "content":
             lines = self.content_lines(self.subject, max(p.rect[3], 40))
         else:
-            lines = render_markdown(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))
+            lines = render_markdown(self.answer_text(), max(p.rect[3], 40))
         p.scroll_only = True
         rows, in_code, prev_table = [], False, False
         for t in lines:
@@ -3068,6 +3072,26 @@ class Tui:
                 para.append(ln)
         flush()
         return "\n".join(out)
+
+    def answer_text(self):
+        """The answer tab: the running/last answer if it is about the current subject, then earlier Q&A on it."""
+        nid = self.subject or self.item
+        parts = []
+        if self.answer and self.answer_nid == nid:
+            parts.append(self.answer)
+        hist = load_qa().get(nid, []) if nid else []
+        cur_q = self.ask_state["q"] if self.ask_state and self.answer_nid == nid else None
+        earlier = [e for e in hist if not (cur_q and e["q"] == cur_q and parts)]
+        if earlier:
+            n = self.g.nodes.get(nid)
+            label = (self.g.label_num(n) if n and n.kind == "item" else
+                     f"comment on {self.g.label_num(self.g.nodes[n.parent])}" if n and n.kind == "comment" else nid)
+            parts.append(f"## earlier questions on {label}")
+            for e in reversed(earlier):
+                parts.append(f"**{e['when']}  Q:** {e['q']}\n\n{e['a']}")
+        if not parts:
+            return "(no answer yet — press a to ask about the selection; answers stay anchored to it across sessions)"
+        return "\n\n---\n\n".join(parts)
 
     def content_lines(self, nid, width):
         n = self.g.nodes.get(nid) if nid else None
@@ -3200,9 +3224,8 @@ class Tui:
             nid = (r.jump if r and r.kind == "mention" and r.jump else (r.nid if r else None))
             if nid and nid != self.subject:
                 self.subject = nid
-                if self.MAIN_TABS[self.panels["main"].tab] == "content":
-                    self.panels["main"].top = 0
-                    self.refresh_main()
+                self.panels["main"].top = 0
+                self.refresh_main()
 
     # ------------------------------------------------------------------ tree folding (main tree tab)
     def fold_below(self, depth):
@@ -3621,12 +3644,14 @@ class Tui:
         st = {"nid": nid, "label": label, "q": q, "t0": time.time()}
         self.ask_state = st
         self.answer = f"Q ({label}): {q}\n\n(waiting for the answer…)"
+        self.answer_nid = nid
         self.panels["main"].tab = self.MAIN_TABS.index("answer")
         self.refresh_main()
 
         def work():
             try:
                 st["answer"] = ask_claude(self.g, nid, q)
+                save_qa(nid, q, st["answer"])          # anchored to the item/comment, survives restarts
             except Exception as e:  # noqa: BLE001
                 st["answer"] = f"error: {e}"
             self.answer = f"Q ({label}): {q}\n\n{st['answer']}"
@@ -3856,7 +3881,10 @@ class Tui:
                 title += f"› {p.tab + 1}/{len(p.tabs)}"
             else:
                 title += " "
+                n_qa = len(load_qa().get(self.subject or self.item or "", [])) if key == "main" else 0
                 for i, t in enumerate(p.tabs):
+                    if t == "answer" and n_qa:
+                        t = f"answer({n_qa})"
                     lab = f"[{t}]" if i == p.tab else t
                     zones.append((dw(title), dw(title) + dw(lab), ("tab", i)))
                     title += lab + " "
@@ -4729,6 +4757,20 @@ def save_todo(entries):
     with open(p, "w") as f:
         f.write(render_todo_md(entries))
     return p
+
+
+QA_JSON = os.path.expanduser("~/.config/gitgraph/qa.json")
+
+
+def load_qa():
+    return read_json(QA_JSON) or {}
+
+
+def save_qa(nid, question, answer):
+    """Append a question/answer pair anchored to a node (issue, PR or comment); kept across sessions."""
+    qa = load_qa()
+    qa.setdefault(nid, []).append({"when": datetime.now().isoformat(timespec="minutes"), "q": question, "a": answer})
+    write_json(QA_JSON, qa)
 
 
 def todo_find(entries, ref):

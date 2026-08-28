@@ -93,7 +93,7 @@ code fence 안과 kernel log / stack trace 줄(`[ 123.4]`, `Tainted:`, `PID:`, `
 
 - **번역** — 제목과 코멘트 첫 줄 중 한자가 섞인 것(`-t zh`)을 `tr_model`로 `lang`으로 바꾼다. `-t all`이면 영어도. `~/.cache/gitgraph/translations.json`에 캐시, `show`는 원문 제목도 같이 보여준다.
 - **요약** (`-S`, TUI 기본) — 코멘트 줄이 첫 줄 발췌 대신 한 줄 요약(issue/PR 본문도 요약해 Links panel에 씀)(`» …`)이 된다. 본문 sha1 기준 `summaries.json` 캐시(본문 4,000자, 호출당 40건 / 40,000자 상한). 생성 중에는 `» 요약 중…`, 실패하면 첫 줄 발췌.
-- **질문** (`a`, `gg ask`) — 질문과 함께 그 항목(또는 커서의 코멘트, 표시됨)·메타·코멘트 전체 스레드(순서대로)·링크된 issue/PR과 그 참조 문장(총 90,000자까지)을 `ask_model`에 보내고, 답은 근거로 삼은 코멘트나 #번호를 밝힌다. 단발, 캐시 없음.
+- **질문** (`a`, `gg ask`) — 모든 답은 질문과 함께 그 issue/PR/코멘트에 앵커되어 저장되고(`~/.config/gitgraph/qa.json`), 다음 세션에서도 그 대상의 answer 탭에 이전 질문·답이 다시 보인다(Item panel에 `2 Q&A`). 질문과 함께 그 항목(또는 커서의 코멘트, 표시됨)·메타·코멘트 전체 스레드(순서대로)·링크된 issue/PR과 그 참조 문장(총 90,000자까지)을 `ask_model`에 보내고, 답은 근거로 삼은 코멘트나 #번호를 밝힌다. 단발, 캐시 없음.
 - Claude Code 로그인만 있으면 되고 API key는 필요 없다. `--output-format json`이 알려주는 usage를 프로세스 시작부터 누적: TUI 제목줄에 `tokens 31.2k in / 1.4k out · $0.052 · 7 calls`, `$` 키로 phase별 표, CLI는 종료 시 stderr 한 줄. "in"의 대부분은 캐시된 system prompt라 비용은 작다.
 
 ## TUI
