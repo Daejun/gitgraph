@@ -42,6 +42,7 @@ gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with t
 gg config [KEY [VALUE]]   # persistent settings
 gg todo                   # print the markdown of everything marked with m in the tui
 gg mcp                    # MCP server for Claude Code in another window (see the C key)
+gg cache [clear …]        # what is stored locally and how to remove it
 gg check [-r owner/name]  # diagnose: gh accounts for the host, access per account, open counts, GraphQL fields
 gg update                 # update this installation
 ```
@@ -156,6 +157,21 @@ Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$
 Under tmux enable mouse reporting (`set -g mouse on`).
 
 Smoke test: `GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py` drives the TUI in a pseudo-terminal, renders it with `tests/vt.py` and checks the screen.
+
+## Local data
+
+Everything gg keeps is under `~/.cache/gitgraph/` (mode 0700, files 0600 — it contains the bodies and comments of private repos) plus two small files under `~/.config/gitgraph/`:
+
+| file | what | lifetime |
+|---|---|---|
+| `items__<repo>__open.json` | issues/PRs of one repo with bodies and comments, as fetched | refreshed after `--max-age` minutes (15); deleted at start-up when unused for 30 days |
+| `stubs__<repo>.json` | titles/bodies of referenced items (closed, other repos) | same |
+| `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI results keyed by text hash | capped (oldest dropped beyond 20k entries) |
+| `tui.log` | tui stderr / progress | cut back beyond 1 MB |
+| `state.json`, `cmd*.json` | what the tui shows (for `gg mcp`) | overwritten |
+| `~/.config/gitgraph/config.json`, `todo.json` (+ the `todo_file` markdown) | settings, your marks | yours |
+
+`gg cache` lists all of it with sizes and ages; `gg cache clear all|items|ai|logs|owner/name` removes it (everything is re-fetched or re-generated on demand).
 
 ## GitHub Enterprise
 

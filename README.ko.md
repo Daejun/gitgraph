@@ -42,6 +42,7 @@ gg ask 4563 "왜 #3859를 언급해?"   # 그 항목(본문+코멘트 전체)을
 gg config [KEY [VALUE]]   # 설정 저장
 gg todo                   # tui에서 m으로 표시한 것들의 markdown 출력
 gg mcp                    # 다른 창의 Claude Code용 MCP 서버 (C 키 참조)
+gg cache [clear …]        # 로컬에 저장된 것과 지우는 법
 gg check [-r owner/name]  # 진단: host별 gh 계정, 계정별 접근 여부, open 수, GraphQL 필드
 gg update                 # 설치 갱신
 ```
@@ -156,6 +157,21 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 tmux 안이면 마우스 보고를 켜야 한다(`set -g mouse on`).
 
 Smoke test: `GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py` — pty에서 TUI를 돌리고 `tests/vt.py`로 화면을 그려 검사한다.
+
+## 로컬 데이터
+
+gg가 보관하는 것은 모두 `~/.cache/gitgraph/`(디렉터리 0700, 파일 0600 — private repo의 본문·코멘트가 들어 있음)와 `~/.config/gitgraph/`의 작은 파일 둘입니다:
+
+| 파일 | 내용 | 수명 |
+|---|---|---|
+| `items__<repo>__open.json` | repo 하나의 issue/PR 원본(본문·코멘트) | `--max-age`분(15) 지나면 재조회; 30일 안 쓰면 시작 시 삭제 |
+| `stubs__<repo>.json` | 참조된 항목(닫힌 것·다른 repo)의 제목/본문 | 같음 |
+| `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI 결과(텍스트 해시 기준) | 상한(2만 건 넘으면 오래된 것부터 삭제) |
+| `tui.log` | tui stderr/진행 로그 | 1 MB 넘으면 잘라냄 |
+| `state.json`, `cmd*.json` | tui가 보는 것(`gg mcp`용) | 덮어씀 |
+| `~/.config/gitgraph/config.json`, `todo.json`(+ `todo_file` markdown) | 설정, 마킹 | 사용자 것 |
+
+`gg cache`로 크기·나이와 함께 목록을 보고, `gg cache clear all|items|ai|logs|owner/name`으로 지운다(지워도 필요할 때 다시 받거나 만든다).
 
 ## GitHub Enterprise
 

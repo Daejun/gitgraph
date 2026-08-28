@@ -12,6 +12,7 @@ Usage:
   gg todo                                 print the markdown of everything marked with m in the tui
   gg check [-r owner/name]                diagnose: gh accounts for the host, access, open counts, GraphQL fields
   gg mcp                                  MCP stdio server for Claude Code in another window (claude mcp add -s user gg -- gg mcp)
+  gg cache [clear all|items|ai|logs|REPO] what is stored locally (issue/PR bodies, AI results, logs) and how to remove it
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
 """
@@ -27,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -548,6 +549,7 @@ def load_items(repo, state, max_age_min, refresh=False):
     items = fetch_repo(repo, state)
     with open(p, "w") as f:
         json.dump({"fetched_at": time.time(), "repo": repo, "state": state, "items": items}, f)
+    secure(p)
     return items, time.time()
 
 
@@ -4310,6 +4312,133 @@ def todo_entry(g, nid, note):
 
 
 # --------------------------------------------------------------------------
+# local data: what is stored, listing, clearing, automatic hygiene
+# --------------------------------------------------------------------------
+CACHE_KINDS = {   # filename prefix -> (group, purpose)
+    "items__": ("items", "issues/PRs with bodies and comments of one repo (fetched from GitHub; refreshed after --max-age)"),
+    "stubs__": ("items", "titles/bodies of referenced items of one repo (closed ones, other repos)"),
+    "translations.json": ("ai", "title/excerpt translations"),
+    "translations_full.json": ("ai", "full-text translations (i)"),
+    "summaries.json": ("ai", "one-line summaries of comments and items"),
+    "whys.json": ("ai", "link reasons"),
+    "tui.log": ("logs", "tui stderr / progress log"),
+    "state.json": ("state", "what the tui shows now (read by gg mcp)"),
+    "cmd.json": ("state", "command from gg mcp to the tui"),
+    "cmd_result.json": ("state", "its result"),
+}
+ITEMS_KEEP_DAYS = 30        # repo data not touched for this long is deleted at start-up
+LOG_MAX = 1_000_000         # tui.log is cut back to its last half beyond this
+AI_MAX_ENTRIES = 20000      # per AI cache file; oldest entries are dropped beyond this
+
+
+def cache_kind(name):
+    for prefix, kd in CACHE_KINDS.items():
+        if name.startswith(prefix):
+            return kd
+    return ("other", "")
+
+
+def cache_files():
+    out = []
+    if not os.path.isdir(CACHE_DIR):
+        return out
+    for name in sorted(os.listdir(CACHE_DIR)):
+        path = os.path.join(CACHE_DIR, name)
+        if os.path.isfile(path):
+            st = os.stat(path)
+            out.append((name, path, st.st_size, st.st_mtime, st.st_atime) + cache_kind(name))
+    return out
+
+
+def secure(path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def cache_hygiene():
+    """Called at start-up: private permissions, drop repo data unused for ITEMS_KEEP_DAYS, cap logs and AI caches."""
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        os.chmod(CACHE_DIR, 0o700)
+    except OSError:
+        return
+    now = time.time()
+    for name, path, size, mtime, atime, group, _ in cache_files():
+        secure(path)
+        if group == "items" and now - max(mtime, atime) > ITEMS_KEEP_DAYS * 86400:
+            try:
+                os.remove(path)
+                log(f"cache: removed {name} (unused for {ITEMS_KEEP_DAYS} days)")
+            except OSError:
+                pass
+        elif name == "tui.log" and size > LOG_MAX:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(size - LOG_MAX // 2)
+                    tail = f.read()
+                with open(path, "wb") as f:
+                    f.write(tail)
+            except OSError:
+                pass
+        elif group == "ai" and size > 2_000_000:
+            d = read_json(path)
+            if isinstance(d, dict) and len(d) > AI_MAX_ENTRIES:
+                keep = list(d.items())[len(d) - AI_MAX_ENTRIES:]      # dicts keep insertion order: oldest first
+                write_json(path, dict(keep))
+                secure(path)
+    cfg_dir = os.path.dirname(CONFIG_PATH)
+    if os.path.isdir(cfg_dir):
+        try:
+            os.chmod(cfg_dir, 0o700)
+            for n in os.listdir(cfg_dir):
+                secure(os.path.join(cfg_dir, n))
+        except OSError:
+            pass
+
+
+def cache_cmd(args):
+    """gg cache                 what is stored where, sizes, ages
+       gg cache clear all|items|ai|logs|<owner/name>"""
+    home = os.path.expanduser("~")
+    files = cache_files()
+    if args and args[0] == "clear":
+        what = args[1] if len(args) > 1 else "all"
+        n = 0
+        for name, path, size, mtime, atime, group, _ in files:
+            hit = (what == "all" or what == group or
+                   (what not in ("all", "items", "ai", "logs", "state") and group == "items" and what.replace("/", "__") in name))
+            if hit:
+                os.remove(path)
+                n += 1
+        print(f"removed {n} file(s) from {CACHE_DIR.replace(home, '~')}")
+        return 0
+    if not files:
+        print(f"nothing cached in {CACHE_DIR.replace(home, '~')}")
+        return 0
+    now, total = time.time(), 0
+    print(f"{CACHE_DIR.replace(home, '~')}  (files are 0600, dir 0700; repo data unused for {ITEMS_KEEP_DAYS} days is removed at start-up)\n")
+    print(f"{'group':6} {'size':>8} {'age':>6}  file — purpose")
+    for name, path, size, mtime, atime, group, purpose in files:
+        total += size
+        age = now - mtime
+        ages = f"{int(age // 86400)}d" if age >= 86400 else f"{int(age // 3600)}h" if age >= 3600 else f"{int(age // 60)}m"
+        print(f"{group:6} {fmt_bytes(size):>8} {ages:>6}  {name} — {purpose}")
+    print(f"\ntotal {fmt_bytes(total)}.  Also: {CONFIG_PATH.replace(home, '~')} (settings), "
+          f"{TODO_JSON.replace(home, '~')} + {todo_md_path().replace(home, '~')} (marks).")
+    print("clear: gg cache clear all | items | ai | logs | owner/name")
+    return 0
+
+
+def fmt_bytes(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
+
+# --------------------------------------------------------------------------
 # live state for other tools (Claude in another window) + commands back into the tui
 # --------------------------------------------------------------------------
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
@@ -4331,6 +4460,7 @@ def write_json(path, obj):
     with open(tmp, "w") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
+    secure(path)
 
 
 def send_cmd(cmd, wait=3.0):
@@ -4535,7 +4665,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="tui",
                     help="tui [ROOT] (default) | ROOT (777 / #777 / owner/repo#777 / @login: tui on it) | graph [ROOT] "
-                         "(text graph) | show ID | ask ID \"question\" | tutorial | update | config [KEY [VALUE]] | todo | check | mcp")
+                         "(text graph) | show ID | ask ID \"question\" | tutorial | update | config [KEY [VALUE]] | todo | check | mcp | cache [clear …]")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
@@ -4569,12 +4699,13 @@ def main(argv=None):
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="ANSI colours (auto = when stdout is a terminal)")
     a = ap.parse_intermixed_args(argv)
+    cache_hygiene()
     if a.theme:
         global THEME
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial", "mcp") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial", "mcp", "cache") and ROOT_RE.match(a.cmd):
         a.arg, a.cmd = a.cmd, "tui"      # `gg 777` = tui starting on #777
     if a.cmd == "graph" and a.arg and ROOT_RE.match(a.arg) and not a.root:
         a.root = a.arg                   # `gg graph 777`
@@ -4594,6 +4725,8 @@ def main(argv=None):
     if a.cmd == "mcp":
         mcp_serve()
         return 0
+    if a.cmd == "cache":
+        return cache_cmd([x for x in (a.arg, a.question) if x is not None] + (a.extra or []))
     if a.cmd == "todo":
         entries = load_todo()
         if not entries:
