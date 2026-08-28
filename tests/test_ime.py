@@ -10,6 +10,7 @@ hangul_keys() around gitgraph.py:2620-2643.
 Run: python3 -m unittest tests.test_ime -v
 """
 import os
+import re
 import sys
 import unittest
 
@@ -148,6 +149,43 @@ class TestHangulKeysNonHangul(unittest.TestCase):
         # which raises TypeError instead of returning "" like every other non-Hangul input.
         with self.assertRaises(TypeError):
             gg.hangul_keys("")
+
+
+class TestShortcutCoverageInHangulMode(unittest.TestCase):
+    """Every single-letter TUI shortcut must be typable while the IME is in Hangul mode.
+
+    The binding list is read out of gitgraph.py's own handle_key() rather than duplicated here, so a
+    newly added shortcut that no jamo maps to fails this test instead of silently being unusable for
+    anyone typing in Hangul.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "gitgraph.py"), encoding="utf-8").read()
+        body = src[src.index("    def handle_key(self, k):"):]
+        cls.bound = sorted({m.group(1) for m in re.finditer(r'ord\("([a-z])"\)', body)})
+        cls.by_key = {}
+        for jamo, key in gg.JAMO_KEY.items():
+            cls.by_key.setdefault(key, []).append(jamo)
+
+    def test_the_binding_list_was_actually_found(self):
+        self.assertGreater(len(self.bound), 15, f"parsed only {self.bound} — did handle_key move?")
+
+    def test_every_lowercase_shortcut_is_reachable_from_a_jamo(self):
+        missing = [k for k in self.bound if k not in self.by_key]
+        self.assertEqual(missing, [], f"no Hangul jamo types these shortcuts: {missing}")
+
+    def test_each_jamo_maps_back_to_exactly_that_shortcut(self):
+        for key in self.bound:
+            for jamo in self.by_key[key]:
+                self.assertEqual(gg.hangul_keys(jamo), key, f"{jamo} should type {key}")
+
+    def test_the_shortcuts_users_actually_press_in_hangul(self):
+        # spot checks from README.ko / HELP, so a broken JAMO_KEY entry is obvious in the failure text
+        for jamo, key in {"ㅁ": "a", "ㅓ": "j", "ㅏ": "k", "ㅂ": "q", "ㄱ": "r",
+                          "ㅅ": "t", "ㅇ": "d", "ㅑ": "i", "ㅛ": "y", "ㅡ": "m"}.items():
+            self.assertEqual(gg.hangul_keys(jamo), key)
 
 
 if __name__ == "__main__":

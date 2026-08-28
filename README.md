@@ -62,7 +62,6 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `me` | `GITGRAPH_ME` | gh accounts | logins that count as "me" in the TUI home |
 | `lang` | `GITGRAPH_LANG` | `Korean` | language of translations, summaries and answers |
 | `translate` | `GITGRAPH_TRANSLATE` | `zh` | `zh` (Chinese only) / `all` / `none` |
-| `auto_translate` | `GITGRAPH_AUTO_TRANSLATE` | `true` | TUI: translate the main content in the background whenever it is not in `lang`; `i` shows the original |
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | models (real `claude` only) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call (split in halves across jobs) |
 | `ai_parallel` | `GITGRAPH_AI_PARALLEL` | `3` | TUI: how many AI CLI calls run at the same time (summaries, title translations, link reasons; long bodies are translated in parallel chunks) |
@@ -144,13 +143,14 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | move · page · top/bottom · scroll sideways |
 | `K` `J` | scroll the main panel from anywhere |
 | Enter | see the table above |
-| `i` | original ↔ translation of the main content. With `auto_translate` (default) anything not in `lang` is translated in the background as soon as it is shown (`⟳ 번역 중…` meanwhile; cached in `translations_full.json`). Also the `[i 번역]` button in Main's title bar |
+| `i` | translate the main content in full, **on demand** — `i` again shows the original. Also the `[i 번역]` button in Main's title bar. Nothing is translated in the background: the body stays as written until you ask (`⟳ 번역 중…` while it runs; cached in `translations_full.json`) |
 | `m` | mark the selected issue/PR or comment for my next work and write a note; marked rows show `✎`, Inbox gets a **todo** section (second tab, after my turn), and the markdown file `todo_file` (default `~/gitgraph-todo.md`; `gg todo` prints it) is rewritten so the next session — or Claude — can pick the work up. `m` again on a marked row: edit the note / mark done / remove. On the answer tab `m` saves the answer text into the mark's note. Source of truth: `~/.config/gitgraph/todo.json` |
+| `Del` | remove the mark on the selection outright (`m` on a marked row offers edit / done / remove instead) |
 | `y` | copy the URL of the selection to the clipboard |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser (the URL is also the first, underlined line of the content) |
 | Esc / `b` · `f` | back (previous item and perspective) · forward |
 | `u` | view Inbox as another person |
-| `r` · `R` | refresh from GitHub in the background: only what changed (also automatic every `--max-age` minutes) · everything |
+| `r` · `R` | refresh from GitHub in the background: only what changed (also on start-up, and automatically every `--max-age` minutes) · everything |
 | `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | search in the focused panel · colour theme · token usage · quit |
 | `C` | open Claude Code next to gg (a tmux pane, else full screen). Through the `gg mcp` server it sees what you look at (`gg_state`, `gg_context`), your marks (`gg_todo`) and can drive gg (`gg_open`, `gg_mark`) and tick off marks it has handled (`gg_todo_done`). Register once: `claude mcp add -s user gg -- gg mcp` |

@@ -213,19 +213,25 @@ class TestSummaries(AiCase):
 
 
 class TestLinkReasons(AiCase):
-    def test_suspected_bug_why_prompt_is_undefined_in_0_17_0(self):
-        """REGRESSION, still present: WHY_PROMPT's definition was dropped in 0.17.0 (897c522) while its
-        use at gitgraph.py:1285 stayed. summarize_whys() therefore always raises NameError inside its
-        own try/except, logs "link reasons failed" and returns nothing — the ↳ AI link reason silently
-        never appears. 0.16.0 still had the definition (its gitgraph.py:1217).
-
-        When WHY_PROMPT is restored this test will fail: replace it with the real assertion
-        (out == {"k1": "WHY:#2"}) and drop the fake-CLI call count check.
+    def test_link_reasons_are_generated_and_cached(self):
+        """0.18.0 restored WHY_PROMPT: 0.17.0 dropped its definition while keeping the use at
+        summarize_whys(), so every call raised NameError inside its own try/except and the ↳ link
+        reason silently never appeared. Keep this test asserting a real reply, not an empty dict.
         """
-        self.assertFalse(hasattr(gg, "WHY_PROMPT"))
+        self.assertTrue(hasattr(gg, "WHY_PROMPT"), "0.17.0 shipped without it; do not drop it again")
         out = gg.summarize_whys([("k1", {"ref": "#2", "sentence": "see #2 for the fix"})], lang="Korean")
-        self.assertEqual(out, {})
-        self.assertEqual(self.calls(), [], "it fails before ever invoking the AI CLI")
+        self.assertEqual(out, {"k1": "WHY:#2"})
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("Korean:k1", self.cache("whys.json"))
+        gg.summarize_whys([("k1", {"ref": "#2", "sentence": "see #2 for the fix"})], lang="Korean")
+        self.assertEqual(len(self.calls()), 1, "the cached reason must not be asked again")
+
+    def test_prepare_whys_fills_the_graph(self):
+        g = testenv.fixture_graph(gg)
+        pairs = [pr for pr in g.ctx][:2]
+        if pairs:
+            gg.prepare_whys(g, pairs)
+            self.assertTrue(any(v for v in g.why.values()), "g.why stays empty when WHY_PROMPT is gone")
 
     def test_a_cached_reason_is_still_served_without_the_cli(self):
         # the cache path is independent of the broken prompt, and is what keeps old reasons visible
@@ -281,6 +287,26 @@ class TestCacheMergeConcurrency(AiCase):
         gg.cache_merge(path, {"b": "2"})
         with open(path, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"a": "1", "b": "2"})
+
+
+class TestOnDemandTranslationOnly(unittest.TestCase):
+    """0.18.0: the main content is translated only when the user asks (i, or the [i 번역] title button).
+    Nothing is translated in the background any more, so there is no auto_translate setting and no
+    maybe_auto_translate() step in the draw path."""
+
+    def test_the_auto_translate_setting_is_gone(self):
+        self.assertNotIn("auto_translate", gg.CONFIG_KEYS)
+
+    def test_no_background_translation_hook_remains(self):
+        self.assertFalse(hasattr(gg.Tui, "maybe_auto_translate"))
+        self.assertTrue(hasattr(gg.Tui, "translate_content"), "i must still translate on demand")
+
+    def test_a_fresh_tui_starts_on_the_original(self):
+        # show_tr decides original vs translation in refresh_main(); a new Tui must start with it False
+        # (tests/tui_smoke.py checks the visible half of this: the body stays untranslated until i).
+        src = open(gg.__file__, encoding="utf-8").read()
+        init = src[src.index("    def __init__(self, scr, opts):"):src.index("    # ------------------------------------------------------------------ background work")]
+        self.assertIn("self.show_tr = False", init)
 
 
 class TestAiPickers(unittest.TestCase):

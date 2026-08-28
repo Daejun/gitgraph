@@ -130,21 +130,18 @@ class TestGraphqlFallback(FetchCase):
         tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
         self.assertEqual(tried, ["alice", "carol"], "the active account is tried first, then the other")
 
-    def test_suspected_bug_the_working_account_is_not_remembered(self):
-        """graphql()'s docstring says "the account that works is moved to the front for the rest of the
-        process", but gh_accounts() returns a fresh list() copy each call, so `accts.insert(0, accts.pop(i))`
-        reorders only that local copy (gitgraph.py:443,460). Every later query therefore tries the denied
-        account first again — two gh processes per query on a private repo instead of one.
-
-        Pinned as current behaviour; if the reorder is ever made to stick, flip this assertion.
+    def test_the_working_account_is_remembered_for_later_queries(self):
+        """0.18.0: the account that could see the repo is moved to the front of the *shared* account
+        list (_prefer_account), so a private repo costs one gh process per query, not two. Before that,
+        gh_accounts() handed out a fresh copy and the reorder was thrown away every time.
         """
         self.set_accounts({"github.com": ["alice", "carol"]})
         os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
         gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
-        self.assertEqual(gg.gh_accounts("github.com")[0], "alice")
+        self.assertEqual(gg.gh_accounts("github.com")[0], "carol")
         gg.graphql(gg.Q_ISSUES, {"owner": "test", "name": "repo", "after": None, "states": ["OPEN"]})
         tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
-        self.assertEqual(tried, ["alice", "carol", "alice", "carol"])
+        self.assertEqual(tried, ["alice", "carol", "carol"], "the second query goes straight to carol")
 
     def test_not_found_everywhere_names_the_host_and_the_accounts(self):
         self.set_accounts({"github.com": ["alice", "carol"]})

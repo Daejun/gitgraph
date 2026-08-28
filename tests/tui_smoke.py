@@ -58,6 +58,8 @@ def normalise(text):
 class Session:
     def __init__(self, args=(), home=None, rows=ROWS, cols=COLS, **envextra):
         self.home = home or testenv.make_home()
+        envextra.setdefault("FAKE_GH_MODE", "script")
+        envextra.setdefault("FAKE_GH_FIXTURE", gh_fixture(self.home))
         self.rows, self.cols = rows, cols
         # deliberately no LINES/COLUMNS: ncurses would honour them over the pty's real size and never
         # see a resize (SIGWINCH -> KEY_RESIZE), which is one of the things this file checks
@@ -93,6 +95,18 @@ class Session:
                     self.scr.feed(os.read(self.fd, 65536).decode("utf-8", "replace"))
                 except OSError:
                     return
+
+    def settle(self, timeout=25):
+        """Wait until no background job is reporting progress, so a screenshot is reproducible.
+        Since 0.18.0 the TUI always asks GitHub what changed on start-up, so there is always one
+        background job to wait for (answered here by tests/fakes/gh in script mode)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            self.drain(0.4)
+            if not any(w in self.scr.text() for w in PROGRESS_WORDS):
+                self.drain(0.3)
+                return True
+        return False
 
     def wait_for(self, text, timeout=30):
         end = time.time() + timeout
@@ -160,6 +174,27 @@ class Session:
             pass
 
 
+def gh_fixture(home):
+    """Write a FAKE_GH_FIXTURE for tests/fakes/gh from the items already cached in `home`.
+
+    Since 0.18.0 the TUI always asks GitHub what changed when it opens, so the fake gh has to answer
+    instead of refusing: every cached item is listed as OPEN with its cached updatedAt, which makes
+    list_open() report "0 changed, 0 dropped" and the refresh stop there — the real incremental path,
+    with no item re-fetched and the fixture data left exactly as it was.
+    """
+    cache = os.path.join(home, ".cache", "gitgraph", f"items__{testenv.FIXTURE_REPO.replace('/', '__')}__open.json")
+    with open(cache, encoding="utf-8") as f:
+        items = json.load(f)["items"]
+    issues, pulls = {}, {}
+    for it in items:
+        (pulls if it["is_pr"] else issues)[str(it["number"])] = {
+            "number": it["number"], "updatedAt": it["updated"], "state": "OPEN"}
+    path = os.path.join(home, "gh-fixture.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"repos": {testenv.FIXTURE_REPO: {"issues": issues, "pulls": pulls}}}, f)
+    return path
+
+
 FAILS = []
 
 
@@ -215,6 +250,7 @@ def current_item(s):
 def panels_and_navigation(s):
     check("panels drawn", s.wait_for("6 People") and "0 Main" in s.line(0))
     check("repo panel shows the fixture repo", "test/repo" in s.text(), s.line(2))
+    check("the start-up refresh finishes", s.settle())
     check_golden("start", s.text())
 
     s.key("3")                                  # Inbox
@@ -299,6 +335,13 @@ def search_and_marks(s):
     s.key("m", 0.8)
     check("m on a marked row offers edit/done/remove", "is marked" in s.text() or "done" in s.text())
     s.key("\x1b", 0.5)
+    # 0.18.0: Delete drops the mark outright, no menu
+    s.key("\x1b[3~", 1.2)
+    left = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else []
+    check("Del removes the mark", left == [], f"todo.json still holds {left}")
+    check("Del says what it removed", "mark removed" in s.text() or "✎" not in s.text(), s.text()[-300:])
+    s.key("\x1b[3~", 0.8)
+    check("Del on an unmarked row is harmless", "nothing marked" in s.text() or "Traceback" not in s.log())
 
 
 def popups_and_menus(s):
@@ -332,8 +375,16 @@ def ai_flows(s):
     check("ask opens the answer tab", "[answer" in s.line(0))
     check("the fake AI answer is shown", "ANSWER: why?" in s.text(), s.text()[:400])
     s.key("[", 0.5)
-    s.key("i", 2.5)
-    check("i toggles the translation", "Traceback" not in s.log())
+    # 0.18.0: nothing is translated in the background — the body stays as written until i is pressed
+    before = s.text()
+    s.drain(2.0)
+    check("no background translation", "TRFULL:" not in s.text() and "번역 중" not in s.text(),
+          s.text()[:300])
+    s.key("i", 3.0)
+    check("i translates on demand", "TRFULL:" in s.text() or "번역 중" in s.text(), s.text()[:400])
+    s.key("i", 1.5)
+    check("i toggles back to the original", "TRFULL:" not in s.text())
+    check("no traceback from translating", "Traceback" not in s.log())
 
 
 def hangul_ime(s):
@@ -407,6 +458,22 @@ def url_click(s):
     check("clicking the URL opens the browser", bool(urls) and urls[-1].startswith("http"), f"{urls}")
 
 
+def startup_refresh(s):
+    """0.18.0: opening gg always asks GitHub what changed (incrementally), whatever the cache age.
+    Here the fake gh refuses every call, so the proof is that it was called at all — and that a failed
+    refresh leaves the TUI usable."""
+    calls = os.path.join(s.home, "gh-calls.log")
+    got = open(calls, encoding="utf-8").read() if os.path.exists(calls) else ""
+    check("the start-up refresh asked GitHub what changed", "query_head" in got,
+          got[-300:] or "(gh was never called)")
+    log = s.log()
+    check("the refresh took the incremental path", "0 changed" in log or "changed," in log,
+          "\n".join(l for l in log.splitlines() if "changed" in l)[-300:])
+    check("nothing was re-fetched when nothing changed", "fetched" not in got)
+    check("the TUI is still usable after the refresh",
+          "6 People" in s.text() and "Traceback" not in log)
+
+
 def live_state(s):
     """state.json for `gg mcp`, and cmd.json driving the running TUI (gg_open)."""
     st = None
@@ -447,6 +514,7 @@ def portrait_and_theme():
         ok = s.wait_for("Main", 30)
         check("basic theme, 83 columns starts", ok, s.text()[:400])
         check("portrait mode stacks the panels", "0 Main" in s.text() and s.text().count("╭") > 0)
+        s.settle()
         check_golden("portrait83", s.text())
         s.resize(30, 140)
         s.key("3", 0.8)                  # a keypress after SIGWINCH forces the full repaint
@@ -478,7 +546,8 @@ def main():
     assert home != os.path.expanduser("~"), "refusing to run against the real HOME"
     os.environ["FAKE_OPEN_LOG"] = os.path.join(home, "opened.txt")
     s = Session(["--no-summary", "-t", "none"], home=home,
-                FAKE_OPEN_LOG=os.path.join(home, "opened.txt"))
+                FAKE_OPEN_LOG=os.path.join(home, "opened.txt"),
+                FAKE_GH_LOG=os.path.join(home, "gh-calls.log"))
     try:
         panels_and_navigation(s)
         inbox_tabs(s)
@@ -488,6 +557,7 @@ def main():
         hangul_ime(s)
         mouse_and_border(s)
         url_click(s)
+        startup_refresh(s)
         live_state(s)
         check("clean exit", s.quit())
         log = s.log()

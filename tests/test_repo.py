@@ -166,15 +166,11 @@ class TestUnfork(unittest.TestCase):
         with mock.patch.object(gg, "parent_repo", return_value="upstream/a"):
             self.assertEqual(gg.unfork(["fork/a", "fork/b"]).count("upstream/a"), 1)
 
-    def test_suspected_bug_second_fork_of_an_already_seen_parent_survives_under_its_own_name(self):
-        # Suspected bug: when two different repos in the input fork the *same* parent, unfork()'s
-        # docstring says it "replaces forks by their parents", but only the first fork is replaced.
-        # The second one's parent is already in `out`, so the `if parent and parent not in out` branch
-        # is skipped for it, and it falls through to the `elif repo not in out` branch, which re-adds
-        # the fork itself (not its parent, and not deduplicated away either). Net result: the list
-        # ends up containing both the parent *and* the un-replaced second fork.
+    def test_two_forks_of_one_parent_collapse_into_that_parent(self):
+        # 0.18.0: the second fork used to survive under its own name, because its parent was already
+        # in the output list and it fell through to the "not a fork" branch.
         with mock.patch.object(gg, "parent_repo", return_value="upstream/a"):
-            self.assertEqual(gg.unfork(["fork/a", "fork/b"]), ["upstream/a", "fork/b"])
+            self.assertEqual(gg.unfork(["fork/a", "fork/b"]), ["upstream/a"])
 
     def test_already_seen_repo_is_not_duplicated(self):
         with mock.patch.object(gg, "parent_repo", return_value=None):

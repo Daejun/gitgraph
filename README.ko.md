@@ -62,7 +62,6 @@ gg update                 # 설치 갱신
 | `me` | `GITGRAPH_ME` | gh 계정들 | TUI home에서 "나"로 볼 login |
 | `lang` | `GITGRAPH_LANG` | `Korean` | 번역·요약·답변 언어 |
 | `translate` | `GITGRAPH_TRANSLATE` | `zh` | `zh`(한자만) / `all` / `none` |
-| `auto_translate` | `GITGRAPH_AUTO_TRANSLATE` | `true` | TUI: main content가 `lang`이 아니면 보이는 즉시 백그라운드로 전문 번역; `i`로 원문 |
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | 모델(진짜 `claude`에만 적용) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: 번역/요약 호출당 노드 수(job마다 절반씩) |
 | `ai_parallel` | `GITGRAPH_AI_PARALLEL` | `3` | TUI: 동시에 돌리는 AI CLI 호출 수(요약·제목 번역·링크 이유; 긴 본문 번역은 덩어리로 나눠 병렬) |
@@ -144,13 +143,14 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 | `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | 이동 · 페이지 · 처음/끝 · 가로 스크롤 |
 | `K` `J` | 어디서든 main panel 스크롤 |
 | Enter | 위 표 참조 |
-| `i` | main content의 원문 ↔ 번역. `auto_translate`(기본)면 `lang`이 아닌 내용은 보이는 즉시 백그라운드로 번역(그동안 `⟳ 번역 중…`; `translations_full.json` 캐시). Main 제목줄의 `[i 번역]` 버튼도 같음 |
+| `i` | main content를 **누를 때만** 전문 번역 — 다시 `i`면 원문. Main 제목줄의 `[i 번역]` 버튼도 같음. 백그라운드 자동 번역은 없다: 요청하기 전까지 본문은 원문 그대로(번역 중에는 `⟳ 번역 중…`; `translations_full.json` 캐시) |
 | `m` | 선택한 issue/PR 또는 코멘트를 다음 작업으로 표시하고 메모를 적음; 표시된 행에 `✎`, Inbox의 **todo** 섹션(첫 탭; 시작은 여전히 my turn), 그리고 markdown 파일 `todo_file`(기본 `~/gitgraph-todo.md`; `gg todo`로 출력)이 다시 써져서 다음 세션이나 Claude가 그 문서를 보고 일을 이어갈 수 있음. 표시된 행에서 다시 `m`: 메모 수정 / 완료 / 삭제. answer 탭에서 `m`은 답 내용을 그 마킹의 메모로 저장. 원본은 `~/.config/gitgraph/todo.json` |
+| `Del` | 선택 항목의 마킹을 바로 삭제(마킹된 행에서 `m`은 메모 수정 / 완료 / 삭제 메뉴) |
 | `y` | 선택 항목의 URL을 클립보드로 |
 | `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기(URL은 content 첫 줄에 밑줄로도 표시) |
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
 | `u` | Inbox를 다른 사람 관점으로 |
-| `r` · `R` | 백그라운드로 GitHub 갱신: 바뀐 것만(`--max-age`분마다 자동으로도) · 전체 |
+| `r` · `R` | 백그라운드로 GitHub 갱신: 바뀐 것만(시작할 때마다, 그리고 `--max-age`분마다 자동으로도) · 전체 |
 | `c` `t` `s` `p` `h` | comments 모드 · 번역 · 요약 · 사람 노드 · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | 포커스 panel 검색 · 색 테마 · 토큰 사용량 · 종료 |
 | `C` | gg 옆에 Claude Code를 띄움(tmux면 옆 pane, 아니면 전체 화면). `gg mcp` 서버를 통해 지금 보는 것(`gg_state`, `gg_context`)과 마킹(`gg_todo`)을 읽고 gg를 조작(`gg_open`, `gg_mark`)하고 처리한 마킹을 지울 수 있음(`gg_todo_done`). 한 번 등록: `claude mcp add -s user gg -- gg mcp` |

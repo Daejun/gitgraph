@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -43,7 +43,6 @@ CONFIG_KEYS = {
     "me": ("GITGRAPH_ME", "", "logins that count as \"me\", comma separated (default: gh accounts)"),
     "lang": ("GITGRAPH_LANG", "Korean", "language for translations, summaries and answers"),
     "translate": ("GITGRAPH_TRANSLATE", "zh", "zh | all | none"),
-    "auto_translate": ("GITGRAPH_AUTO_TRANSLATE", "true", "tui: translate the main content in the background whenever it is not in `lang`"),
     "tr_model": ("GITGRAPH_TR_MODEL", "haiku", "model for translation / summaries (claude only)"),
     "ask_model": ("GITGRAPH_ASK_MODEL", "sonnet", "model for `a` / `gg ask` (claude only)"),
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
@@ -338,9 +337,10 @@ def unfork(repos):
     out = []
     for repo in repos:
         parent = parent_repo(repo)
-        if parent and parent not in out:
-            log(f"{repo} is a fork of {parent}; using {parent} (pass -r {repo} to look at the fork itself)")
-            out.append(parent)
+        if parent:
+            if parent not in out:
+                log(f"{repo} is a fork of {parent}; using {parent} (pass -r {repo} to look at the fork itself)")
+                out.append(parent)
         elif repo not in out:
             out.append(repo)
     return out
@@ -433,6 +433,13 @@ def gh_api(args, body, env):
     return r
 
 
+def _prefer_account(host, user):
+    """Remember the account that could see this host's repos, so later queries try it first."""
+    if _accounts and user in _accounts.get(host, []):
+        _accounts[host].remove(user)
+        _accounts[host].insert(0, user)
+
+
 def graphql(query, variables=None, host=DEFAULT_HOST):
     """Run a GraphQL query through `gh api graphql` against `host` (github.com or a GitHub Enterprise host).
 
@@ -459,14 +466,14 @@ def graphql(query, variables=None, host=DEFAULT_HOST):
         errs = data.get("errors") or []
         if not errs and r.returncode == 0:
             if i:
-                accts.insert(0, accts.pop(i))
+                _prefer_account(host, accts[i])
             return data.get("data", {})
         types = {e.get("type") for e in errs}
         partial = data.get("data") or {}
         if errs and types <= {"NOT_FOUND"} and any(v is not None for v in partial.values()):
             # partial NOT_FOUND (e.g. one alias in a stub batch): usable; a null repository is not
             if i:
-                accts.insert(0, accts.pop(i))
+                _prefer_account(host, accts[i])
             return data.get("data", {})
         last_err = errs or r.stderr.strip() or f"gh exit {r.returncode}"
         if "NOT_FOUND" in types or "Could not resolve" in (r.stderr or ""):
@@ -1241,6 +1248,15 @@ def translate_body(n, g, lang=TR_LANG):
     return out
 
 
+WHY_PROMPT = """Each entry below is a sentence from a GitHub issue, pull request or comment that mentions another item, \
+given as "ref" (like #748). For each entry write, in {lang}, one sentence of at most 90 characters that says WHY that item \
+is mentioned and what it is — e.g. "충돌 여부를 확인한 관련 PR", "이 버그를 고치는 PR", "같은 증상을 보고한 issue", "재현 절차 출처". \
+Keep #numbers, identifiers and technical terms in English; never use Chinese characters. \
+Output ONLY a JSON array of strings, same length and order as the input, no code fence.
+
+{payload}"""
+
+
 def around(ctx, ref, n=70):
     """The part of ctx within ~n characters of ref, cut at word boundaries (a short quote for narrow panels)."""
     i = ctx.find(ref)
@@ -1709,7 +1725,7 @@ def resolve_root(g, root):
 # --------------------------------------------------------------------------
 def trunc(s, n):
     s = re.sub(r"\s+", " ", (s or "")).strip()
-    return s if len(s) <= n else s[:n - 1] + "…"
+    return s if dw(s) <= n else clip(s, 0, max(n - 1, 0)) + "…"
 
 
 def raw_excerpt(body):
@@ -2578,9 +2594,8 @@ HELP = """gg tui — lazygit style layout
   a               ask claude about the selection (answer tab in main); every answer is saved with its question,
                   anchored to that issue/PR/comment (~/.config/gitgraph/qa.json) and shown again on its answer tab
   d               details pager     o  open in browser
-  i               show the original / the translation of the main content (also the [i 번역] title button).
-                  With auto_translate (default on) any content that is not in your language is translated in the
-                  background as soon as it is shown; i still toggles back to the original
+  i               translate the main content in full, on demand (also the [i 번역] title button); i again shows
+                  the original. Nothing is translated in the background — only what you ask for
   C               open Claude Code in a tmux pane (or full screen) that can see what gg shows: it uses the
                   `gg mcp` server (register once: claude mcp add -s user gg -- gg mcp) — tools gg_state, gg_context,
                   gg_todo, gg_show, gg_graph, gg_open, gg_mark
@@ -2588,6 +2603,7 @@ HELP = """gg tui — lazygit style layout
                   (on the answer tab: saves the answer text into the mark's note)
                   Home has a "todo" section, and ~/gitgraph-todo.md (gg config todo_file) is rewritten for the
                   next session (also `gg todo`). m again on a marked row: edit the note / mark done / remove
+  Del             remove the mark on the selection outright (no menu)
   Esc / b         back (previous item and perspective)     f  forward
   u               view Inbox as another person
   r / R           refresh from GitHub in the background: r = only what changed (also automatic every --max-age
@@ -2729,8 +2745,7 @@ class Tui:
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
         self.todo = load_todo()
-        self.auto_tr = cfg("auto_translate").lower() not in ("false", "0", "no", "") and cfg("claude_bin")
-        self.show_tr = bool(self.auto_tr)   # main content: show the full-text translation (i toggles; auto in the background)
+        self.show_tr = False   # main content: the original until i (or the title button) asks for a translation
         self.last_side = "home"   # the side list panel that stays expanded while main is focused
         self.tr_thread, self.tr_pending = None, None
         self.collapsed = set()
@@ -2880,6 +2895,8 @@ class Tui:
                 save_config()
         if self.o.get("start_tour"):
             self.tutorial()
+        if not refresh:
+            self.refresh_bg()      # always look for what changed on start-up; only changed items are fetched
 
     def refresh_bg(self, full=False):
         """r: fetch what changed on GitHub in the background and swap the graph in when done (R: everything)."""
@@ -3168,8 +3185,6 @@ class Tui:
         p = self.panels["main"]
         tab = self.MAIN_TABS[p.tab]
         if tab == "content":
-            if self.show_tr:
-                self.maybe_auto_translate()
             lines = self.content_lines(self.subject, max(p.rect[3], 40))
         else:
             lines = render_markdown(self.answer_text(), max(p.rect[3], 40))
@@ -3291,29 +3306,6 @@ class Tui:
             out.append("")
             out.extend(render_markdown(self.reflow(body), width))
         return out
-
-    def needs_translation(self, n):
-        """A body with prose that is not in the target language (for Korean: no Hangul at all) and not translated yet."""
-        if not n or n.kind not in ("item", "comment") or n.tr_body or not (n.body or "").strip():
-            return False
-        prose = " ".join(t for is_p, t in _split_prose(n.body[:TR_FULL_CHARS]) if is_p)
-        if len(re.findall(r"[A-Za-z]", prose)) + 3 * len(re.findall(r"[一-鿿]", prose)) < 30:
-            return False
-        if TR_LANG.lower().startswith("korean"):
-            return not HANGUL_RE.search(prose)
-        return True
-
-    def maybe_auto_translate(self):
-        """Start translating the current subject in the background when it is not in the target language."""
-        if not self.auto_tr or self.o["translate"] == "none":
-            return
-        if self.tr_thread is not None and self.tr_thread.is_alive():
-            return
-        nid = self.subject or self.item
-        n = self.g.nodes.get(nid) if nid else None
-        if not self.needs_translation(n) or nid in getattr(self, "tr_failed", set()):
-            return
-        self.start_translation(n, nid)
 
     def start_translation(self, n, nid):
         import threading
@@ -3800,6 +3792,19 @@ class Tui:
             else:
                 return
             self.msg = f"todo updated → {save_todo(self.todo).replace(os.path.expanduser('~'), '~')}"
+        self.refresh_all()
+
+    def unmark(self):
+        """Delete: drop the mark on the selection outright (m offers edit / done / remove instead)."""
+        nid = self.subject or self.item
+        e = self.marked(nid) if nid else None
+        if e is None:
+            self.msg = "nothing marked here (m marks it)"
+            return
+        n = self.g.nodes.get(nid)
+        label = self.g.label_num(n) if n and n.kind == "item" else nid
+        self.todo.remove(e)
+        self.msg = f"mark removed: {label} → {save_todo(self.todo).replace(os.path.expanduser('~'), '~')}"
         self.refresh_all()
 
     def confirm(self, question):
@@ -4568,6 +4573,7 @@ class Tui:
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
         ("*", "y", "copy the URL of the selection", ord("y")),
         ("*", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
+        ("*", "Del", "remove the mark on the selection", 0),
         ("*", "C", "open Claude Code next to gg (tmux pane / full screen), connected via gg mcp", ord("C")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
         ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Inbox as another person", ord("u")),
@@ -4597,7 +4603,7 @@ class Tui:
             self.msg = f"{cur} kept — gg ai switches the AI CLI"
             return
         if choice[0] == "off":
-            self.o["translate"], self.o["summary"], self.auto_tr = "none", False, False
+            self.o["translate"], self.o["summary"], self.show_tr = "none", False, False
             self.enriched = set()
             self.msg = "AI features off for this session (gg ai / O to change)"
             self.refresh_all()
@@ -4748,6 +4754,8 @@ class Tui:
             self.ask()
         elif k == ord("m"):
             self.mark()
+        elif k == c.KEY_DC:
+            self.unmark()
         elif k == ord("C"):
             self.launch_claude()
         elif k == ord("i"):

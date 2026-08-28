@@ -93,20 +93,20 @@ class TestTrunc(unittest.TestCase):
         # though its display width is well over n columns (see test_width_can_exceed_n_for_cjk below).
         s = "가나다라마바사아자차"  # 10 Hangul syllables = 10 chars, 20 display columns
         self.assertEqual(len(s), 10)
-        self.assertEqual(gg.trunc(s, 10), s)  # len(s) == n -> not truncated
-        self.assertEqual(gg.dw(gg.trunc(s, 10)), 20)  # ...but the display width is double n
+        # n is a column budget: 10 wide chars are 20 columns, so this IS truncated
+        self.assertLessEqual(gg.dw(gg.trunc(s, 10)), 10)
 
-    def test_truncates_at_n_minus_one_chars_plus_ellipsis(self):
+    def test_truncates_to_n_minus_one_columns_plus_ellipsis(self):
         self.assertEqual(gg.trunc("abcdefghij", 5), "abcd…")
-        self.assertEqual(gg.trunc("가나다라마바사아자차", 5), "가나다라…")
+        self.assertEqual(gg.trunc("가나다라마바사아자차", 5), "가나…")   # 2 wide chars = 4 columns, + …
 
-    def test_width_can_exceed_n_for_cjk(self):
-        # Documented (suspected-bug-adjacent) behaviour: trunc's `n` bounds len(), not dw(), so the
-        # result's display width is not bounded by n for wide-char-heavy text.
-        out = gg.trunc("가나다라마바사아자차", 9)
-        self.assertEqual(out, "가나다라마바사아…")  # s[:8] (8 chars) + ellipsis = 9 chars
-        self.assertLessEqual(len(out), 9)
-        self.assertGreater(gg.dw(out), 9)
+    def test_cjk_never_exceeds_the_column_budget(self):
+        # 0.18.0: trunc() measures display width (dw), not len() — CJK titles used to overflow the
+        # column budget every caller passes it.
+        for n in range(2, 20):
+            for s in ("가나다라마바사아자차", "mixed 한글 and ascii text", "abcdefghij"):
+                self.assertLessEqual(gg.dw(gg.trunc(s, n)), n, f"{s!r} at n={n}")
+        self.assertEqual(gg.trunc("가나다라마바사아자차", 9), "가나다라…")
 
 
 class TestCharAt(unittest.TestCase):

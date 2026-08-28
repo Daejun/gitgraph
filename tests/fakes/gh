@@ -82,6 +82,7 @@ def log_call(rec):
 
 
 def fail(args):
+    log_call({"argv": args, "mode": "fail"})     # so a test can prove gh was reached at all
     sys.stderr.write(
         "tests/fakes/gh: gh was invoked (args=%r) — a test should never reach the real gh / network path; "
         "fix the fixture or the GITGRAPH_* env instead of letting this run.\n" % (args,))

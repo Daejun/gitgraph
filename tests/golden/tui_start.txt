@@ -31,4 +31,4 @@
 │                                                      ││                                                                                  │
 │                                                      ││                                                                                  │
 ╰──────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────────────────────────────────╯
-⏎ open item  m mark  [ ] section  / search  a ask  o browser  u view-as   1-6 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit
+refreshed: 0 changed

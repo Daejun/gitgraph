@@ -27,4 +27,4 @@
 │                                                                                 │
 │                                                                                 │
 ╰─────────────────────────────────────────────────────────────────────────────────╯
-⏎ open item  m mark  [ ] section  / search  a ask  o   1-6 0 Tab  + _  ? q
+refreshed: 0 changed
