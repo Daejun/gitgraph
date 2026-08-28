@@ -10,9 +10,11 @@ Run: python3 -m unittest tests.test_fetch -v
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -379,6 +381,76 @@ class TestListAndFetch(FetchCase):
     def test_fetch_repo_returns_issues_and_prs(self):
         items = gg.fetch_repo("test/repo", "open")
         self.assertEqual({(it["is_pr"], it["number"]) for it in items}, {(False, 1), (False, 2), (True, 5)})
+
+
+class TestStreamingFetch(unittest.TestCase):
+    """fetch_open_streaming(): the listing and the record fetch overlap — each page of numbers is handed
+    to the record pool while the next page is still being listed. Pagination is simulated here (the fake
+    gh answers everything in one page), so this is where multi-page behaviour is actually checked."""
+
+    ISSUES, PRS = list(range(1, 251)), list(range(1000, 1120))
+
+    def fake_graphql(self, query, variables=None, host=None):
+        with self.lock:
+            self.calls.append(query)
+            kind = "list" if "$after" in query else "records"
+            self.order.append(kind)
+        if kind == "list":
+            time.sleep(0.05)                       # a page takes a moment; records must not wait for it
+            is_pr = "pullRequests(" in query
+            nums = self.PRS if is_pr else self.ISSUES
+            start = int((variables or {}).get("after") or 0)
+            page = nums[start:start + 100]
+            more = start + 100 < len(nums)
+            return {"repository": {"pullRequests" if is_pr else "issues": {
+                "pageInfo": {"hasNextPage": more, "endCursor": str(start + 100)},
+                "nodes": [{"number": n, "updatedAt": "2026-08-01T00:00:00Z"} for n in page]}}}
+        is_pr = "pullRequest(number:" in query
+        rep = {}
+        for alias, num in re.findall(r"(n\d+): (?:issue|pullRequest)\(number:(\d+)\)", query):
+            rep[alias] = node(int(num), f"item {num}", is_pr=is_pr)
+        return {"repository": rep}
+
+    def setUp(self):
+        self.calls, self.order, self.lock = [], [], threading.Lock()
+        patcher = mock.patch.object(gg, "graphql", side_effect=self.fake_graphql)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_every_open_item_is_fetched_exactly_once(self):
+        items = gg.fetch_open_streaming("test/repo")
+        got = sorted(it["number"] for it in items)
+        self.assertEqual(got, sorted(self.ISSUES + self.PRS))
+
+    def test_records_are_fetched_while_the_listing_is_still_paging(self):
+        gg.fetch_open_streaming("test/repo")
+        first_records = self.order.index("records")
+        last_list = len(self.order) - 1 - self.order[::-1].index("list")
+        self.assertLess(first_records, last_list,
+                        "the first records must be requested before the last listing page")
+
+    def test_batches_stay_within_the_cap(self):
+        gg.fetch_open_streaming("test/repo")
+        for q in self.calls:
+            n = len(re.findall(r"n\d+: (?:issue|pullRequest)\(number:", q))
+            self.assertLessEqual(n, gg.MAX_ITEM_BATCH, "one query must not carry more than the cap")
+
+    def test_the_callback_sees_every_item_once(self):
+        seen = []
+        items = gg.fetch_open_streaming("test/repo", on_batch=lambda part: seen.extend(part))
+        self.assertEqual(sorted(it["number"] for it in seen), sorted(it["number"] for it in items))
+
+    def test_the_newest_are_listed_first(self):
+        # the listing asks for CREATED_AT DESC, so page 1 — the first thing drawn — is the newest
+        gg.fetch_open_streaming("test/repo")
+        listing = [q for q in self.calls if "$after" in q]
+        for q in listing:
+            self.assertIn("direction:DESC", q)
+
+    def test_a_repository_that_is_not_there_raises(self):
+        with mock.patch.object(gg, "graphql", side_effect=lambda *a, **k: {"repository": None}):
+            with self.assertRaises(gg.GhError):
+                gg.fetch_open_streaming("test/repo")
 
 
 class TestRefreshItems(FetchCase):

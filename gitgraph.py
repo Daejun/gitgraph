@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.20.2"
+VERSION = "0.21.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -665,12 +665,14 @@ def _norm_item(repo, n, is_pr):
 
 Q_LIST = """
 query($owner:String!,$name:String!,$after:String,$states:[IssueState!]) {
-  repository(owner:$owner,name:$name){ issues(first:100, after:$after, states:$states){
+  repository(owner:$owner,name:$name){ issues(first:100, after:$after, states:$states,
+    orderBy:{field:CREATED_AT,direction:DESC}){
     pageInfo{hasNextPage endCursor} nodes{ number updatedAt } } } }
 """
 Q_LIST_PR = """
 query($owner:String!,$name:String!,$after:String,$states:[PullRequestState!]) {
-  repository(owner:$owner,name:$name){ pullRequests(first:100, after:$after, states:$states){
+  repository(owner:$owner,name:$name){ pullRequests(first:100, after:$after, states:$states,
+    orderBy:{field:CREATED_AT,direction:DESC}){
     pageInfo{hasNextPage endCursor} nodes{ number updatedAt } } } }
 """
 ITEM_BATCH = 10             # numbers per query when only a few items changed
@@ -705,6 +707,17 @@ def list_open(repo):
     return out
 
 
+def fetch_batch(repo, is_pr, numbers):
+    """One query: the full records of these issue (or PR) numbers."""
+    host, owner, name = split_repo(repo)
+    fields = PR_FIELDS if is_pr else ISSUE_FIELDS
+    kind = "pullRequest" if is_pr else "issue"
+    aliases = " ".join(f"n{n}: {kind}(number:{n}){{ {fields} }}" for n in numbers)
+    d = graphql(f'query {{ repository(owner:"{owner}", name:"{name}") {{ {aliases} }} }}', host=host)
+    rep_ = d.get("repository") or {}
+    return [_norm_item(repo, rep_[f"n{n}"], is_pr) for n in numbers if rep_.get(f"n{n}")]
+
+
 def fetch_items(repo, is_pr, numbers, note="changed items", spread=False, on_batch=None):
     return fetch_groups(repo, [(is_pr, numbers)], note, spread, on_batch)
 
@@ -728,14 +741,8 @@ def fetch_groups(repo, groups, note="items", spread=False, on_batch=None):
     done = [0]
 
     def fetch(job):
-        is_pr, batch = job
-        fields = PR_FIELDS if is_pr else ISSUE_FIELDS
-        kind = "pullRequest" if is_pr else "issue"
-        aliases = " ".join(f"n{n}: {kind}(number:{n}){{ {fields} }}" for n in batch)
-        d = graphql(f'query {{ repository(owner:"{owner}", name:"{name}") {{ {aliases} }} }}', host=host)
-        rep_ = d.get("repository") or {}
-        out = [_norm_item(repo, rep_[f"n{n}"], is_pr) for n in batch if rep_.get(f"n{n}")]
-        done[0] += len(batch)
+        out = fetch_batch(repo, job[0], job[1])
+        done[0] += len(job[1])
         progress("fetch", done[0], total, f"{repo}: {note}")
         if on_batch:
             on_batch(out)      # from a worker thread: the caller may draw what has arrived
@@ -767,15 +774,54 @@ def refresh_items(repo, cached, on_batch=None):
     return items, len(changed), len(dropped)
 
 
+def fetch_open_streaming(repo, on_batch=None):
+    """Every open issue/PR of a repo, with the listing and the record fetch overlapped: each page of
+    numbers (100 at a time, and the pages of a connection have to be walked in order) is handed to the
+    record pool as soon as it lands, so the first records are already being fetched while the last
+    pages are still being listed."""
+    from concurrent.futures import ThreadPoolExecutor
+    host, owner, name = split_repo(repo)
+    futures, done, lock = [], [0], __import__("threading").Lock()
+    pool = ThreadPoolExecutor(max_workers=FETCH_PARALLEL)
+
+    def records(is_pr, batch):
+        out = fetch_batch(repo, is_pr, batch)
+        with lock:
+            done[0] += len(batch)
+            n = done[0]
+        progress("fetch", n, None, f"{repo}: items")
+        if on_batch:
+            on_batch(out)
+        return out
+
+    def page_and_submit(q, is_pr):
+        after = None
+        while True:
+            d = graphql(q, {"owner": owner, "name": name, "after": after, "states": ["OPEN"]}, host)
+            conn = (d.get("repository") or {}).get("pullRequests" if is_pr else "issues")
+            if conn is None:
+                raise GhError(f"{repo}: repository not found on {host}")
+            nums = sorted((n["number"] for n in conn["nodes"]), reverse=True)
+            for i in range(0, len(nums), MAX_ITEM_BATCH):
+                futures.append(pool.submit(records, is_pr, nums[i:i + MAX_ITEM_BATCH]))
+            if not conn["pageInfo"]["hasNextPage"]:
+                return
+            after = conn["pageInfo"]["endCursor"]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as lister:      # the two connections are independent
+            list(lister.map(lambda a: page_and_submit(*a), ((Q_LIST, False), (Q_LIST_PR, True))))
+        return [it for f in futures for it in f.result()]      # in submission order; raises on failure
+    finally:
+        pool.shutdown()
+
+
 def fetch_repo(repo, state, on_batch=None):
     """Every issue/PR of a repo, for a cold cache. For the usual state="open" this lists the open
     numbers first (one cheap query per 100) and then pulls the records in parallel batches; a full
     `--state all` build still pages through the heavy connection query."""
     if state == "open":
-        listing = list_open(repo)
-        groups = [(is_pr, sorted((n for p, n in listing if p == is_pr), reverse=True))
-                  for is_pr in (False, True)]
-        items = fetch_groups(repo, [g for g in groups if g[1]], "items", spread=True, on_batch=on_batch)
+        items = fetch_open_streaming(repo, on_batch)
         items.sort(key=lambda it: it["created"], reverse=True)
         if not items:
             log(f"{repo}: no open issues or PRs came back — run `gg check -r {repo}` to see why")

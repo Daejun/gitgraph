@@ -70,10 +70,11 @@ parent (that is where the issues live). Enterprise repos are written `host/owner
 carries its host through the whole pipeline (`split_repo`/`qualify`/`repo_host`).
 
 **Fetch** (`graphql`, `load_items`) — every query is a `gh api graphql` process (~0.4s before any
-network), so the shape of the fetch is what costs time. A cold cache lists the open numbers first
-(`list_open`, both connections paged at once) and then pulls the records in aliased batches through
-`fetch_groups`, `FETCH_PARALLEL` queries at a time with the batch size chosen to fill every slot;
-pagination inside one connection is the only part that must stay sequential. Past `--max-age` the same
+network), so the shape of the fetch is what costs time. A cold cache goes through
+`fetch_open_streaming`: the two listing connections are paged at once (newest first) and each page of
+numbers is handed to a `FETCH_PARALLEL` pool that pulls the records in aliased batches, so the first
+records are already arriving while the last pages are still being listed. Pagination inside one
+connection is the only part that must stay sequential. Past `--max-age` the same
 listing feeds `refresh_items`, which re-fetches just what changed. The referenced-but-not-fetched
 items of every repo are looked up together by `resolve_stubs_many`, in the same parallel shape. Retried on transient errors, with
 multi-account fallback: on `NOT_FOUND` the other accounts `gh auth status` knows for that host are tried
