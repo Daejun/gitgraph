@@ -69,6 +69,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | how many `gh` queries run at the same time while filling the cache (first run, refresh). A round trip to GitHub costs ~0.4s whatever it asks for, so this is what makes a cold start fast; on a repo with hundreds of open items raising it to 12 is measurably quicker still |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
+| `review_signature` | `GITGRAPH_REVIEW_SIGNATURE` | (empty) | review mode: a footer added to every posted comment. Empty by default — the comment goes out under your own account |
 | `review_verify` · `review_verify_model` | `GITGRAPH_REVIEW_VERIFY` · `GITGRAPH_REVIEW_VERIFY_MODEL` | `on` · `sonnet` | review mode: the pass that tries to disprove each finding, and the model it runs on |
 | `review_model` · `review_timeout` · `review_max_bytes` | `GITGRAPH_REVIEW_MODEL` · `GITGRAPH_REVIEW_TIMEOUT` · `GITGRAPH_REVIEW_MAX_BYTES` | `sonnet` · `900` · `400000` | review mode: the model the review runs on (claude only), how long one call may take, and the diff size beyond which it is split by file and run in parallel |
 | `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | review mode: width of the Files and Findings columns |
@@ -204,6 +205,7 @@ The screen adapts: three columns while the diff can keep 56 of them, otherwise F
 | `v` · Esc | into review mode on the PR under the cursor · back to the graph |
 | `1` `2` `3` · Tab | Files · Diff · Findings · cycle |
 | Enter | see the table above |
+| `space` · `P` | pick a finding for posting / unpick it · post the picked ones (or the one under the cursor) — the text first, then yes or no |
 | `x` | ignore this finding, or take the ignore back (remembered per PR, across new commits) |
 | `R` · `r` | run the review (it asks first) · reload the PR and its diff, keeping the cached findings |
 | `d` · `i` | read the whole finding — body, evidence, suggested fix · the same in your `lang`. What `P` posts is always the original |
@@ -215,6 +217,8 @@ The screen adapts: three columns while the diff can keep 56 of them, otherwise F
 gg review 779             # the TUI in review mode on PR #779
 gg review 779 --print     # run the review and print it (--no-ai: the diff only, no AI call)
 gg review 779 --print --no-verify   # skip the pass that tries to disprove each finding
+gg review 779 --post [--yes]        # post the findings as one review (asks unless --yes)
+gg review 779 --post --dry-run      # print the exact mutation payload and stop
 gg review 779 --json      # the same as JSON (files, hunks are re-read from the worktree)
 gg review 779 --refresh   # ignore what is cached for this head and read it again
 ```
@@ -228,6 +232,9 @@ Remarks about style and design are held to the same discipline as the kernel pro
 It costs real money and minutes, so nothing starts on its own: `R` asks first (with the file and call count), the result is cached against the head SHA, and `r` only reloads the PR. Measured on a private kernel-style repo with claude sonnet — the review pass: 2 files / +163 -166 in 7m14s reporting nothing, 4 files / +466 -155 in 6m39s reporting one real inconsistency between two sibling functions the same PR added, with a four-hop evidence chain and an applicable diff. The check pass on that repo: two findings in parallel, 1m23s, $0.85 — it confirmed the real one (tracing two hops further than the claim did) and threw out a planted "add a NULL check" by following the callers up and noting that no other function in the file checks that pointer either.
 
 Everything else in review mode works without an AI CLI at all.
+Posting is deliberately slow to trigger. `space` picks a finding (confirmed ones start picked), `P` shows **exactly** the text that would leave the machine — scrollable, because approving something you could not scroll is not approval — and only then asks yes or no. It goes as one `addPullRequestReview` with an inline thread per finding: one review, one notification, and only on lines the diff touches, which is what GitHub accepts. It is all or nothing: if GitHub refuses the review, nothing is marked as posted. What was posted is remembered by content, so a review of the same PR after new commits will not offer it again.
+
+The comment carries no tool signature — it goes out under your own GitHub account, and `review_signature` is yours to set if you want a footer. On the command line, `--post` prints the same text and asks on the terminal (`--yes` skips the question, `--dry-run` prints the exact mutation payload and stops).
 
 While review mode is open, `gg mcp` reports it: `gg_state` names the PR, its files, the finding counts and the finding under the cursor, and `gg_context` takes `finding:<fid>` for one finding in full or `file:<path>` for the reviewed file straight out of the worktree.
 

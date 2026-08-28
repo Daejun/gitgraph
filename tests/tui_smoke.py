@@ -741,7 +741,8 @@ def review_with_a_clone():
     review through the (fake) AI CLI and anchors its findings onto changed lines."""
     home = testenv.make_home()
     root = fake_clone(home)
-    s = Session(["--no-summary", "-t", "none", "5"], home=home, cwd=root)
+    gh_log = os.path.join(home, "gh-calls.log")
+    s = Session(["--no-summary", "-t", "none", "5"], home=home, cwd=root, FAKE_GH_LOG=gh_log)
     try:
         s.wait_for("6 People", 30)
         s.settle()
@@ -775,6 +776,18 @@ def review_with_a_clone():
         s.key("d", 1.0)                       # the panel only has room for the title
         check("d reads the whole finding", "the fake AI CLI always says this" in s.text(), s.text()[:900])
         s.key("\x1b", 0.6)
+
+        s.key("P", 1.2)                       # posting shows the exact text first
+        txt = s.text()
+        check("P shows what would be posted", "about to post to test/repo#5" in txt
+              and "fake finding" in txt, txt[:900])
+        s.key("\x1b", 0.6)
+        check("then it asks", "Post 1 comment(s)" in s.text(), s.text()[:400])
+        s.key("\r", 1.2)                      # the popup starts on "no"
+        check("no means nothing was sent", "not posted" in s.text(), s.text()[:300])
+        calls = open(gh_log).read() if os.path.exists(gh_log) else ""
+        check("saying no sends nothing at all", "addPullRequestReview" not in calls, calls[-400:])
+
         s.key("x", 1.0)                       # ignore it
         check("x ignores a finding", "ignored" in s.text(), s.text()[:300])
         check("no traceback with a real worktree", "Traceback" not in s.log(),

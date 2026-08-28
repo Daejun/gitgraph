@@ -1,6 +1,6 @@
 # gg에 PR 리뷰 모드를 넣는 계획
 
-상태: 1~4단계 구현됨 — worktree·3열 diff·내장 프로토콜 pass 1·검증 pass 2·주관적 억제까지. 5~7단계(게시, 증분 재리뷰, review_cmd)가 남았다.
+상태: 1~5단계 구현됨 — worktree·3열 diff·pass 1·pass 2·게시까지. 6~7단계(증분 재리뷰, review_cmd)가 남았다.
 
 결정된 것(인터뷰):
 

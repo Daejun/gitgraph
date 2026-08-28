@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.24.0"
+VERSION = "0.25.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -66,6 +66,8 @@ CONFIG_KEYS = {
     "review_verify_model": ("GITGRAPH_REVIEW_VERIFY_MODEL", "sonnet", "review: model for that check (claude only)"),
     "review_max_bytes": ("GITGRAPH_REVIEW_MAX_BYTES", "400000",
                          "review: split the diff by file and review the parts in parallel beyond this size"),
+    "review_signature": ("GITGRAPH_REVIEW_SIGNATURE", "",
+                         "review: footer added to every posted comment (empty = none; the comment goes out under your own account)"),
     "review_subjective": ("GITGRAPH_REVIEW_SUBJECTIVE", "auto",
                           "review: style/design remarks — auto (hidden while a confirmed defect stands) | always | never"),
     "review_files_width": ("GITGRAPH_REVIEW_FILES_WIDTH", "0.22", "review: fraction of the width for the Files column"),
@@ -562,15 +564,18 @@ def _prefer_account(host, user, repo=None):
             pass
 
 
-def graphql(query, variables=None, host=DEFAULT_HOST):
+def graphql(query, variables=None, host=DEFAULT_HOST, repo=None):
     """Run a GraphQL query through `gh api graphql` against `host` (github.com or a GitHub Enterprise host).
 
     If the active account gets NOT_FOUND (private repo not visible), retry
     with the other accounts registered for that host; the account that works
     is moved to the front for the rest of the process.
+
+    `repo` names what the call is about when the query itself does not — a mutation carries a node id,
+    not repository(owner:…,name:…), so without it the remembered account for that repo cannot be used.
     """
     accts = gh_accounts(host) or [None]
-    repo = _query_repo(query, variables)
+    repo = repo or _query_repo(query, variables)
     fav = (_pref_map().get(host) or {}).get(repo) or _acct_hint.get(host)
     if fav in accts and accts[0] != fav:                # the account that saw this repo last time
         accts = [fav] + [a for a in accts if a != fav]
@@ -3064,6 +3069,93 @@ def cap_subjective(rv):
     return rv
 
 
+
+# ---------------------------------------------------------------- posting
+# One addPullRequestReview with every chosen finding as an inline thread: a single review, a single
+# notification, and no REST plumbing. GitHub takes a comment only on a line the diff touches, which is
+# what anchor_findings() has already guaranteed for anything postable.
+REVIEW_SIGNATURE = cfg("review_signature")
+
+POST_MUTATION = """
+mutation($pr:ID!,$body:String,$threads:[DraftPullRequestReviewThread!]){
+  addPullRequestReview(input:{pullRequestId:$pr, event:COMMENT, body:$body, threads:$threads}){
+    pullRequestReview{ url } } }
+"""
+
+
+def comment_body(f):
+    """What one finding looks like on the pull request. No tool signature: this goes out under the
+    user's own account, and review_signature is theirs to set."""
+    parts = [f.title.strip(), "", f.body.strip()]
+    diff = (f.diff or "").strip()
+    if diff:
+        parts += ["", "```diff", diff, "```"]
+    if REVIEW_SIGNATURE:
+        parts += ["", REVIEW_SIGNATURE]
+    return "\n".join(parts).strip()
+
+
+def post_payload(rv, findings):
+    """The exact variables the mutation will be sent, so --dry-run and the confirmation show the truth."""
+    threads = []
+    for f in findings:
+        t = {"path": f.path, "line": int(f.line), "side": f.side, "body": comment_body(f)}
+        if f.end_line and int(f.end_line) > int(f.line):
+            t["startLine"], t["startSide"] = int(f.line), f.side
+            t["line"] = int(f.end_line)
+        threads.append(t)
+    return {"pr": rv.pr_id, "body": REVIEW_SIGNATURE or None, "threads": threads}
+
+
+def postable_findings(rv, fids=None):
+    """Open, anchored, not disproved — and not something already posted under another head."""
+    posted, _, _ = review_history(rv.repo, rv.number)
+    out = []
+    for f in rv.findings:
+        if fids is not None and f.fid not in fids:
+            continue
+        if not f.postable or f.digest in posted:
+            continue
+        out.append(f)
+    return out
+
+
+def post_findings(rv, findings, dry_run=False):
+    """Post them as one review. Returns (url, error): nothing is marked posted unless GitHub took it."""
+    if not findings:
+        return None, "nothing to post"
+    if not rv.pr_id:
+        return None, "the pull request id is missing — reload the PR (r) first"
+    payload = post_payload(rv, findings)
+    if dry_run:
+        return None, None
+    try:
+        d = graphql(POST_MUTATION, payload, repo_host(rv.repo), repo=rv.repo)
+    except GhError as e:
+        return None, str(e)
+    url = (((d or {}).get("addPullRequestReview") or {}).get("pullRequestReview") or {}).get("url")
+    now = time.time()
+    for f in findings:                       # all or nothing: the mutation either took every thread or none
+        f.state, f.posted_at, f.thread_url = "posted", now, url
+    save_review(rv)
+    return url, None
+
+
+def post_preview(rv, findings, width=100):
+    """Every character that would leave this machine, for the confirmation to show."""
+    lines = [f"{len(findings)} inline comment(s) as one review on {rv.repo}#{rv.number}",
+             f"as the gh account that can see it; head {(rv.head_oid or '')[:12]}", ""]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"--- {i}. {f.path}:{f.line} ({f.side})"
+                     + ("  ⚠ moved onto the nearest changed line" if f.anchor == "moved" else "") + " ---")
+        for ln in comment_body(f).splitlines():
+            lines += wrap(ln, width) if len(ln) > width else [ln]
+        lines.append("")
+    if REVIEW_SIGNATURE:
+        lines += [f"review body: {REVIEW_SIGNATURE}"]
+    return lines
+
+
 # ---------------------------------------------------------------- CLI
 PR_TARGET_RE = re.compile(r"^(?:(?P<repo>[\w.-]+/[\w.-]+(?:/[\w.-]+)?)?#|#?)(?P<num>\d+)$")
 
@@ -3114,8 +3206,8 @@ def review_summary_rows(rv):
     return rows
 
 
-def do_review(target, repos, refresh=False, as_json=False, no_ai=False, verify=True, to_tui=False,
-              opts=None, color=True):
+def do_review(target, repos, refresh=False, as_json=False, no_ai=False, verify=True, post=False,
+              yes=False, dry_run=False, to_tui=False, opts=None, color=True):
     """gg review <PR>: the TUI in review mode, or the result on stdout (--print / --json)."""
     repo, number = parse_pr_target(target, repos)
     if to_tui:
@@ -3144,6 +3236,40 @@ def do_review(target, repos, refresh=False, as_json=False, no_ai=False, verify=T
     if rv.error:
         print(f"error: {rv.error}", file=sys.stderr)
         return 1
+    if post:
+        return post_cmd(rv, yes=yes, dry_run=dry_run)
+    return 0
+
+
+def post_cmd(rv, yes=False, dry_run=False):
+    """gg review PR --post: the same text the TUI would show, then a yes/no on the terminal."""
+    picked = postable_findings(rv)
+    if not picked:
+        print("nothing to post (open, anchored, not already posted)", file=sys.stderr)
+        return 1
+    if dry_run:
+        print(json.dumps(post_payload(rv, picked), ensure_ascii=False, indent=1))
+        return 0
+    print("\n" + "\n".join(post_preview(rv, picked)))
+    for f in picked:
+        print(f"  {f.fid}  [{f.severity}/{f.verdict or 'unverified'}] {f.path}:{f.line}")
+    if not yes:
+        sys.stderr.write(f"\npost {len(picked)} comment(s) to {rv.repo}#{rv.number} as one review, "
+                         f"from your GitHub account? [y/N] ")
+        sys.stderr.flush()
+        try:
+            with open("/dev/tty") as tty:
+                ans = tty.readline().strip().lower()
+        except OSError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("not posted")
+            return 1
+    url, err = post_findings(rv, picked)
+    if err:
+        print(f"error: posting failed, nothing was sent: {err}", file=sys.stderr)
+        return 1
+    print(f"posted {len(picked)} comment(s): {url or 'done'}")
     return 0
 
 
@@ -4762,6 +4888,18 @@ class Tui:
         if k == ord("R"):
             self.run_review_bg()
             return True
+        if k == ord(" ") and self.focus == "rfind":
+            f = self.review_finding()
+            if f is None or not f.postable:
+                self.msg = "only an open finding anchored on a changed line can be posted"
+                return True
+            self.rv_checked ^= {f.fid}
+            self.refresh_review()
+            self.msg = f"{len(self.rv_checked)} finding(s) picked — P posts them"
+            return True
+        if k == ord("P"):
+            self.post_findings_ui()
+            return True
         if k in (ord("d"), ord("i")) and self.focus == "rfind":
             self.review_details(translate=k == ord("i"))
             return True
@@ -4796,6 +4934,37 @@ class Tui:
                 self.msg = f"copied {url} ({', '.join(copy_to_clipboard(url)) or 'no clipboard tool'})"
             return True
         return None
+
+    def post_findings_ui(self):
+        """P: post the picked findings (or the one under the cursor) as one review. Two steps on
+        purpose — the whole text first, scrollable, then a plain yes/no. Nothing that leaves this
+        machine should be approved from a box you could not scroll."""
+        rv = self.rv
+        if rv is None:
+            return
+        picked = postable_findings(rv, self.rv_checked or None)
+        if not picked and not self.rv_checked:
+            f = self.review_finding()
+            picked = postable_findings(rv, {f.fid}) if f else []
+        if not picked:
+            self.msg = ("nothing to post — pick with space (only open, anchored, not-yet-posted "
+                        "findings can go)")
+            return
+        self.popup_text(f"about to post to {rv.repo}#{rv.number} — read it, then say yes or no",
+                        post_preview(rv, picked, max(self.panels["rdiff"].rect[3] - 4, 60)))
+        if not self.confirm(f"Post {len(picked)} comment(s) to {rv.repo}#{rv.number} "
+                            f"as one review, from your GitHub account?"):
+            self.msg = "not posted"
+            return
+        self.msg = "posting…"
+        self.draw()
+        url, err = post_findings(rv, picked)
+        if err:
+            self.msg = f"posting failed, nothing was sent: {err.splitlines()[0][:160]}"
+        else:
+            self.rv_checked.clear()
+            self.msg = f"posted {len(picked)} comment(s): {url or 'done'}"
+        self.refresh_review(keep=False)
 
     def review_details(self, translate=False):
         """d / i on a finding: the whole thing — the panel only has room for its title.
@@ -6213,7 +6382,7 @@ class Tui:
         "item": "⏎ read in main  m mark  i translate  a ask  o browser  d details",
         "rfiles": "⏎ show this file's diff  r reload  R refetch  o browser  v back to the graph",
         "rdiff": "⏎ fold/unfold a hunk  J K scroll  o open this line on GitHub  v back to the graph",
-        "rfind": "⏎ jump to the line  d read it  i in " + TR_LANG + "  V check again  x ignore  [ ] tab  v back",
+        "rfind": "⏎ line  d read  i " + TR_LANG + "  space pick  P post  V recheck  x ignore  [ ] tab  v back",
     }
 
     def state_snapshot(self):
@@ -6616,6 +6785,8 @@ class Tui:
         ("rfind", "d", "read the whole finding (body, evidence, suggested fix)", ord("d")),
         ("rfind", "i", f"the same in {TR_LANG} — what P posts is always the original", ord("i")),
         ("rfind", "V", "check this finding again (a fresh call that tries to disprove it)", ord("V")),
+        ("rfind", "space", "pick this finding for posting / unpick it (confirmed ones start picked)", ord(" ")),
+        ("review", "P", "post the picked findings to the pull request as one review", ord("P")),
         ("rfind", "x", "ignore this finding / take it back", ord("x")),
     ]
 
@@ -6683,6 +6854,8 @@ class Tui:
                     self.rv_path = None
                 if self.rv is not None and self.rv.status == "done" and self.rv.t1 and not self._told_review:
                     self._told_review = True
+                    self.rv_checked = {f.fid for f in postable_findings(self.rv)
+                                       if f.verdict == "CONFIRMED"}
                     cnt = self.rv.counts()          # not `c`: that is the curses module in this loop
                     self.msg = (f"review done in {int(self.rv.t1 - (self.rv.t0 or self.rv.t1))}s: "
                                 f"{cnt['open']} open, {cnt['dropped']} dropped"
@@ -7590,6 +7763,11 @@ def main(argv=None):
     ap.add_argument("--no-ai", action="store_true", help="review: the diff only, never call the AI CLI")
     ap.add_argument("--no-verify", action="store_true",
                     help="review: skip the pass that tries to disprove each finding")
+    ap.add_argument("--post", action="store_true",
+                    help="review: post the findings to the PR as one review (asks first)")
+    ap.add_argument("--yes", action="store_true", help="review --post: do not ask")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="review --post: print what would be sent and stop")
     a = ap.parse_intermixed_args(argv)
     cache_hygiene()
     if a.theme:
@@ -7663,7 +7841,7 @@ def main(argv=None):
             if not a.arg:
                 ap.error('review needs a PR: gg review 123 (also #123, owner/name#123, a pull request URL)')
             return do_review(a.arg, a.repo, refresh=a.refresh, as_json=a.json, no_ai=a.no_ai,
-                             verify=not a.no_verify,
+                             verify=not a.no_verify, post=a.post, yes=a.yes, dry_run=a.dry_run,
                              to_tui=not (a.print_ or a.json), opts=a,
                              color=a.color == "always" or (a.color == "auto" and sys.stdout.isatty()))
         elif a.cmd == "show":

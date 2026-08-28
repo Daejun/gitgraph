@@ -429,5 +429,145 @@ class TestSubjectiveDiscipline(RunReviewCase):
                        gg.Finding(severity="style", path="fs/f2fs/data.c", line=221, title="remark")]
         self.assertFalse(gg.subjective_held(rv))
 
+
+class TestPosting(RunReviewCase):
+    """What leaves the machine, and what is only marked as having left it."""
+
+    def review_with(self, *findings):
+        rv = review()
+        rv.pr_id = "PR_kwDO123"
+        rv.findings = list(findings)
+        gg.anchor_findings(rv)
+        return rv
+
+    def finding(self, **kw):
+        kw.setdefault("severity", "bug")
+        kw.setdefault("path", "fs/f2fs/data.c")
+        kw.setdefault("line", 221)
+        kw.setdefault("title", "lock leak")
+        kw.setdefault("body", "out_unlock keeps i_lock.")
+        return gg.Finding(**kw)
+
+    def graphql_returns(self, result=None, error=None):
+        self.sent = []
+
+        def fake(query, variables=None, host=gg.DEFAULT_HOST, repo=None):
+            self.sent.append({"query": query, "variables": variables, "host": host, "repo": repo})
+            if error:
+                raise gg.GhError(error)
+            return result or {"addPullRequestReview": {"pullRequestReview": {"url": "https://x/1"}}}
+
+        self._old_graphql = gg.graphql
+        gg.graphql = fake
+        self.addCleanup(lambda: setattr(gg, "graphql", self._old_graphql))
+
+    # -- the text -----------------------------------------------------
+    def test_a_comment_is_the_title_the_body_and_the_fix(self):
+        body = gg.comment_body(self.finding(diff="--- a\n+++ b\n"))
+        self.assertTrue(body.startswith("lock leak\n\nout_unlock keeps i_lock."))
+        self.assertIn("```diff\n--- a\n+++ b\n```", body)
+
+    def test_no_signature_unless_the_user_asked_for_one(self):
+        self.assertNotIn("gitgraph", gg.comment_body(self.finding()).lower())
+        self.assertNotIn("claude", gg.comment_body(self.finding()).lower())
+        old = gg.REVIEW_SIGNATURE
+        gg.REVIEW_SIGNATURE = "-- posted with gg"
+        try:
+            self.assertTrue(gg.comment_body(self.finding()).endswith("-- posted with gg"))
+        finally:
+            gg.REVIEW_SIGNATURE = old
+
+    def test_the_preview_is_built_from_the_same_text_that_is_sent(self):
+        rv = self.review_with(self.finding())
+        payload = gg.post_payload(rv, rv.findings)
+        preview = "\n".join(gg.post_preview(rv, rv.findings))
+        self.assertIn(payload["threads"][0]["body"].splitlines()[0], preview)
+        self.assertIn("fs/f2fs/data.c:221", preview)
+
+    # -- the payload --------------------------------------------------
+    def test_one_thread_per_finding_with_path_line_and_side(self):
+        rv = self.review_with(self.finding(), self.finding(title="other", line=222))
+        p = gg.post_payload(rv, rv.findings)
+        self.assertEqual(p["pr"], "PR_kwDO123")
+        self.assertIsNone(p["body"])
+        self.assertEqual([(t["path"], t["line"], t["side"]) for t in p["threads"]],
+                         [("fs/f2fs/data.c", 221, "RIGHT"), ("fs/f2fs/data.c", 222, "RIGHT")])
+
+    def test_a_range_becomes_startline_to_line(self):
+        rv = self.review_with(self.finding(line=221, end_line=222))
+        t = gg.post_payload(rv, rv.findings)["threads"][0]
+        self.assertEqual((t["startLine"], t["line"], t["startSide"], t["side"]), (221, 222, "RIGHT", "RIGHT"))
+
+    # -- what may be posted -------------------------------------------
+    def test_only_open_anchored_findings_are_offered(self):
+        rv = self.review_with(
+            self.finding(title="good"),
+            self.finding(title="dropped", verdict="FALSE"),
+            self.finding(title="ignored", state="ignored"),
+            self.finding(title="already posted", state="posted"),
+            self.finding(title="off the diff", path="nowhere.c"))
+        self.assertEqual([f.title for f in gg.postable_findings(rv)], ["good"])
+
+    def test_something_posted_under_an_earlier_head_is_not_offered_again(self):
+        rv = self.review_with(self.finding(state="posted", thread_url="https://x/1"))
+        gg.save_review(rv)
+        again = self.review_with(self.finding())          # same digest, fresh state
+        self.assertEqual(gg.postable_findings(again), [])
+
+    def test_a_subset_can_be_named(self):
+        a, b = self.finding(title="a"), self.finding(title="b", line=222)
+        rv = self.review_with(a, b)
+        self.assertEqual([f.title for f in gg.postable_findings(rv, {b.fid})], ["b"])
+
+    # -- sending ------------------------------------------------------
+    def test_a_successful_post_marks_them_and_remembers_the_url(self):
+        self.graphql_returns()
+        rv = self.review_with(self.finding())
+        url, err = gg.post_findings(rv, rv.findings)
+        self.assertIsNone(err)
+        self.assertEqual(url, "https://x/1")
+        self.assertEqual(rv.findings[0].state, "posted")
+        self.assertEqual(rv.findings[0].thread_url, "https://x/1")
+        posted, _, _ = gg.review_history(rv.repo, rv.number)
+        self.assertIn(rv.findings[0].digest, posted)
+
+    def test_the_mutation_says_which_repo_it_is_about(self):
+        self.graphql_returns()
+        rv = self.review_with(self.finding())
+        gg.post_findings(rv, rv.findings)
+        self.assertEqual(self.sent[0]["repo"], "test/repo")   # a mutation names no repository() itself
+        self.assertIn("addPullRequestReview", self.sent[0]["query"])
+
+    def test_a_failure_leaves_every_finding_untouched(self):
+        self.graphql_returns(error="Pull request review thread line must be part of the diff")
+        rv = self.review_with(self.finding())
+        url, err = gg.post_findings(rv, rv.findings)
+        self.assertIsNone(url)
+        self.assertIn("part of the diff", err)
+        self.assertEqual(rv.findings[0].state, "new")
+        posted, _, _ = gg.review_history(rv.repo, rv.number)
+        self.assertEqual(posted, {})
+
+    def test_a_dry_run_sends_nothing(self):
+        self.graphql_returns()
+        rv = self.review_with(self.finding())
+        gg.post_findings(rv, rv.findings, dry_run=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(rv.findings[0].state, "new")
+
+    def test_posting_nothing_is_refused_not_silently_ignored(self):
+        self.graphql_returns()
+        rv = self.review_with(self.finding())
+        self.assertEqual(gg.post_findings(rv, []), (None, "nothing to post"))
+        self.assertEqual(self.sent, [])
+
+    def test_a_missing_pr_id_is_refused(self):
+        self.graphql_returns()
+        rv = self.review_with(self.finding())
+        rv.pr_id = None
+        url, err = gg.post_findings(rv, rv.findings)
+        self.assertIn("pull request id", err)
+        self.assertEqual(self.sent, [])
+
 if __name__ == "__main__":
     unittest.main()
