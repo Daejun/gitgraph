@@ -11,6 +11,7 @@ Usage:
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
   gg todo                                 print the markdown of everything marked with m in the tui
   gg check [-r owner/name]                diagnose: gh accounts for the host, access, open counts, GraphQL fields
+  gg mcp                                  MCP stdio server for Claude Code in another window (claude mcp add -s user gg -- gg mcp)
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
 """
@@ -26,7 +27,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2245,6 +2246,9 @@ HELP = """gg tui — lazygit style layout
                   Item / Comments: read it in main      Links: go to that item      People: view as that person
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
   i               translate the main content (issue/PR body or comment) in full; press again for the original
+  C               open Claude Code in a tmux pane (or full screen) that can see what gg shows: it uses the
+                  `gg mcp` server (register once: claude mcp add -s user gg -- gg mcp) — tools gg_state, gg_context,
+                  gg_todo, gg_show, gg_graph, gg_open, gg_mark
   m               mark the selected issue/PR or comment for my next work and write a note; marked rows show ✎,
                   Home has a "todo" section, and ~/gitgraph-todo.md (gg config todo_file) is rewritten for the
                   next session (also `gg todo`). m again on a marked row: edit the note / mark done / remove
@@ -3582,6 +3586,9 @@ class Tui:
                                   "cursor, drag the border between the side column and main to resize. m marks an item or "
                                   "comment with a note; ~/gitgraph-todo.md is rewritten so the next session (or Claude) "
                                   "can pick the work up; gg todo prints it."),
+        (None, "Claude", "C opens Claude Code next to gg (a tmux pane, or full screen). Through the gg MCP server it "
+                         "sees what you are looking at (gg_state, gg_context), your marks (gg_todo), and can drive gg "
+                         "(gg_open, gg_mark). Register once: claude mcp add -s user gg -- gg mcp."),
     ]
 
     def popup_step(self, title, lines, last=False):
@@ -3628,9 +3635,86 @@ class Tui:
         "item": "⏎ read in main  m mark  i translate  a ask  o browser  d details",
     }
 
+    def state_snapshot(self):
+        g = self.g
+        def node_info(nid):
+            n = g.nodes.get(nid) if nid else None
+            if not n:
+                return None
+            if n.kind == "item":
+                return {"id": nid, "kind": "pr" if n.is_pr else "issue", "label": g.label_num(n), "title": n.title or "",
+                        "url": n.url or "", "text": (n.summary or excerpt(n.body, 200))}
+            if n.kind == "comment":
+                p = g.nodes.get(n.parent)
+                return {"id": nid, "kind": "comment", "label": f"comment by @{n.author} {rel_days(n, g)} on {g.label_num(p) if p else '?'}",
+                        "title": p.title if p else "", "url": n.url or "", "text": (n.summary or excerpt(n.body, 300))}
+            return {"id": nid, "kind": "person", "label": nid, "title": "", "url": "", "text": ""}
+        r = self.panels[self.focus].current()
+        return {"pid": os.getpid(), "updated": datetime.now().isoformat(timespec="seconds"), "updated_ts": time.time(),
+                "repos": self.o["repos"], "me": self.me, "focus": self.focus,
+                "inbox_tab": self.HOME_TABS[self.panels["home"].tab][1],
+                "item": node_info(self.item), "subject": node_info(self.subject),
+                "cursor_row": r.text.strip() if r else "", "answer": (self.answer or "")[:4000],
+                "todo_open": sum(1 for e in self.todo if not e.get("done"))}
+
+    def write_state(self):
+        st = self.state_snapshot()
+        sig = (st["item"], st["subject"], st["focus"], st["inbox_tab"], st["cursor_row"], st["me"], st["todo_open"], st["answer"])
+        if sig != getattr(self, "_state_sig", None) or time.time() - getattr(self, "_state_t", 0) > 20:
+            self._state_sig, self._state_t = sig, time.time()
+            try:
+                write_json(STATE_PATH, st)
+            except OSError:
+                pass
+
+    def poll_cmd(self):
+        """Commands from `gg mcp` (Claude in another window): open an item, mark it."""
+        cmd = read_json(CMD_PATH)
+        if not cmd:
+            return
+        try:
+            os.remove(CMD_PATH)
+        except OSError:
+            pass
+        msg = "unknown command"
+        try:
+            if cmd.get("op") == "open" and cmd.get("id") in self.g.nodes:
+                self.set_item(cmd["id"])
+                self.focus = "item"
+                msg = f"gg now shows {self.g.label_num(self.g.nodes[cmd['id']])}"
+            elif cmd.get("op") == "mark" and cmd.get("id") in self.g.nodes:
+                if not self.marked(cmd["id"]):
+                    self.todo.append(todo_entry(self.g, cmd["id"], cmd.get("note", "")))
+                    save_todo(self.todo)
+                    self.refresh_all()
+                msg = f"marked {self.g.label_num(self.g.nodes[cmd['id']]) if self.g.nodes[cmd['id']].kind == 'item' else cmd['id']}"
+            self.msg = f"claude: {msg}"
+        except Exception as e:  # noqa: BLE001
+            msg = f"failed: {e}"
+        write_json(CMD_RESULT_PATH, {"req": cmd.get("req"), "msg": msg})
+
+    def launch_claude(self):
+        """C: Claude Code in another pane (tmux) or full screen, connected through `gg mcp`."""
+        import shlex
+        cmd = f"claude {shlex.quote(CLAUDE_PROMPT)}"
+        if os.environ.get("TMUX"):
+            r = subprocess.run(["tmux", "split-window", "-h", "-c", os.getcwd(), cmd], capture_output=True, text=True)
+            self.msg = "claude opened in a tmux pane (it reads gg through the gg MCP server)" if r.returncode == 0 else f"tmux failed: {r.stderr.strip()}"
+            return
+        self.curses.endwin()
+        try:
+            subprocess.call(["claude", CLAUDE_PROMPT])
+        finally:
+            self.scr.clear()
+            self.scr.refresh()
+            sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h")
+            sys.stdout.flush()
+            self.msg = "back from claude"
+
     def draw(self):
         c = self.curses
         scr = self.scr
+        self.write_state()
         scr.erase()
         h, w = scr.getmaxyx()
         self.layout()
@@ -3832,6 +3916,7 @@ class Tui:
         ("*", "a", "ask claude about the selection", ord("a")),
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
         ("*", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
+        ("*", "C", "open Claude Code next to gg (tmux pane / full screen), connected via gg mcp", ord("C")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
         ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Inbox as another person", ord("u")),
         ("*", "F2", "guided tour of the screen", 0),
@@ -3874,10 +3959,11 @@ class Tui:
             if self.tr_thread is not None and not self.tr_thread.is_alive():
                 self.tr_thread = None
                 self.refresh_main()
-            self.scr.timeout(400 if self.busy() else -1)
+            self.scr.timeout(400 if self.busy() else 500)
             self.draw()
             k = self.read_key()
             if k == -1:
+                self.poll_cmd()
                 continue
             if not (k == c.KEY_MOUSE and self.mouse_ev and not self.mouse_ev[3]):   # a button release keeps the message
                 self.msg = ""
@@ -3974,6 +4060,8 @@ class Tui:
             self.ask()
         elif k == ord("m"):
             self.mark()
+        elif k == ord("C"):
+            self.launch_claude()
         elif k == ord("i"):
             self.translate_content()
         elif k == ord("d"):
@@ -4222,6 +4310,169 @@ def todo_entry(g, nid, note):
 
 
 # --------------------------------------------------------------------------
+# live state for other tools (Claude in another window) + commands back into the tui
+# --------------------------------------------------------------------------
+STATE_PATH = os.path.join(CACHE_DIR, "state.json")
+CMD_PATH = os.path.join(CACHE_DIR, "cmd.json")
+CMD_RESULT_PATH = os.path.join(CACHE_DIR, "cmd_result.json")
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def send_cmd(cmd, wait=3.0):
+    """Ask a running gg tui to do something (open / mark); returns its result or None when no tui answered."""
+    st = read_json(STATE_PATH) or {}
+    if time.time() - st.get("updated_ts", 0) > 30:
+        return None                                  # no tui has written state recently
+    try:
+        os.remove(CMD_RESULT_PATH)
+    except OSError:
+        pass
+    cmd["req"] = f"{time.time():.3f}"
+    write_json(CMD_PATH, cmd)
+    end = time.time() + wait
+    while time.time() < end:
+        res = read_json(CMD_RESULT_PATH)
+        if res and res.get("req") == cmd["req"]:
+            return res
+        time.sleep(0.1)
+    return None
+
+
+def state_text():
+    st = read_json(STATE_PATH)
+    if not st:
+        return "gg tui is not running (no state file)."
+    age = int(time.time() - st.get("updated_ts", 0))
+    lines = [f"gg tui state ({age}s ago{'; the tui may have exited' if age > 60 else ''}):",
+             f"repos: {', '.join(st.get('repos', []))}   viewing as: {', '.join('@' + m for m in st.get('me', []))}",
+             f"focused panel: {st.get('focus')}   Inbox tab: {st.get('inbox_tab')}"]
+    it = st.get("item")
+    if it:
+        lines.append(f"current item: {it['label']} — {it['title']}  ({it['url']})")
+    sub = st.get("subject")
+    if sub and sub.get("id") != (it or {}).get("id"):
+        lines.append(f"on screen (main): {sub['label']}: {sub.get('text', '')[:200]}  ({sub.get('url', '')})")
+    row = st.get("cursor_row")
+    if row:
+        lines.append(f"cursor row: {row}")
+    if st.get("answer"):
+        lines.append("last answer in gg:\n" + st["answer"][:1500])
+    lines.append(f"marks (todo): {st.get('todo_open', 0)} open — gg_todo for the list")
+    return "\n".join(lines)
+
+
+MCP_TOOLS = [
+    {"name": "gg_state", "description": "What the user is looking at right now in gg tui: repo, current issue/PR, the "
+                                         "comment or item shown in the main panel, focused panel, Inbox tab, last answer.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "gg_context", "description": "Full material for what is on screen in gg (or a given id): body, metadata, "
+                                           "the whole comment thread in order, linked issues/PRs with the sentence that made "
+                                           "each link. Use before answering questions about it.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "description": "777 / owner/repo#777 / @login; default: what gg shows"}}}},
+    {"name": "gg_todo", "description": "The user's marks made with m in gg tui (their next-work list with notes), as markdown.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "gg_show", "description": "Details of one issue/PR: every edge with the referencing sentence, comments, body.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "gg_graph", "description": "ASCII graph of how open issues/PRs/comments link together (tree), optionally around one item.",
+     "inputSchema": {"type": "object", "properties": {"root": {"type": "string"}, "hops": {"type": "integer"}}}},
+    {"name": "gg_open", "description": "Make gg tui show this issue/PR (its Item/Comments/Links panels follow).",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "gg_mark", "description": "Mark an issue/PR (or a comment url) in the user's gg todo list with a note.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}, "note": {"type": "string"}}}},
+]
+
+
+def mcp_call(name, a):
+    a = a or {}
+    st = read_json(STATE_PATH) or {}
+    repos = st.get("repos") or resolve_repos(None)
+    if name == "gg_state":
+        return state_text()
+    if name == "gg_todo":
+        entries = load_todo()
+        return render_todo_md(entries) if entries else "nothing marked yet"
+    if name == "gg_graph":
+        rows, _ = graph_rows(repos=repos, root=a.get("root"), hops=int(a.get("hops", 2)), translate="none")
+        return "\n".join(r.text for r in rows)
+    g = build_graph(repos, "open", 15)
+    if name == "gg_context":
+        nid = resolve_root(g, a["id"]) if a.get("id") else ((st.get("subject") or st.get("item") or {}).get("id"))
+        if not nid or nid not in g.nodes:
+            return "nothing on screen; pass an id"
+        kind, label, text = ask_context(g, nid)
+        return f"[{kind}] {label}\n\n{text}"
+    if name == "gg_show":
+        return render_show(g, resolve_root(g, a["id"]))
+    if name == "gg_open":
+        nid = resolve_root(g, a["id"])
+        res = send_cmd({"op": "open", "id": nid})
+        return res.get("msg", "done") if res else f"gg tui is not running; {nid} exists (gg {a['id']} opens it)"
+    if name == "gg_mark":
+        nid = resolve_root(g, a["id"])
+        res = send_cmd({"op": "mark", "id": nid, "note": a.get("note", "")})
+        if res:
+            return res.get("msg", "marked")
+        entries = load_todo()
+        entries.append(todo_entry(g, nid, a.get("note", "")))
+        return f"marked {nid} -> {save_todo(entries)}"
+    raise ValueError(f"unknown tool {name}")
+
+
+def mcp_serve():
+    """Minimal MCP stdio server (JSON-RPC over newline-delimited stdin/stdout); no dependencies."""
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
+                                                          "capabilities": {"tools": {}},
+                                                          "serverInfo": {"name": "gg", "version": VERSION}}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}})
+        elif method == "tools/call":
+            try:
+                text = mcp_call(params.get("name"), params.get("arguments"))
+                send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": text}]}})
+            except Exception as e:  # noqa: BLE001
+                send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}})
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif mid is not None:
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown method {method}"}})
+
+
+CLAUDE_PROMPT = ("You are paired with the terminal tool gg (GitHub issue/PR graph) that I am using in another window. "
+                 "Call the MCP tool gg_state to see what I am looking at, gg_context for its full thread and links, "
+                 "gg_todo for my marks; gg_open / gg_mark let you drive gg. Start by telling me in one paragraph what "
+                 "I am looking at and what needs doing.")
+
+
+# --------------------------------------------------------------------------
 # self-update
 # --------------------------------------------------------------------------
 def _run(cmd, **kw):
@@ -4284,7 +4535,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="tui",
                     help="tui [ROOT] (default) | ROOT (777 / #777 / owner/repo#777 / @login: tui on it) | graph [ROOT] "
-                         "(text graph) | show ID | ask ID \"question\" | tutorial | update | config [KEY [VALUE]] | todo | check")
+                         "(text graph) | show ID | ask ID \"question\" | tutorial | update | config [KEY [VALUE]] | todo | check | mcp")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
@@ -4323,7 +4574,7 @@ def main(argv=None):
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial", "mcp") and ROOT_RE.match(a.cmd):
         a.arg, a.cmd = a.cmd, "tui"      # `gg 777` = tui starting on #777
     if a.cmd == "graph" and a.arg and ROOT_RE.match(a.arg) and not a.root:
         a.root = a.arg                   # `gg graph 777`
@@ -4340,6 +4591,9 @@ def main(argv=None):
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+    if a.cmd == "mcp":
+        mcp_serve()
+        return 0
     if a.cmd == "todo":
         entries = load_todo()
         if not entries:
