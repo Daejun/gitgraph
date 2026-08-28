@@ -39,6 +39,7 @@ gg graph -l log           # git log --graph style timeline
 gg graph 768 --hops 1     # text graph around #768
 gg show 748               # one node in detail: every edge, comments, body
 gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with the item as context
+gg ai [NAME]              # list / pick the AI CLI: claude, cla, codex, gemini, grok, … (installed ones are shown)
 gg config [KEY [VALUE]]   # persistent settings
 gg todo                   # print the markdown of everything marked with m in the tui
 gg todo done|remove 750   # tick off / delete a mark (also: clear-done); Claude does the same through gg_todo_done
@@ -56,11 +57,12 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 
 | key | env | default | meaning |
 |---|---|---|---|
-| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | binary for translation / summaries / questions. A Claude-compatible variant (e.g. `cla`) gets the same arguments (`-p --no-session-persistence --output-format json <prompt>`) **except `--model`** — it keeps its own default model |
+| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | the AI CLI for translation / summaries / questions, chosen with `gg ai`: `claude` (`-p --output-format json --model …`), a claude-compatible variant such as `cla` (same arguments, **no `--model`**), `codex` (`codex exec … -o FILE`), `gemini` / `grok` / anything else (`-p PROMPT`). Only claude reports token usage |
 | `repos` | `GITGRAPH_REPOS` | | default repos, comma separated |
 | `me` | `GITGRAPH_ME` | gh accounts | logins that count as "me" in the TUI home |
 | `lang` | `GITGRAPH_LANG` | `Korean` | language of translations, summaries and answers |
 | `translate` | `GITGRAPH_TRANSLATE` | `zh` | `zh` (Chinese only) / `all` / `none` |
+| `auto_translate` | `GITGRAPH_AUTO_TRANSLATE` | `true` | TUI: translate the main content in the background whenever it is not in `lang`; `i` shows the original |
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | models (real `claude` only) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
@@ -141,7 +143,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | move · page · top/bottom · scroll sideways |
 | `K` `J` | scroll the main panel from anywhere |
 | Enter | see the table above |
-| `i` | translate the main content (issue/PR body or comment) in full into `lang`; again = original (cached in `translations_full.json`). Also the `[i 번역]` button in Main's title bar |
+| `i` | original ↔ translation of the main content. With `auto_translate` (default) anything not in `lang` is translated in the background as soon as it is shown (`⟳ 번역 중…` meanwhile; cached in `translations_full.json`). Also the `[i 번역]` button in Main's title bar |
 | `m` | mark the selected issue/PR or comment for my next work and write a note; marked rows show `✎`, Inbox gets a **todo** section (second tab, after my turn), and the markdown file `todo_file` (default `~/gitgraph-todo.md`; `gg todo` prints it) is rewritten so the next session — or Claude — can pick the work up. `m` again on a marked row: edit the note / mark done / remove. On the answer tab `m` saves the answer text into the mark's note. Source of truth: `~/.config/gitgraph/todo.json` |
 | `y` | copy the URL of the selection to the clipboard |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser (the URL is also the first, underlined line of the content) |

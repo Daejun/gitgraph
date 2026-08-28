@@ -106,7 +106,7 @@ def main():
     s.key("\x1b", 0.5)
     s.key("a", 0.5)
     s.key("x\r", 1.5)                # a real question would take a while; the answer tab must open without crashing
-    check("ask opens the answer tab", "[answer]" in s.line(0))
+    check("ask opens the answer tab", "[answer" in s.line(0))
     s.key("[", 0.5)
     # drag the border from the current position 15 columns to the right
     home_row = next(i for i, l in enumerate(s.text().splitlines()) if "3 Inbox" in l)
@@ -134,6 +134,17 @@ def main():
     check("clean exit", s.quit())
     log = open(os.path.expanduser("~/.cache/gitgraph/tui.log")).read()
     check("no traceback", "Traceback" not in log)
+    try:   # the test question above gets saved like any other: drop it again
+        import json
+        qp = os.path.expanduser("~/.config/gitgraph/qa.json")
+        qa = json.load(open(qp))
+        for k in list(qa):
+            qa[k] = [e for e in qa[k] if e.get("q") != "x"]
+            if not qa[k]:
+                del qa[k]
+        json.dump(qa, open(qp, "w"), ensure_ascii=False, indent=1)
+    except (OSError, ValueError):
+        pass
     print(f"\n{len(fails)} failure(s)" if fails else "\nall good")
     return 1 if fails else 0
 

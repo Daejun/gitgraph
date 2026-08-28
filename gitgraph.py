@@ -8,6 +8,7 @@ Usage:
   gg show 777                             details of one node
   gg ask 4563 "why does it mention #3859?"   # one-shot question to claude with the item as context
   gg update                               update this installation from GitHub
+  gg ai [NAME]                            list / pick the AI CLI (claude, cla, codex, gemini, grok, …)
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
   gg todo                                 print the markdown of everything marked with m in the tui
   gg todo done|remove ID                  tick off / delete a mark (ID: 750, #750, owner/name#750, comment url); clear-done drops ticked ones
@@ -29,19 +30,20 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
 CONFIG_PATH = os.path.expanduser("~/.config/gitgraph/config.json")
 # key -> (env var, default, help)
 CONFIG_KEYS = {
-    "claude_bin": ("GITGRAPH_CLAUDE", "claude", "binary used for translation / summaries / questions; a variant such as "
-                                               "`cla` gets the same arguments except --model (its own default model is used)"),
+    "claude_bin": ("GITGRAPH_CLAUDE", "claude", "AI CLI used for translation / summaries / questions: claude (or a claude-"
+                                               "compatible variant such as cla), codex, gemini, grok, … — pick with `gg ai`"),
     "repos": ("GITGRAPH_REPOS", "", "default repos, comma separated (owner/name or host/owner/name)"),
     "me": ("GITGRAPH_ME", "", "logins that count as \"me\", comma separated (default: gh accounts)"),
     "lang": ("GITGRAPH_LANG", "Korean", "language for translations, summaries and answers"),
     "translate": ("GITGRAPH_TRANSLATE", "zh", "zh | all | none"),
+    "auto_translate": ("GITGRAPH_AUTO_TRANSLATE", "true", "tui: translate the main content in the background whenever it is not in `lang`"),
     "tr_model": ("GITGRAPH_TR_MODEL", "haiku", "model for translation / summaries (claude only)"),
     "ask_model": ("GITGRAPH_ASK_MODEL", "sonnet", "model for `a` / `gg ask` (claude only)"),
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
@@ -77,6 +79,50 @@ def save_config():
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(CONFIG, f, indent=2, ensure_ascii=False)
+
+
+def ai_cmd(args):
+    """gg ai            list the AI CLIs gg knows, which are installed, which is selected; pick one by number
+       gg ai NAME       select NAME (claude | cla | codex | gemini | grok | any binary that takes -p PROMPT)"""
+    import shutil
+    known = ["claude", "cla", "codex", "gemini", "grok"]
+    cur = cfg("claude_bin")
+    if args:
+        choice = args[0]
+        if not shutil.which(choice):
+            print(f"{choice}: not found in PATH", file=sys.stderr)
+            return 1
+        CONFIG["claude_bin"] = choice
+        save_config()
+        print(f"AI CLI = {choice}  ({AI_BACKENDS.get(ai_backend(choice), ('generic: -p PROMPT', ''))[0]})")
+        return 0
+    rows = []
+    for name in known:
+        path = shutil.which(name)
+        how, login = AI_BACKENDS[name]
+        rows.append((name, path, how, login))
+    if cur not in known and shutil.which(cur):
+        rows.append((cur, shutil.which(cur), "generic: -p PROMPT", ""))
+    print("AI CLIs for translation / summaries / questions:\n")
+    for i, (name, path, how, login) in enumerate(rows, 1):
+        mark = "*" if name == cur else " "
+        state = path or "not installed"
+        print(f" {mark}{i}) {name:8} {state:32} {how}" + (f"   (login: {login})" if login and path else ""))
+    print(f"\n* = current ({cur}). Choose a number to switch, Enter to keep: ", end="", flush=True)
+    try:
+        with open("/dev/tty") as tty:
+            ans = tty.readline().strip()
+    except OSError:
+        ans = ""
+    if ans.isdigit() and 1 <= int(ans) <= len(rows):
+        name, path, how, login = rows[int(ans) - 1]
+        if not path:
+            print(f"{name} is not installed", file=sys.stderr)
+            return 1
+        CONFIG["claude_bin"] = name
+        save_config()
+        print(f"AI CLI = {name}")
+    return 0
 
 
 def config_cmd(args):
@@ -833,17 +879,63 @@ USAGE = {"calls": 0, "input": 0, "cache_read": 0, "cache_create": 0, "output": 0
 USAGE_T0 = time.time()
 
 
+AI_BACKENDS = {   # name -> (how it is run non-interactively, login hint)
+    "claude": ("Claude Code: claude -p --output-format json [--model M] PROMPT", "claude (then /login)"),
+    "cla":    ("claude-compatible variant: same arguments as claude, no --model", ""),
+    "codex":  ("OpenAI Codex CLI: codex exec --skip-git-repo-check --ephemeral -s read-only -o FILE PROMPT", "codex login"),
+    "gemini": ("Google Gemini CLI: gemini -p PROMPT", "gemini (sign in once)"),
+    "grok":   ("xAI grok CLI: grok -p PROMPT", "grok (API key / sign in)"),
+}
+
+
+def ai_backend(binpath=None):
+    """Which backend the configured AI CLI is: claude | cla | codex | gemini | grok | generic."""
+    b = os.path.basename(binpath or CLAUDE_BIN).lower()
+    for name in ("claude", "codex", "gemini", "grok"):
+        if b == name or b.startswith(name + "-") or b.startswith(name + "_"):
+            return name
+    return "cla" if b.startswith("cla") else "generic"
+
+
 def claude_call(prompt, model, phase, timeout=300):
-    """Run `claude -p` (Claude Code login, no API key); return the reply text and add its usage to USAGE."""
-    # no --bare: bare mode skips the stored login and answers "Not logged in"
-    cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json"]
-    if IS_CLAUDE:
-        cmd += ["--model", model]          # a variant binary (gg config claude_bin cla) keeps its own default model
+    """Run the configured AI CLI non-interactively; return the reply text and add its usage (claude only) to USAGE."""
+    kind = ai_backend()
+    outfile = None
+    if kind in ("claude", "cla"):
+        # no --bare: bare mode skips the stored login and answers "Not logged in"
+        cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json"]
+        if kind == "claude":
+            cmd += ["--model", model]      # variants keep their own default model
+        cmd.append(prompt)
+    elif kind == "codex":
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        outfile = os.path.join(CACHE_DIR, f"codex_last_{os.getpid()}_{int(time.time() * 1000)}.txt")
+        cmd = [CLAUDE_BIN, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "--color", "never",
+               "-o", outfile, prompt]
+    else:                                   # gemini, grok, anything else that takes -p PROMPT
+        cmd = [CLAUDE_BIN, "-p", prompt]
     try:
-        r = subprocess.run(cmd + [prompt], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
                            start_new_session=True)   # no controlling terminal: the child cannot touch our screen
     except FileNotFoundError:
-        raise ValueError(f"{CLAUDE_BIN} not found (gg config claude_bin …)") from None
+        raise ValueError(f"{CLAUDE_BIN} not found (gg ai to pick an AI CLI)") from None
+    if kind not in ("claude", "cla"):
+        text = ""
+        if outfile:
+            try:
+                with open(outfile) as f:
+                    text = f.read()
+                os.remove(outfile)
+            except OSError:
+                pass
+        text = (text or r.stdout or "").strip()
+        if not text or r.returncode:
+            err = (r.stderr or r.stdout or "").strip().splitlines()
+            raise ValueError((err[-1] if err else f"{CLAUDE_BIN} exited {r.returncode}")[:300])
+        rec = USAGE["by"].setdefault(phase, {"calls": 0, "input": 0, "cache_read": 0, "cache_create": 0, "output": 0, "cost_usd": 0.0})
+        for tgt in (USAGE, rec):
+            tgt["calls"] += 1
+        return text
     try:
         d = json.loads(r.stdout)
     except json.JSONDecodeError:
@@ -2447,8 +2539,9 @@ HELP = """gg tui — lazygit style layout
   a               ask claude about the selection (answer tab in main); every answer is saved with its question,
                   anchored to that issue/PR/comment (~/.config/gitgraph/qa.json) and shown again on its answer tab
   d               details pager     o  open in browser
-  i               translate the main content (issue/PR body or comment) in full; press again for the original
-                  (also the [i 번역] button in Main's title bar)
+  i               show the original / the translation of the main content (also the [i 번역] title button).
+                  With auto_translate (default on) any content that is not in your language is translated in the
+                  background as soon as it is shown; i still toggles back to the original
   C               open Claude Code in a tmux pane (or full screen) that can see what gg shows: it uses the
                   `gg mcp` server (register once: claude mcp add -s user gg -- gg mcp) — tools gg_state, gg_context,
                   gg_todo, gg_show, gg_graph, gg_open, gg_mark
@@ -2595,7 +2688,8 @@ class Tui:
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
         self.todo = load_todo()
-        self.show_tr = False   # main content: show the full-text translation (i toggles; runs claude on demand)
+        self.auto_tr = cfg("auto_translate").lower() not in ("false", "0", "no", "") and cfg("claude_bin")
+        self.show_tr = bool(self.auto_tr)   # main content: show the full-text translation (i toggles; auto in the background)
         self.last_side = "home"   # the side list panel that stays expanded while main is focused
         self.tr_thread, self.tr_pending = None, None
         self.collapsed = set()
@@ -3022,6 +3116,8 @@ class Tui:
         p = self.panels["main"]
         tab = self.MAIN_TABS[p.tab]
         if tab == "content":
+            if self.show_tr:
+                self.maybe_auto_translate()
             lines = self.content_lines(self.subject, max(p.rect[3], 40))
         else:
             lines = render_markdown(self.answer_text(), max(p.rect[3], 40))
@@ -3144,6 +3240,41 @@ class Tui:
             out.extend(render_markdown(self.reflow(body), width))
         return out
 
+    def needs_translation(self, n):
+        """A body with prose that is not in the target language (for Korean: no Hangul at all) and not translated yet."""
+        if not n or n.kind not in ("item", "comment") or n.tr_body or not (n.body or "").strip():
+            return False
+        prose = " ".join(t for is_p, t in _split_prose(n.body[:TR_FULL_CHARS]) if is_p)
+        if len(re.findall(r"[A-Za-z]", prose)) + 3 * len(re.findall(r"[一-鿿]", prose)) < 30:
+            return False
+        if TR_LANG.lower().startswith("korean"):
+            return not HANGUL_RE.search(prose)
+        return True
+
+    def maybe_auto_translate(self):
+        """Start translating the current subject in the background when it is not in the target language."""
+        if not self.auto_tr or self.o["translate"] == "none":
+            return
+        if self.tr_thread is not None and self.tr_thread.is_alive():
+            return
+        nid = self.subject or self.item
+        n = self.g.nodes.get(nid) if nid else None
+        if not self.needs_translation(n):
+            return
+        import threading
+        label = self.g.label_num(n) if n.kind == "item" else f"comment on {self.g.label_num(self.g.nodes[n.parent])}"
+        self.tr_pending = (label, time.time(), nid)
+
+        def work():
+            try:
+                n.tr_body = translate_body(n, self.g) or None
+            except Exception as e:  # noqa: BLE001
+                self.msg = f"translation failed: {e}"
+
+        self.tr_thread = threading.Thread(target=work, daemon=True)
+        self.tr_thread.start()
+        self.refresh_main()
+
     def translate_content(self):
         """i: toggle between the original and a full translation of the main content (translated on demand)."""
         nid = self.subject or self.item
@@ -3153,6 +3284,7 @@ class Tui:
             return
         if self.show_tr:
             self.show_tr = False
+            self.msg = "showing the original (i = translation again)"
             self.refresh_main()
             return
         self.show_tr = True
@@ -4414,7 +4546,7 @@ class Tui:
                 self.refresh_main()
             if self.tr_thread is not None and not self.tr_thread.is_alive():
                 self.tr_thread = None
-                self.refresh_main()
+                self.refresh_main()          # shows the translation, and starts the next one if the subject moved on
             elif self.tr_thread is not None and self.MAIN_TABS[self.panels["main"].tab] == "content":
                 top = self.panels["main"].top
                 self.refresh_main()
@@ -5227,7 +5359,7 @@ def main(argv=None):
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial", "mcp", "cache") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial", "mcp", "cache", "ai") and ROOT_RE.match(a.cmd):
         a.arg, a.cmd = a.cmd, "tui"      # `gg 777` = tui starting on #777
     if a.cmd == "graph" and a.arg and ROOT_RE.match(a.arg) and not a.root:
         a.root = a.arg                   # `gg graph 777`
@@ -5247,6 +5379,8 @@ def main(argv=None):
     if a.cmd == "mcp":
         mcp_serve()
         return 0
+    if a.cmd == "ai":
+        return ai_cmd([x for x in (a.arg,) if x])
     if a.cmd == "cache":
         return cache_cmd([x for x in (a.arg, a.question) if x is not None] + (a.extra or []))
     if a.cmd == "todo" and a.arg in ("done", "remove", "clear-done"):
