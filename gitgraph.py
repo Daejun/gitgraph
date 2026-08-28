@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -47,6 +47,7 @@ CONFIG_KEYS = {
     "tr_model": ("GITGRAPH_TR_MODEL", "haiku", "model for translation / summaries (claude only)"),
     "ask_model": ("GITGRAPH_ASK_MODEL", "sonnet", "model for `a` / `gg ask` (claude only)"),
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
+    "ai_parallel": ("GITGRAPH_AI_PARALLEL", "3", "tui: how many AI CLI calls may run at the same time"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
     "todo_file": ("GITGRAPH_TODO", "~/gitgraph-todo.md", "markdown written from the marks made with m in the tui (for the next session)"),
@@ -160,6 +161,7 @@ ENV_REPOS = [r.strip() for r in cfg("repos").split(",") if r.strip()]
 PAGE = 50
 ME = [m.strip().lower() for m in cfg("me").split(",") if m.strip()]
 ENRICH_BATCH = int(cfg("batch"))   # tui: nodes per translate/summary call
+AI_PARALLEL = max(1, int(cfg("ai_parallel") or 3))   # concurrent AI CLI calls
 
 
 def log(msg):
@@ -1002,6 +1004,18 @@ def usage_report():
     return lines
 
 
+import threading
+_cache_lock = threading.Lock()
+
+
+def cache_merge(path, updates):
+    """Merge `updates` into the JSON dict at path — safe for several threads finishing at the same time."""
+    with _cache_lock:
+        d = read_json(path) or {}
+        d.update(updates)
+        write_json(path, d)
+
+
 def claude_json(prompt, n, phase="translate"):
     """claude_call() whose reply must be a JSON array of n strings."""
     out = claude_call(prompt, TR_MODEL, phase)
@@ -1059,12 +1073,12 @@ def summarize_comments(entries, lang=TR_LANG):
         except Exception as e:  # noqa: BLE001 - best effort
             log(f"summary failed, keeping excerpts: {e}")
             break
+        new = {}
         for (k, d), sm in zip(batch, arr):
             if isinstance(sm, str) and sm.strip():
-                cache[f"{lang}:{k}"] = sm.strip()
+                new[f"{lang}:{k}"] = sm.strip()
                 out[k] = sm.strip()
-        with open(p, "w") as f:
-            json.dump(cache, f, ensure_ascii=False)
+        cache_merge(p, new)
     return out
 
 
@@ -1178,49 +1192,53 @@ def _split_prose(body):
 
 
 def translate_body(n, g, lang=TR_LANG):
-    """Full-text translation of an item/comment body: prose only, code fences and log lines stay as they are.
-    Cached in translations_full.json. Returns the text."""
+    """Full-text translation of an item/comment body: prose only (code fences and log lines stay), long bodies are
+    split into ~1,200-character chunks translated in parallel (AI_PARALLEL). Cached in translations_full.json."""
     body = (n.body or "")[:TR_FULL_CHARS]
     if not body.strip():
         return ""
     os.makedirs(CACHE_DIR, exist_ok=True)
     p = os.path.join(CACHE_DIR, "translations_full.json")
-    cache = {}
-    if os.path.exists(p):
-        with open(p) as f:
-            cache = json.load(f)
     key = f"{lang}:{hashlib.sha1(body.encode('utf-8')).hexdigest()}"
-    if key in cache:
-        return cache[key]
+    cached = (read_json(p) or {}).get(key)
+    if cached:
+        return cached
     kind = "comment" if n.kind == "comment" else ("pull request" if n.is_pr else "issue")
     pieces = _split_prose(body)
-    prose = [t for is_p, t in pieces if is_p and t.strip()]
-    if not prose:
+    prose_idx = [i for i, (is_p, t) in enumerate(pieces) if is_p and t.strip()]
+    if not prose_idx:
         return body
-    marked = "\n\n<<<SEG>>>\n\n".join(prose)
-    tr = claude_call(TR_FULL_PROMPT.format(kind=kind, lang=lang, body=marked) +
-                     "\n\n(The text contains <<<SEG>>> separators between independent parts: keep every separator "
-                     "exactly, in the same order.)", TR_MODEL, "translate", timeout=600).strip()
-    got = [x.strip() for x in tr.split("<<<SEG>>>")]
-    if len(got) != len(prose):
-        out = tr                      # separators lost: fall back to the plain translation
-    else:
-        it = iter(got)
-        out = "\n".join((next(it) if (is_p and t.strip()) else t) for is_p, t in pieces)
-    if out:
-        cache[key] = out
-        with open(p, "w") as f:
-            json.dump(cache, f, ensure_ascii=False)
+    # group consecutive prose pieces into chunks of ~2500 chars
+    chunks, cur, size = [], [], 0
+    for i in prose_idx:
+        t = pieces[i][1]
+        if cur and size + len(t) > 1200:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(i)
+        size += len(t)
+    if cur:
+        chunks.append(cur)
+
+    def translate_chunk(idx_list):
+        marked = "\n\n<<<SEG>>>\n\n".join(pieces[i][1] for i in idx_list)
+        tr = claude_call(TR_FULL_PROMPT.format(kind=kind, lang=lang, body=marked) +
+                         "\n\n(The text contains <<<SEG>>> separators between independent parts: keep every separator "
+                         "exactly, in the same order.)", TR_MODEL, "translate", timeout=600).strip()
+        got = [x.strip() for x in tr.split("<<<SEG>>>")]
+        return got if len(got) == len(idx_list) else [tr] + [""] * (len(idx_list) - 1)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=AI_PARALLEL) as ex:
+        results = list(ex.map(translate_chunk, chunks))
+    translated = {}
+    for idx_list, got in zip(chunks, results):
+        for i, t in zip(idx_list, got):
+            translated[i] = t
+    out = "\n".join(translated.get(i, t) if is_p else t for i, (is_p, t) in enumerate(pieces))
+    if out.strip():
+        cache_merge(p, {key: out})
     return out
-
-
-WHY_PROMPT = """Each entry below is a sentence from a GitHub issue, pull request or comment that mentions another item, \
-given as "ref" (like #748). For each entry write, in {lang}, one sentence of at most 90 characters that says WHY that item \
-is mentioned and what it is — e.g. "충돌 여부를 확인한 관련 PR", "이 버그를 고치는 PR", "같은 증상을 보고한 issue", "재현 절차 출처". \
-Keep #numbers, identifiers and technical terms in English; never use Chinese characters. \
-Output ONLY a JSON array of strings, same length and order as the input, no code fence.
-
-{payload}"""
 
 
 def around(ctx, ref, n=70):
@@ -1269,12 +1287,12 @@ def summarize_whys(entries, lang=TR_LANG):
         except Exception as e:  # noqa: BLE001
             log(f"link reasons failed: {e}")
             break
+        new = {}
         for (k, _), txt in zip(batch, arr):
             if isinstance(txt, str) and txt.strip():
-                cache[f"{lang}:{k}"] = txt.strip()
+                new[f"{lang}:{k}"] = txt.strip()
                 out[k] = txt.strip()
-        with open(p, "w") as f:
-            json.dump(cache, f, ensure_ascii=False)
+        cache_merge(p, new)
     return out
 
 
@@ -1352,12 +1370,12 @@ def translate_texts(texts, lang=TR_LANG):
         except Exception as e:  # noqa: BLE001 - translation is best effort
             log(f"translation failed, keeping originals: {e}")
             break
+        new = {}
         for t, tr in zip(batch, arr):
             if isinstance(tr, str) and tr.strip():
-                cache[f"{lang}:{t}"] = tr
+                new[f"{lang}:{t}"] = tr
                 out[t] = tr
-        with open(p, "w") as f:
-            json.dump(cache, f, ensure_ascii=False)
+        cache_merge(p, new)
     return out
 
 
@@ -2734,7 +2752,7 @@ class Tui:
         self.visible = []                  # panel keys drawn in the current layout
         self.title_zones = {}              # panel -> [(x0, x1, action)] clickable parts of its title bar
         self.msg, self.answer, self.answer_nid = "", None, None
-        self.progress, self.worker, self.t0, self.bg_error = None, None, time.time(), None
+        self.progress, self.jobs, self.t0, self.bg_error = None, [], time.time(), None
         self.last_refresh, self._new_g = time.time(), None
         self.enriched = set()
         self.ask_thread, self.ask_state = None, None
@@ -2762,7 +2780,8 @@ class Tui:
     def on_progress(self, phase, done, total, detail=""):
         self.progress = {"phase": phase, "done": done, "total": total, "detail": detail}
 
-    def run_bg(self, fn):
+    def run_bg(self, fn, note=""):
+        """Start fn in a background thread (an AI job or a fetch); finished jobs are reaped in the main loop."""
         import threading
 
         def body():
@@ -2772,15 +2791,20 @@ class Tui:
                 self.bg_error = str(e)
                 self.progress = {"phase": "error", "done": 0, "total": None, "detail": str(e)}
 
-        self.t0, self.progress, self.bg_error = time.time(), None, None
+        self.t0, self.bg_error = time.time(), None
         th = threading.Thread(target=body, daemon=True)
+        th.note = note
         th.start()
+        self.jobs.append(th)
         return th
 
     def busy(self):
-        return (self.worker is not None and self.worker.is_alive()) or \
+        return any(t.is_alive() for t in self.jobs) or \
                (self.ask_thread is not None and self.ask_thread.is_alive()) or \
                (self.tr_thread is not None and self.tr_thread.is_alive())
+
+    def ai_running(self):
+        return sum(1 for t in self.jobs if t.is_alive() and getattr(t, "note", "") != "fetch")
 
     def progress_text(self):
         sp = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time() * 8) % 10]
@@ -2791,6 +2815,10 @@ class Tui:
             el = int(time.time() - self.tr_pending[1])
             return f"{sp} translating {self.tr_pending[0]} in full ({model_label(TR_MODEL)})  {el}s"
         p = self.progress or {}
+        alive = [getattr(t, "note", "") for t in self.jobs if t.is_alive() and getattr(t, "note", "")]
+        if len(alive) > 1 and (p.get("phase") in ("translate", "summarize")):
+            el = int(time.time() - self.t0)
+            return f"{sp} {len(alive)} AI jobs ({model_label(TR_MODEL)}): " + ", ".join(alive[:4]) + f"  {el}s"
         el = int(time.time() - self.t0)
         els = f"{el // 60}m{el % 60:02d}s" if el >= 60 else f"{el}s"
         names = {"fetch": "fetching issues/PRs", "stubs": "resolving referenced items",
@@ -2817,12 +2845,12 @@ class Tui:
         scr.refresh()
 
     def load(self, refresh):
-        self.g, self.worker, self.enriched = None, None, set()
+        self.g, self.enriched = None, set()
 
         def work():
             self.g = build_graph(self.o["repos"], self.o["state"], self.o["max_age_min"], refresh)
 
-        th = self.run_bg(work)
+        th = self.run_bg(work, "fetch")
         self.scr.timeout(100)
         while th.is_alive():
             self.draw_loading("fetching from GitHub" if refresh else "loading")
@@ -2855,8 +2883,8 @@ class Tui:
 
     def refresh_bg(self, full=False):
         """r: fetch what changed on GitHub in the background and swap the graph in when done (R: everything)."""
-        if self.busy():
-            self.msg = "busy — try again in a moment"
+        if any(t.is_alive() and getattr(t, "note", "") == "fetch" for t in self.jobs):
+            self.msg = "a refresh is already running"
             return
         repos, state, max_age = self.o["repos"], self.o["state"], self.o["max_age_min"]
 
@@ -2879,7 +2907,7 @@ class Tui:
 
         self._new_g = None
         self.progress = {"phase": "fetch", "done": 0, "total": None, "detail": "checking GitHub for changes"}
-        self.worker = self.run_bg(work)
+        self.run_bg(work, "fetch")
         self.last_refresh = time.time()
 
     def rebuild_graph(self):
@@ -3283,16 +3311,23 @@ class Tui:
             return
         nid = self.subject or self.item
         n = self.g.nodes.get(nid) if nid else None
-        if not self.needs_translation(n):
+        if not self.needs_translation(n) or nid in getattr(self, "tr_failed", set()):
             return
+        self.start_translation(n, nid)
+
+    def start_translation(self, n, nid):
         import threading
         label = self.g.label_num(n) if n.kind == "item" else f"comment on {self.g.label_num(self.g.nodes[n.parent])}"
         self.tr_pending = (label, time.time(), nid)
+        self.tr_failed = getattr(self, "tr_failed", set())
 
         def work():
             try:
                 n.tr_body = translate_body(n, self.g) or None
+                if not n.tr_body:
+                    self.tr_failed.add(nid)
             except Exception as e:  # noqa: BLE001
+                self.tr_failed.add(nid)              # no automatic retry; i tries again by hand
                 self.msg = f"translation failed: {e}"
 
         self.tr_thread = threading.Thread(target=work, daemon=True)
@@ -3319,19 +3354,8 @@ class Tui:
         if self.tr_thread is not None and self.tr_thread.is_alive():
             self.msg = "a translation is still running"
             return
-        import threading
-        label = self.g.label_num(n) if n.kind == "item" else f"comment on {self.g.label_num(self.g.nodes[n.parent])}"
-        self.tr_pending = (label, time.time(), nid)
-
-        def work():
-            try:
-                n.tr_body = translate_body(n, self.g) or None
-            except Exception as e:  # noqa: BLE001
-                self.msg = f"translation failed: {e}"
-
-        self.tr_thread = threading.Thread(target=work, daemon=True)
-        self.tr_thread.start()
-        self.refresh_main()
+        getattr(self, "tr_failed", set()).discard(nid)
+        self.start_translation(n, nid)
 
     # ------------------------------------------------------------------ selection / history
     def snapshot(self):
@@ -3426,8 +3450,13 @@ class Tui:
 
     # ------------------------------------------------------------------ enrichment (visible rows first)
     def enrich(self):
+        """On demand, in parallel: translate / summarize the nodes in the current rows (on-screen first), a few
+        small AI jobs at a time (AI_PARALLEL)."""
         want_tr, want_sum = self.o["translate"] != "none", self.o["summary"]
-        if not (want_tr or want_sum) or self.busy():
+        if not (want_tr or want_sum):
+            return
+        free = AI_PARALLEL - self.ai_running()
+        if free <= 0:
             return
         ids = []
 
@@ -3447,12 +3476,23 @@ class Tui:
                     add(r.jump)
             for r in p.rows:
                 add(r.nid)
-        ids = set(ids[:ENRICH_BATCH])
         whys = [pr for pr in getattr(self, "link_pairs", []) if pr in self.g.ctx and pr not in self.g.why
                 and pr not in self.enriched] if want_sum else []
-        whys = whys[:ENRICH_BATCH]
-        if not ids and not whys:
-            return
+        chunk = max(1, ENRICH_BATCH // 2)
+        started = False
+        for _ in range(free):
+            batch = ids[:chunk]
+            ids = ids[chunk:]
+            wb = whys[:chunk] if not started else []
+            whys = whys[chunk:] if not started else whys
+            if not batch and not wb:
+                break
+            self.start_enrich_job(set(batch), wb, want_sum)
+            started = True
+        if started:
+            self.refresh_all_rows()
+
+    def start_enrich_job(self, ids, whys, want_sum):
         parents = {self.g.nodes[i].parent for i in ids if self.g.nodes[i].kind == "comment"} - {None}
         sub = subgraph(self.g, ids | parents)
         mode = self.o["translate"]
@@ -3460,8 +3500,7 @@ class Tui:
                    and not self.g.nodes[i].summary and self.g.nodes[i].body.strip()]
         for n in pending:
             n.summary_pending = True
-
-        self.why_pending = set(whys)
+        self.why_pending = getattr(self, "why_pending", set()) | set(whys)
 
         def work():
             try:
@@ -3473,12 +3512,21 @@ class Tui:
             finally:
                 for n in pending:
                     n.summary_pending = False
-                self.why_pending = set()
+                self.why_pending -= set(whys)
 
         self.enriched |= ids | set(whys)
-        self.worker = self.run_bg(work)
-        if pending or whys:
-            self.refresh_all()
+        note = f"{len(pending)} summaries" if pending else (f"{len(whys)} link reasons" if whys else f"{len(ids)} titles")
+        self.run_bg(work, note)
+
+    def refresh_all_rows(self):
+        """Rebuild the rows without starting new jobs (pending markers, finished results)."""
+        self.panels["repo"].rows = self.repo_rows()
+        self.panels["home"].set_rows(self.home_rows())
+        self.panels["links"].set_rows(self.links_rows())
+        self.panels["item"].rows = self.item_rows()
+        self.panels["comments"].set_rows(self.comments_rows())
+        self.panels["people"].set_rows(self.people_rows())
+        self.refresh_main()
 
     # ------------------------------------------------------------------ actions
     def enter(self):
@@ -4579,14 +4627,17 @@ class Tui:
     def _run(self):
         c = self.curses
         while True:
-            if self.worker is not None and not self.worker.is_alive():
-                self.worker, self.progress = None, None
+            finished = [t for t in self.jobs if not t.is_alive()]
+            if finished:
+                self.jobs = [t for t in self.jobs if t.is_alive()]
+                if not self.jobs:
+                    self.progress = None
                 if getattr(self, "_new_g", None) is not None:      # a background refresh finished: swap the graph in
                     self.g, self._new_g = self._new_g, None
                     self.enriched = set()
                     self.rebuild_graph()
                     self.msg = getattr(self, "_refresh_note", "refreshed")
-                self.refresh_all()
+                self.refresh_all()                                  # rows + next enrich jobs
             if not self.busy() and time.time() - getattr(self, "last_refresh", self.t0) > self.o["max_age_min"] * 60:
                 self.refresh_bg()                                   # auto: every max-age minutes, incrementally
             if self.ask_thread is not None and not self.ask_thread.is_alive():

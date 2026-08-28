@@ -64,7 +64,8 @@ gg update                 # 설치 갱신
 | `translate` | `GITGRAPH_TRANSLATE` | `zh` | `zh`(한자만) / `all` / `none` |
 | `auto_translate` | `GITGRAPH_AUTO_TRANSLATE` | `true` | TUI: main content가 `lang`이 아니면 보이는 즉시 백그라운드로 전문 번역; `i`로 원문 |
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | 모델(진짜 `claude`에만 적용) |
-| `batch` | `GITGRAPH_BATCH` | `10` | TUI: 번역/요약 호출당 노드 수 |
+| `batch` | `GITGRAPH_BATCH` | `10` | TUI: 번역/요약 호출당 노드 수(job마다 절반씩) |
+| `ai_parallel` | `GITGRAPH_AI_PARALLEL` | `3` | TUI: 동시에 돌리는 AI CLI 호출 수(요약·제목 번역·링크 이유; 긴 본문 번역은 덩어리로 나눠 병렬) |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (아래 참조) |
 | `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | `m`으로 표시한 것으로 만드는 markdown |

@@ -64,7 +64,8 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `translate` | `GITGRAPH_TRANSLATE` | `zh` | `zh` (Chinese only) / `all` / `none` |
 | `auto_translate` | `GITGRAPH_AUTO_TRANSLATE` | `true` | TUI: translate the main content in the background whenever it is not in `lang`; `i` shows the original |
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | models (real `claude` only) |
-| `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call |
+| `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call (split in halves across jobs) |
+| `ai_parallel` | `GITGRAPH_AI_PARALLEL` | `3` | TUI: how many AI CLI calls run at the same time (summaries, title translations, link reasons; long bodies are translated in parallel chunks) |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
 | `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | markdown written from the marks made with `m` |
