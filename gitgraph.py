@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.11.1"
+VERSION = "0.11.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -4114,6 +4114,8 @@ class Tui:
         b, x, y, press = ev
         h, w = self.scr.getmaxyx()
         mp = self.panels["main"]
+        if os.environ.get("GG_DEBUG"):
+            log(f"mouse b={b} x={x} y={y} press={press} main.rect={mp.rect} sel={self.sel} dragging={self.dragging}")
         if b & 32:                                   # motion with a button held
             if self.dragging and w > 40:
                 self.side_width = min(0.8, max(0.15, (x + 1) / w))
@@ -4138,7 +4140,7 @@ class Tui:
             return
         base = b & ~28
         bx = self.border_x()
-        if base == 0 and bx is not None and bx - 1 <= x <= bx + 1 and self.screen == "normal" and w > 84:
+        if base == 0 and bx is not None and bx - 1 <= x <= bx and self.screen == "normal" and w > 84:   # the two border columns
             self.dragging = True
             return
         key = self.panel_at(x, y)
