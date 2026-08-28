@@ -8,7 +8,7 @@ Usage:
   gg show 777                             details of one node
   gg ask 4563 "why does it mention #3859?"   # one-shot question to claude with the item as context
   gg update                               update this installation from GitHub
-  gg ai [NAME]                            list / pick the AI CLI (claude, cla, codex, gemini, grok, …)
+  gg ai [NAME]                            list / pick the AI CLI (claude, codex, gemini, grok, …)
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
   gg todo                                 print the markdown of everything marked with m in the tui
   gg todo done|remove ID                  tick off / delete a mark (ID: 750, #750, owner/name#750, comment url); clear-done drops ticked ones
@@ -30,15 +30,15 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
 CONFIG_PATH = os.path.expanduser("~/.config/gitgraph/config.json")
 # key -> (env var, default, help)
 CONFIG_KEYS = {
-    "claude_bin": ("GITGRAPH_CLAUDE", "claude", "AI CLI used for translation / summaries / questions: claude (or a claude-"
-                                               "compatible variant such as cla), codex, gemini, grok, … — pick with `gg ai`"),
+    "claude_bin": ("GITGRAPH_CLAUDE", "claude", "AI CLI used for translation / summaries / questions: claude, codex, "
+                                               "gemini, grok, or any binary taking -p PROMPT — pick with `gg ai`"),
     "repos": ("GITGRAPH_REPOS", "", "default repos, comma separated (owner/name or host/owner/name)"),
     "me": ("GITGRAPH_ME", "", "logins that count as \"me\", comma separated (default: gh accounts)"),
     "lang": ("GITGRAPH_LANG", "Korean", "language for translations, summaries and answers"),
@@ -83,9 +83,9 @@ def save_config():
 
 def ai_cmd(args):
     """gg ai            list the AI CLIs gg knows, which are installed, which is selected; pick one by number
-       gg ai NAME       select NAME (claude | cla | codex | gemini | grok | any binary that takes -p PROMPT)"""
+       gg ai NAME       select NAME (claude | codex | gemini | grok | any binary that takes -p PROMPT)"""
     import shutil
-    known = ["claude", "cla", "codex", "gemini", "grok"]
+    known = ["claude", "codex", "gemini", "grok"]
     cur = cfg("claude_bin")
     if args:
         choice = args[0]
@@ -880,8 +880,7 @@ USAGE_T0 = time.time()
 
 
 AI_BACKENDS = {   # name -> (how it is run non-interactively, login hint)
-    "claude": ("Claude Code: claude -p --output-format json [--model M] PROMPT", "claude (then /login)"),
-    "cla":    ("claude-compatible variant: same arguments as claude, no --model", ""),
+    "claude": ("Claude Code: claude -p --output-format json --model M PROMPT", "claude (then /login)"),
     "codex":  ("OpenAI Codex CLI: codex exec --skip-git-repo-check --ephemeral -s read-only -o FILE PROMPT", "codex login"),
     "gemini": ("Google Gemini CLI: gemini -p PROMPT", "gemini (sign in once)"),
     "grok":   ("xAI grok CLI: grok -p PROMPT", "grok (API key / sign in)"),
@@ -894,19 +893,16 @@ def ai_backend(binpath=None):
     for name in ("claude", "codex", "gemini", "grok"):
         if b == name or b.startswith(name + "-") or b.startswith(name + "_"):
             return name
-    return "cla" if b.startswith("cla") else "generic"
+    return "generic"
 
 
 def claude_call(prompt, model, phase, timeout=300):
     """Run the configured AI CLI non-interactively; return the reply text and add its usage (claude only) to USAGE."""
     kind = ai_backend()
     outfile = None
-    if kind in ("claude", "cla"):
+    if kind == "claude":
         # no --bare: bare mode skips the stored login and answers "Not logged in"
-        cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json"]
-        if kind == "claude":
-            cmd += ["--model", model]      # variants keep their own default model
-        cmd.append(prompt)
+        cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json", "--model", model, prompt]
     elif kind == "codex":
         os.makedirs(CACHE_DIR, exist_ok=True)
         outfile = os.path.join(CACHE_DIR, f"codex_last_{os.getpid()}_{int(time.time() * 1000)}.txt")
@@ -919,7 +915,7 @@ def claude_call(prompt, model, phase, timeout=300):
                            start_new_session=True)   # no controlling terminal: the child cannot touch our screen
     except FileNotFoundError:
         raise ValueError(f"{CLAUDE_BIN} not found (gg ai to pick an AI CLI)") from None
-    if kind not in ("claude", "cla"):
+    if kind != "claude":
         text = ""
         if outfile:
             try:

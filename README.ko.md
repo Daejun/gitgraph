@@ -39,7 +39,7 @@ gg graph -l log           # git log --graph 식 시간축
 gg graph 768 --hops 1     # #768 주변 텍스트 그래프
 gg show 748               # 노드 상세: edge 전부(참조가 나온 문장 포함), 코멘트, 본문
 gg ask 4563 "왜 #3859를 언급해?"   # 그 항목(본문+코멘트 전체)을 context로 claude에게 단발 질문
-gg ai [NAME]              # AI CLI 목록/선택: claude, cla, codex, gemini, grok, … (설치된 것 표시)
+gg ai [NAME]              # AI CLI 목록/선택: claude, codex, gemini, grok, … (설치된 것 표시)
 gg config [KEY [VALUE]]   # 설정 저장
 gg todo                   # tui에서 m으로 표시한 것들의 markdown 출력
 gg todo done|remove 750   # 마킹 완료 처리 / 삭제 (clear-done: 완료된 것 정리); Claude는 gg_todo_done으로 같은 일을 함
@@ -57,7 +57,7 @@ gg update                 # 설치 갱신
 
 | 키 | 환경변수 | 기본값 | 의미 |
 |---|---|---|---|
-| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | 번역·요약·질문에 쓰는 AI CLI, `gg ai`로 선택: `claude`(`-p --output-format json --model …`), claude 호환 변종 `cla`(같은 인자, **`--model` 없음**), `codex`(`codex exec … -o FILE`), `gemini`/`grok`/그 밖(`-p PROMPT`). 토큰 집계는 claude만 |
+| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | 번역·요약·질문에 쓰는 AI CLI, `gg ai`로 선택: `claude`(`-p --output-format json --model …`), `codex`(`codex exec … -o FILE`), `gemini`/`grok`/그 밖(`-p PROMPT`, 자체 기본 모델). 토큰 집계는 claude만 |
 | `repos` | `GITGRAPH_REPOS` | | 기본 repo, 콤마 구분 |
 | `me` | `GITGRAPH_ME` | gh 계정들 | TUI home에서 "나"로 볼 login |
 | `lang` | `GITGRAPH_LANG` | `Korean` | 번역·요약·답변 언어 |

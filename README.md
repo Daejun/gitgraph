@@ -39,7 +39,7 @@ gg graph -l log           # git log --graph style timeline
 gg graph 768 --hops 1     # text graph around #768
 gg show 748               # one node in detail: every edge, comments, body
 gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with the item as context
-gg ai [NAME]              # list / pick the AI CLI: claude, cla, codex, gemini, grok, … (installed ones are shown)
+gg ai [NAME]              # list / pick the AI CLI: claude, codex, gemini, grok, … (installed ones are shown)
 gg config [KEY [VALUE]]   # persistent settings
 gg todo                   # print the markdown of everything marked with m in the tui
 gg todo done|remove 750   # tick off / delete a mark (also: clear-done); Claude does the same through gg_todo_done
@@ -57,7 +57,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 
 | key | env | default | meaning |
 |---|---|---|---|
-| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | the AI CLI for translation / summaries / questions, chosen with `gg ai`: `claude` (`-p --output-format json --model …`), a claude-compatible variant such as `cla` (same arguments, **no `--model`**), `codex` (`codex exec … -o FILE`), `gemini` / `grok` / anything else (`-p PROMPT`). Only claude reports token usage |
+| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | the AI CLI for translation / summaries / questions, chosen with `gg ai`: `claude` (`-p --output-format json --model …`), `codex` (`codex exec … -o FILE`), `gemini` / `grok` / anything else (`-p PROMPT`, its own default model). Only claude reports token usage |
 | `repos` | `GITGRAPH_REPOS` | | default repos, comma separated |
 | `me` | `GITGRAPH_ME` | gh accounts | logins that count as "me" in the TUI home |
 | `lang` | `GITGRAPH_LANG` | `Korean` | language of translations, summaries and answers |
