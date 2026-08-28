@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1791,7 +1791,8 @@ def segments(row, g):
     if row.kind == "note":
         return [(t, "sum" if t.lstrip().startswith("↳ »") else "meta")]
     if row.kind == "url":
-        return [(t, "url")]
+        lead = t[:len(t) - len(t.lstrip())]
+        return ([(lead, "")] if lead else []) + [(t.strip(), "url")]
     if row.kind in ("md", "md_code"):
         return md_segments(t, row.kind == "md_code")
     if row.kind == "mention":
