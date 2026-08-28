@@ -142,6 +142,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | Enter | see the table above |
 | `i` | translate the main content (issue/PR body or comment) in full into `lang`; again = original (cached in `translations_full.json`) |
 | `m` | mark the selected issue/PR or comment for my next work and write a note; marked rows show `✎`, Inbox gets a **todo** section (second tab, after my turn), and the markdown file `todo_file` (default `~/gitgraph-todo.md`; `gg todo` prints it) is rewritten so the next session — or Claude — can pick the work up. `m` again on a marked row: edit the note / mark done / remove. Source of truth: `~/.config/gitgraph/todo.json` |
+| `y` | copy the URL of the selection to the clipboard |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser (the URL is also the first, underlined line of the content) |
 | Esc / `b` · `f` | back (previous item and perspective) · forward |
 | `u` · `r` | view Inbox as another person · refetch |
@@ -150,7 +151,7 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `C` | open Claude Code next to gg (a tmux pane, else full screen). Through the `gg mcp` server it sees what you look at (`gg_state`, `gg_context`), your marks (`gg_todo`) and can drive gg (`gg_open`, `gg_mark`). Register once: `claude mcp add -s user gg -- gg mcp` |
 | `?` · `O` · F1 · F2 | key menu for the focused panel (Enter runs the action) · options menu (comments / translation / summaries / people / hops / theme / screen) · full help text · guided tour (offered once on the first run; also `gg tutorial`; ⏎/→ next, ←/p prev, Esc stop) |
 | Hangul IME | shortcuts work while the keyboard is in Hangul mode: the jamo/syllable is mapped back to the 2-set layout keys (`ㅓ` = j, `ㅏ` = k, `자` = w k) |
-| mouse | click `‹` `›` in the Inbox title or a tab name in Main's title = switch tab; first click on another panel = focus it (its cursor stays); a click inside the focused panel = select that row; click on the URL text = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
+| mouse | drag inside Main = select text, copied to the clipboard on release (OSC 52 plus `wl-copy`/`xclip`/`xsel`/`pbcopy` when installed; tmux needs `set -g set-clipboard on`; Shift+drag keeps the terminal's own selection); click `‹` `›` in the Inbox title or a tab name in Main's title = switch tab; first click on another panel = focus it (its cursor stays); a click inside the focused panel = select that row; click on the URL text = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
 
 Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$`, F1) open as centred popups; Esc closes them.
 

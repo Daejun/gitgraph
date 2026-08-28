@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2345,6 +2345,39 @@ def char_at(s, col):
     return ""
 
 
+def slice_cols(s, c0, c1):
+    """Characters of s drawn between display columns c0 (inclusive) and c1 (exclusive)."""
+    out, c = [], 0
+    for ch in s:
+        w = _cw(ch)
+        if c + w > c0 and c < c1:
+            out.append(ch)
+        c += w
+    return "".join(out)
+
+
+def copy_to_clipboard(text):
+    """OSC 52 (works in xterm/Windows Terminal/kitty/… and through ssh) plus a local clipboard tool when present."""
+    import base64
+    import shutil
+    ok = []
+    try:
+        sys.stdout.write("\033]52;c;" + base64.b64encode(text.encode("utf-8")).decode() + "\007")
+        sys.stdout.flush()
+        ok.append("OSC52")
+    except OSError:
+        pass
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"], ["pbcopy"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode("utf-8"), timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ok.append(cmd[0])
+                break
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    return ok
+
+
 def clip(s, start, width):
     """The part of s that occupies display columns [start, start+width)."""
     out, col = [], 0
@@ -2424,7 +2457,10 @@ HELP = """gg tui — lazygit style layout
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
   Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, 자 = w k …)
-  mouse           click = focus a panel (its cursor stays); a click inside the focused panel selects the row;
+  y               copy the URL of the selection to the clipboard
+  mouse           drag in main = select text and copy it on release (OSC 52 + wl-copy/xclip/xsel/pbcopy; in tmux
+                  turn on set-clipboard; Shift+drag still uses the terminal's own selection);
+                  click = focus a panel (its cursor stays); a click inside the focused panel selects the row;
                   click ‹ › in the Inbox title (or a tab name in Main's title) = switch tab;
                   double-click = Enter; click on a URL's text = open it in the browser;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
@@ -2591,6 +2627,7 @@ class Tui:
         self.apply_theme()
         sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h")   # SGR mouse reports incl. drags, parsed in read_key()
         self.dragging = False
+        self.sel = None          # main-panel drag selection: {"start": (row, col), "end": (row, col), "live": bool}
         sys.stdout.flush()
         self.load(refresh=False)
 
@@ -3673,7 +3710,8 @@ class Tui:
         except self.curses.error:
             pass
 
-    def put_row(self, y, x, row, hs, width, extra=0, pad=False):
+    def put_row(self, y, x, row, hs, width, extra=0, pad=False, hl=None):
+        """hl = (c0, c1): display columns (before hs) drawn reversed, for the drag selection."""
         col, cx = 0, x
         for text, st in colorize_people(segments(row, self.g)):
             attr = self.style_attr(st) | extra
@@ -3683,22 +3721,60 @@ class Tui:
                 if col + cw > hs + width:
                     break
                 if col >= hs:
-                    buf.append(ch)
+                    buf.append((ch, hl is not None and hl[0] <= col < hl[1]))
                 elif col + cw > hs:
-                    buf.append(" ")
+                    buf.append((" ", False))
                 col += cw
-            if buf:
-                sub = "".join(buf)
+            i = 0
+            while i < len(buf):                       # runs of same highlight state
+                j = i
+                while j < len(buf) and buf[j][1] == buf[i][1]:
+                    j += 1
+                sub = "".join(ch for ch, _ in buf[i:j])
                 try:
-                    self.scr.addstr(y, cx, sub, attr)
+                    self.scr.addstr(y, cx, sub, attr | (self.curses.A_REVERSE if buf[i][1] else 0))
                 except self.curses.error:
                     pass
                 cx += dw(sub)
+                i = j
         if (extra or pad) and cx < x + width:
             try:
                 self.scr.addstr(y, cx, " " * (x + width - cx), extra)
             except self.curses.error:
                 pass
+
+    def sel_range(self, key, idx):
+        """Highlighted display-column range of row idx in panel key, or None."""
+        if key != "main" or not self.sel:
+            return None
+        (r0, c0), (r1, c1) = sorted([self.sel["start"], self.sel["end"]])
+        if idx < r0 or idx > r1:
+            return None
+        if r0 == r1:
+            return (min(c0, c1), max(c0, c1) + 1)
+        if idx == r0:
+            return (c0, 10 ** 6)
+        if idx == r1:
+            return (0, c1 + 1)
+        return (0, 10 ** 6)
+
+    def selection_text(self):
+        p = self.panels["main"]
+        (r0, c0), (r1, c1) = sorted([self.sel["start"], self.sel["end"]])
+        if r0 == r1:
+            c0, c1 = min(c0, c1), max(c0, c1)
+        parts = []
+        for idx in range(r0, min(r1, len(p.rows) - 1) + 1):
+            t = p.rows[idx].text
+            if r0 == r1:
+                parts.append(slice_cols(t, c0, c1 + 1))
+            elif idx == r0:
+                parts.append(slice_cols(t, c0, 10 ** 6))
+            elif idx == r1:
+                parts.append(slice_cols(t, 0, c1 + 1))
+            else:
+                parts.append(t)
+        return "\n".join(x.rstrip() for x in parts)
 
     def draw_box(self, key):
         p = self.panels[key]
@@ -3756,7 +3832,7 @@ class Tui:
             extra = 0
             if not p.scroll_only and idx == p.cur:
                 extra = c.A_REVERSE if focused else c.A_UNDERLINE
-            self.put_row(y + i, x, r, p.hs, ww, extra, pad=True)
+            self.put_row(y + i, x, r, p.hs, ww, extra, pad=True, hl=self.sel_range(key, idx))
         if len(p.rows) > hh:                          # scroll indicator on the right border
             pos = int((bh - 3) * min(p.top, max(len(p.rows) - hh, 1)) / max(len(p.rows) - hh, 1))
             self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
@@ -4037,14 +4113,28 @@ class Tui:
             return
         b, x, y, press = ev
         h, w = self.scr.getmaxyx()
-        if b & 32:                                   # motion with a button held: drag the side/main border
+        mp = self.panels["main"]
+        if b & 32:                                   # motion with a button held
             if self.dragging and w > 40:
                 self.side_width = min(0.8, max(0.15, (x + 1) / w))
+            elif self.sel and self.sel.get("live"):
+                self.sel["end"] = (mp.top + max(0, min(y - mp.rect[0], mp.rect[2] - 1)), max(0, x - mp.rect[1]) + mp.hs)
             return
         if not press:
             if self.dragging:
                 self.dragging = False
                 self.msg = f"side width {self.side_width:.2f}   (keep it: gg config side_width {self.side_width:.2f})"
+            elif self.sel and self.sel.get("live"):
+                self.sel["live"] = False
+                if self.sel["start"] == self.sel["end"]:      # no movement: a plain click on main
+                    self.sel = None
+                    self.focus = "main"
+                    self.mouse_ev = (0, x, y, True)
+                    self.click_main(x, y)
+                else:
+                    text = self.selection_text()
+                    how = copy_to_clipboard(text)
+                    self.msg = f"copied {len(text)} chars ({', '.join(how) or 'no clipboard tool'})"
             return
         base = b & ~28
         bx = self.border_x()
@@ -4052,6 +4142,10 @@ class Tui:
             self.dragging = True
             return
         key = self.panel_at(x, y)
+        if base == 0 and key == "main" and mp.rect[0] <= y < mp.rect[0] + mp.rect[2] and mp.rect[3]:
+            self.sel = {"start": (mp.top + (y - mp.rect[0]), max(0, x - mp.rect[1]) + mp.hs), "live": True}
+            self.sel["end"] = self.sel["start"]
+            return                                   # decided on release: click or copy
         if base in (64, 65):
             if key:
                 p = self.panels[key]
@@ -4084,6 +4178,9 @@ class Tui:
             self.update_subject()
             self.last_click = (0.0, -1, "")
             return
+        self.click_main(x, y, key)
+
+    def click_main(self, x, y, key="main"):
         idx = self.click_row(key, y)
         self.update_subject()
         p = self.panels[key]
@@ -4161,6 +4258,7 @@ class Tui:
         ("*", "+ _", "screen mode normal / half / full", ord("+")),
         ("*", "a", "ask claude about the selection", ord("a")),
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
+        ("*", "y", "copy the URL of the selection", ord("y")),
         ("*", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
         ("*", "C", "open Claude Code next to gg (tmux pane / full screen), connected via gg mcp", ord("C")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
@@ -4219,6 +4317,8 @@ class Tui:
     def handle_key(self, k):
         """Returns False to quit."""
         c = self.curses
+        if k != c.KEY_MOUSE and self.sel and not self.sel.get("live"):
+            self.sel = None
         h, w = self.scr.getmaxyx()
         p = self.panels[self.focus]
         page = max(p.rect[2] - 1, 1)
@@ -4302,6 +4402,10 @@ class Tui:
             self.launch_claude()
         elif k == ord("i"):
             self.translate_content()
+        elif k == ord("y"):
+            url = self.node_url(self.subject or self.item)
+            if url:
+                self.msg = f"copied {url} ({', '.join(copy_to_clipboard(url)) or 'no clipboard tool'})"
         elif k == ord("d"):
             self.details()
         elif k == ord("o"):
