@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.10.3"
+VERSION = "0.10.4"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2577,6 +2577,7 @@ class Tui:
     def draw_loading(self, what):
         scr = self.scr
         scr.erase()
+        self._size = None
         h, w = scr.getmaxyx()
         lines = [f"gg — {what}", "", self.progress_text(), "", "q = quit"]
         for i, t in enumerate(lines):
@@ -3215,9 +3216,11 @@ class Tui:
         bh, bw = min(want_h, h - 2), min(want_w, w - 2)
         return (h - bh) // 2, (w - bw) // 2, bh, bw
 
-    def popup_frame(self, title, want_h, want_w):
-        """Draw the current screen, then a centred box; returns the content rect (y, x, h, w)."""
-        self.draw()
+    def popup_frame(self, title, want_h, want_w, background=True):
+        """A centred box over the screen (the screen itself is redrawn only when background=True);
+        returns the content rect (y, x, h, w)."""
+        if background:
+            self.draw()
         c = self.curses
         by, bx, bh, bw = self.popup_rect(want_h, want_w)
         tl, tr, bl, br, hz, vt = BORDERS["rounded"] if self.border == BORDERS["hidden"] else self.border
@@ -3231,9 +3234,10 @@ class Tui:
 
     def popup_text(self, title, lines, hint="j/k PgUp/PgDn scroll  H L sideways  Esc/q/⏎ close"):
         c = self.curses
-        top, hs = 0, 0
+        top, hs, first = 0, 0, True
         while True:
-            y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2 if lines else 40)
+            y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2 if lines else 40, first)
+            first = False
             body = hh - 1
             for i in range(body):
                 if top + i >= len(lines):
@@ -3276,10 +3280,11 @@ class Tui:
     def popup_menu(self, title, items, cur=0):
         """items: [(label, value)]; returns the chosen value or None. j/k/digits/mouse, Enter picks, Esc cancels."""
         c = self.curses
-        top = 0
+        top, first = 0, True
         while True:
             width = max([dw(l) for l, _ in items] + [dw(title) + 4]) + 6
-            y, x, hh, ww = self.popup_frame(title, len(items) + 2, width)
+            y, x, hh, ww = self.popup_frame(title, len(items) + 2, width, first)
+            first = False
             if cur < top:
                 top = cur
             if cur >= top + hh:
@@ -3327,9 +3332,11 @@ class Tui:
         c = self.curses
         buf = list(initial)
         c.curs_set(1)
+        first = True
         try:
             while True:
-                y, x, hh, ww = self.popup_frame(label, 4, max(60, dw(label) + 4))
+                y, x, hh, ww = self.popup_frame(label, 4, max(60, dw(label) + 4), first)
+                first = False
                 text = "".join(buf)
                 shown = text if dw(text) < ww - 1 else text[-(ww - 2):]
                 self.put(y, x, shown, fill=ww)
@@ -3589,7 +3596,7 @@ class Tui:
         except self.curses.error:
             pass
 
-    def put_row(self, y, x, row, hs, width, extra=0):
+    def put_row(self, y, x, row, hs, width, extra=0, pad=False):
         col, cx = 0, x
         for text, st in colorize_people(segments(row, self.g)):
             attr = self.style_attr(st) | extra
@@ -3610,7 +3617,7 @@ class Tui:
                 except self.curses.error:
                     pass
                 cx += dw(sub)
-        if extra and cx < x + width:
+        if (extra or pad) and cx < x + width:
             try:
                 self.scr.addstr(y, cx, " " * (x + width - cx), extra)
             except self.curses.error:
@@ -3666,12 +3673,13 @@ class Tui:
         for i in range(hh):
             idx = p.top + i
             if idx >= len(p.rows):
-                break
+                self.put(y + i, x, "", 0, fill=ww)          # blank the rest of the panel (no erase() per frame)
+                continue
             r = p.rows[idx]
             extra = 0
             if not p.scroll_only and idx == p.cur:
                 extra = c.A_REVERSE if focused else c.A_UNDERLINE
-            self.put_row(y + i, x, r, p.hs, ww, extra)
+            self.put_row(y + i, x, r, p.hs, ww, extra, pad=True)
         if len(p.rows) > hh:                          # scroll indicator on the right border
             pos = int((bh - 3) * min(p.top, max(len(p.rows) - hh, 1)) / max(len(p.rows) - hh, 1))
             self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
@@ -3708,8 +3716,10 @@ class Tui:
         """One tutorial step. Returns "next", "prev" or "stop"."""
         c = self.curses
         hint = ("  ".join(x for x in ["⏎/→ next" if not last else "⏎ finish", "←/p prev" if not first else "", "Esc stop"] if x))
+        fresh = True
         while True:
-            y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2)
+            y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2, fresh)
+            fresh = False
             for i, l in enumerate(lines[:hh - 1]):
                 self.put(y + i, x, l)
             self.put(y + hh - 1, x, hint, self.dim())
@@ -3838,8 +3848,10 @@ class Tui:
         c = self.curses
         scr = self.scr
         self.write_state()
-        scr.erase()
         h, w = scr.getmaxyx()
+        if (h, w) != getattr(self, "_size", None):     # only a resize clears the screen; frames overwrite every cell
+            self._size = (h, w)
+            scr.erase()
         self.layout()
         widths = tuple(self.panels[k].rect[3] for k in self.SIDE + ["main"])
         if widths != getattr(self, "_widths", None):
