@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.10.1"
+VERSION = "0.10.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2357,6 +2357,7 @@ HELP = """gg tui — lazygit style layout
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
   Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, 자 = w k …)
   mouse           click = focus a panel (its cursor stays); a click inside the focused panel selects the row;
+                  click ‹ › in the Inbox title (or a tab name in Main's title) = switch tab;
                   double-click = Enter; click on a URL's text = open it in the browser;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
                   drag the border between the side column and main to resize (gg config side_width keeps it)
@@ -2501,6 +2502,7 @@ class Tui:
             "main": Panel("main", "Main", self.MAIN_TABS, scroll_only=True),
         }
         self.visible = []                  # panel keys drawn in the current layout
+        self.title_zones = {}              # panel -> [(x0, x1, action)] clickable parts of its title bar
         self.msg, self.answer = "", None
         self.progress, self.worker, self.t0, self.bg_error = None, None, time.time(), None
         self.enriched = set()
@@ -3624,13 +3626,24 @@ class Tui:
         attr = (self.style_attr("fold") | c.A_BOLD) if focused else self.dim()
         num = self.SIDE.index(key) + 1 if key in self.SIDE else 0
         title = f"{num} {p.title}"
+        zones = []                                   # (start col, end col, action) within the title, for mouse clicks
         if p.tabs:
             if key == "home":
                 cnt = getattr(self, "home_counts", {})
                 k_, t_ = self.HOME_TABS[p.tab]
-                title += f" ‹ {t_} {cnt.get(k_, 0)} › {p.tab + 1}/{len(p.tabs)}"
+                title += " "
+                zones.append((dw(title), dw(title) + 1, ("tab", -1)))
+                title += f"‹ {t_} {cnt.get(k_, 0)} "
+                zones.append((dw(title), dw(title) + 1, ("tab", +1)))
+                title += f"› {p.tab + 1}/{len(p.tabs)}"
             else:
-                title += " " + " ".join(f"[{t}]" if i == p.tab else t for i, t in enumerate(p.tabs))
+                title += " "
+                for i, t in enumerate(p.tabs):
+                    lab = f"[{t}]" if i == p.tab else t
+                    zones.append((dw(title), dw(title) + dw(lab), ("tab", i)))
+                    title += lab + " "
+                title = title.rstrip()
+        self.title_zones[key] = [(x - 1 + 2 + a, x - 1 + 2 + b, act) for a, b, act in zones]   # screen columns
             if key == "main":
                 sub = self.g.nodes.get(self.subject) if self.subject else None
                 what = (self.g.label_num(sub) if sub and sub.kind == "item" else
@@ -3967,6 +3980,15 @@ class Tui:
             return
         if base != 0 or not key:
             return
+        p = self.panels[key]
+        if y == p.rect[0] - 1:                   # the title bar: ‹ › or a tab name switches tabs
+            for x0, x1, act in self.title_zones.get(key, []):
+                if x0 <= x < x1:
+                    self.focus = key
+                    self.switch_tab(key, act, relative=(key == "home"))
+                    return
+            self.focus = key
+            return
         if key != self.focus:                    # first click on another panel: focus it, keep its cursor
             self.focus = key
             self.update_subject()
@@ -4014,6 +4036,21 @@ class Tui:
         return -1
 
     # ------------------------------------------------------------------ main loop
+    def switch_tab(self, key, action, relative=False):
+        p = self.panels[key]
+        if not p.tabs:
+            return
+        p.tab = (p.tab + action[1]) % len(p.tabs) if relative else action[1] % len(p.tabs)
+        p.top = 0
+        if key == "home":
+            p.set_rows(self.home_rows(), keep=False)
+            p.cur = 0
+            if self.focus == "home":
+                self.update_subject()
+        elif key == "main":
+            self.refresh_main()
+        self.enrich()
+
     def cycle_focus(self, d):
         order = self.SIDE + ["main"]
         self.focus = order[(order.index(self.focus) + d) % len(order)]
@@ -4121,15 +4158,7 @@ class Tui:
             self.update_subject()
             return True
         if k in (ord("["), ord("]")) and p.tabs:
-            p.tab = (p.tab + (1 if k == ord("]") else -1)) % len(p.tabs)
-            p.top = 0
-            if self.focus == "home":
-                p.set_rows(self.home_rows(), keep=False)
-                p.cur = 0
-                self.update_subject()
-            elif self.focus == "main":
-                self.refresh_main()
-            self.enrich()
+            self.switch_tab(self.focus, ("tab", 1 if k == ord("]") else -1), relative=True)
             return True
         if k == ord("+"):
             self.screen = {"normal": "half", "half": "full", "full": "normal"}[self.screen]
