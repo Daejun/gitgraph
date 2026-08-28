@@ -26,7 +26,7 @@ gg --version
 
 ### repo 선택
 
-git repo 안이나 repo들이 모여 있는 dir(2단계 아래까지)에서 `gg`를 실행하면 URL이 GitHub host(`github.com`, `github.*` host, 또는 `gh`에 로그인된 host)를 가리키는 모든 remote가 후보가 된다 — `origin` 우선, 다음은 이름이 `github*`인 remote(그래서 `origin`은 GitLab이고 `github` remote가 따로 있는 repo도 됨). 그리고 여러 개면 번호로 물어본다(`a` = 전부, 첫 번째가 *primary*라 그 항목은 `#N`으로만 표시). 아니면 `-r owner/name`(반복 가능)을 주거나 `gg config repos owner/name`으로 기본값을 저장한다. GitHub Enterprise repo는 `host/owner/name`.
+git repo 안이나 repo들이 모여 있는 dir(2단계 아래까지)에서 `gg`를 실행하면 URL이 GitHub host(`github.com`, `github.*` host, 또는 `gh`에 로그인된 host)를 가리키는 모든 remote가 후보가 된다 — `origin` 우선, 다음은 이름이 `github*`인 remote(그래서 `origin`은 GitLab이고 `github` remote가 따로 있는 repo도 됨). 그리고 여러 개면 번호로 물어본다(`a` = 전부, 첫 번째가 *primary*라 그 항목은 `#N`으로만 표시). 잡힌 repo가 fork면 원본(parent) repo로 자동 전환한다(issue/PR은 거기 있으므로; fork 자체를 보려면 `-r`로 지정). 아니면 `-r owner/name`(반복 가능)을 주거나 `gg config repos owner/name`으로 기본값을 저장한다. GitHub Enterprise repo는 `host/owner/name`.
 
 ## 사용법
 

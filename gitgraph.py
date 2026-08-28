@@ -25,7 +25,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -254,13 +254,48 @@ def choose_repos(cands):
     return picks or [cands[0][0]]
 
 
+_parent_cache = {}
+
+
+def parent_repo(repo):
+    """If repo is a fork, the repo it was forked from (owner/name or host/owner/name); else None."""
+    if repo in _parent_cache:
+        return _parent_cache[repo]
+    host, owner, name = split_repo(repo)
+    res = None
+    try:
+        d = graphql("query($o:String!,$n:String!){ repository(owner:$o,name:$n){ isFork parent{ nameWithOwner } } }",
+                    {"o": owner, "n": name}, host)
+        r = (d or {}).get("repository") or {}
+        if r.get("isFork") and r.get("parent"):
+            res = qualify(r["parent"]["nameWithOwner"], host)
+    except GhError:
+        pass
+    _parent_cache[repo] = res
+    return res
+
+
+def unfork(repos):
+    """Replace forks by their parents (a clone's `origin` is usually the fork; the issues/PRs live upstream)."""
+    out = []
+    for repo in repos:
+        parent = parent_repo(repo)
+        if parent and parent not in out:
+            log(f"{repo} is a fork of {parent}; using {parent} (pass -r {repo} to look at the fork itself)")
+            out.append(parent)
+        elif repo not in out:
+            out.append(repo)
+    return out
+
+
 def resolve_repos(explicit=None, interactive=False):
-    """-r > $GITGRAPH_REPOS > repos found under cwd (ask if several) > built-in default."""
+    """-r > $GITGRAPH_REPOS > repos found under cwd (ask if several; forks -> their parent)."""
     if explicit:
         return list(explicit)
     if ENV_REPOS:
         return ENV_REPOS
     cands = discover_repos(os.getcwd())
+    cands = [(r, d) for r, d in cands]
     if not cands:
         home = os.path.expanduser("~")
         seen = "\n".join(f"  {d.replace(home, '~')}: {name} {url} — {why}" for d, name, url, why in SKIPPED_REMOTES[:12])
@@ -268,9 +303,9 @@ def resolve_repos(explicit=None, interactive=False):
                          + (f"\n  remotes seen but skipped:\n{seen}" if seen else "\n  no git remotes found here")
                          + "\n  -> pass -r owner/name, set GITGRAPH_REPOS, or run inside the repo")
     if len(cands) == 1:
-        return [cands[0][0]]
+        return unfork([cands[0][0]])
     if interactive:
-        return choose_repos(cands)
+        return unfork(choose_repos(cands))
     raise ValueError("several repos under " + os.getcwd() + ": " + ", ".join(c[0] for c in cands)
                      + " — pass repos=[\"owner/name\", ...]")
 
@@ -3949,6 +3984,7 @@ def check_cmd(repos):
                 continue
             env["GH_TOKEN"] = env["GH_ENTERPRISE_TOKEN"] = tok
             q = ('query($o:String!,$n:String!){ repository(owner:$o,name:$n){ nameWithOwner isPrivate hasIssuesEnabled '
+                 'isFork parent{ nameWithOwner } '
                  'issues(states:[OPEN]){totalCount} pullRequests(states:[OPEN]){totalCount} '
                  'allIssues: issues{totalCount} allPRs: pullRequests{totalCount} } viewer{login} }')
             body = json.dumps({"query": q, "variables": {"o": owner, "n": name}})
@@ -3966,7 +4002,10 @@ def check_cmd(repos):
                       f"(all-time {rep_['allIssues']['totalCount']} / {rep_['allPRs']['totalCount']}), "
                       f"issues {'enabled' if rep_['hasIssuesEnabled'] else 'DISABLED'}")
                 good += 1
-                if rep_["issues"]["totalCount"] + rep_["pullRequests"]["totalCount"] == 0:
+                if rep_.get("isFork") and rep_.get("parent"):
+                    print(f"      -> this is a FORK of {rep_['parent']['nameWithOwner']}: the issues/PRs live there; "
+                          f"gg now switches to the parent automatically (or: gg -r {rep_['parent']['nameWithOwner']})")
+                elif rep_["issues"]["totalCount"] + rep_["pullRequests"]["totalCount"] == 0:
                     print("      -> nothing is open; gg shows open items only (try --state all)")
             else:
                 msg = "; ".join(e.get("message", "") for e in errs) or (r.stderr or "").strip()[:200] or "no data"

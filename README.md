@@ -26,7 +26,7 @@ gg --version
 
 ### Which repo
 
-Run `gg` inside a git repo, or in a directory that contains repos (2 levels deep): every remote whose URL points at a GitHub host (`github.com`, any `github.*` host, or a host you are logged in to with `gh`) is a candidate — `origin` first, then remotes named `github*`, so a repo whose `origin` is GitLab but has a `github` remote works too; if several are found you are asked which (`a` = all, the first is *primary* and its items are shown as bare `#N`). Otherwise pass `-r owner/name` (repeatable) or store a default: `gg config repos owner/name`. GitHub Enterprise repos are written `host/owner/name`.
+Run `gg` inside a git repo, or in a directory that contains repos (2 levels deep): every remote whose URL points at a GitHub host (`github.com`, any `github.*` host, or a host you are logged in to with `gh`) is a candidate — `origin` first, then remotes named `github*`, so a repo whose `origin` is GitLab but has a `github` remote works too; if several are found you are asked which (`a` = all, the first is *primary* and its items are shown as bare `#N`). If the repo found is a fork, gg switches to the repo it was forked from (that is where the issues/PRs are; `-r` the fork explicitly to look at the fork). Otherwise pass `-r owner/name` (repeatable) or store a default: `gg config repos owner/name`. GitHub Enterprise repos are written `host/owner/name`.
 
 ## Usage
 
