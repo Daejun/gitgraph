@@ -2,10 +2,11 @@
 """gg (gitgraph) - GitHub issue / PR / comment / @mention relation graph rendered as ASCII.
 
 Usage:
-  gg [overview options]                   render overview of open items
-  gg 777 [--hops 2]                       neighbourhood of one item (also #777, owner/repo#777, @login)
+  gg [777]                                the TUI (default), optionally starting on #777 (also owner/repo#777, @login)
+  gg tutorial                             the TUI with the guided tour
+  gg graph [777] [--hops 2]               text graph: overview of open items, or the neighbourhood of one item
   gg show 777                             details of one node
-  gg tui [777]                            lazygit-style TUI: side panels (Repo/Home/Links/Comments/People) + main
+  gg ask 4563 "why does it mention #3859?"   # one-shot question to claude with the item as context
   gg update                               update this installation from GitHub
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
   gg todo                                 print the markdown of everything marked with m in the tui
@@ -25,7 +26,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.7.4"
+VERSION = "0.8.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -67,6 +68,12 @@ def cfg(key):
     """CLI option (handled by the caller) > environment variable > config file > built-in default."""
     env, default, _ = CONFIG_KEYS[key]
     return os.environ.get(env) or str(CONFIG.get(key, "") or "") or default
+
+
+def save_config():
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(CONFIG, f, indent=2, ensure_ascii=False)
 
 
 def config_cmd(args):
@@ -1007,15 +1014,15 @@ def translate_body(n, g, lang=TR_LANG):
 
 
 WHY_PROMPT = """Each entry below is a sentence from a GitHub issue, pull request or comment that mentions another item, \
-given as "ref" (like #748). For each entry write, in {lang}, a phrase of at most 40 characters that says WHY that item \
-is mentioned — e.g. "충돌 여부를 확인한 관련 PR", "이 버그를 고치는 PR", "같은 증상을 보고한 issue", "재현 절차 출처". \
+given as "ref" (like #748). For each entry write, in {lang}, one sentence of at most 90 characters that says WHY that item \
+is mentioned and what it is — e.g. "충돌 여부를 확인한 관련 PR", "이 버그를 고치는 PR", "같은 증상을 보고한 issue", "재현 절차 출처". \
 Keep #numbers, identifiers and technical terms in English; never use Chinese characters. \
 Output ONLY a JSON array of strings, same length and order as the input, no code fence.
 
 {payload}"""
 
 
-def around(ctx, ref, n=40):
+def around(ctx, ref, n=70):
     """The part of ctx within ~n characters of ref, cut at word boundaries (a short quote for narrow panels)."""
     i = ctx.find(ref)
     if i < 0:
@@ -2228,13 +2235,13 @@ def wrap(text, width):
 
 HELP = """gg tui — lazygit style layout
 
-  side column: 1 Repo  2 Item  3 Home  4 Links  5 Comments  6 People      main: 0 (content · answer)
+  side column: 1 Repo  2 Item  3 Inbox  4 Comments  5 Links  6 People      main: 0 (content · answer)
   1-6 / 0         jump to a panel            Tab / Shift-Tab  next / previous panel
-  [ / ]           previous / next tab in the focused panel (Home sections, main content / answer)
+  [ / ]           previous / next tab in the focused panel (Inbox sections, main content / answer)
   + / _           screen mode normal -> half (focused side panel fills the column) -> full (only that panel)
   Up/k Down/j     move            PgUp/PgDn , .   page       g/G < >  top / bottom      H / L  scroll sideways
   K / J           scroll the main panel from anywhere
-  Enter           Home: make it the current item (Item, Links, Comments and People follow)
+  Enter           Inbox: make it the current item (Item, Comments, Links and People follow)
                   Item / Comments: read it in main      Links: go to that item      People: view as that person
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
   i               translate the main content (issue/PR body or comment) in full; press again for the original
@@ -2242,7 +2249,8 @@ HELP = """gg tui — lazygit style layout
                   Home has a "todo" section, and ~/gitgraph-todo.md (gg config todo_file) is rewritten for the
                   next session (also `gg todo`). m again on a marked row: edit the note / mark done / remove
   Esc / b         back (previous item and perspective)     f  forward
-  u               view Home as another person       r  refetch from GitHub
+  u               view Inbox as another person      r  refetch from GitHub
+  F2              guided tour of the screen (also: gg tutorial)
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
   Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, 자 = w k …)
@@ -2356,7 +2364,7 @@ class Panel:
 
 
 class Tui:
-    SIDE = ["repo", "item", "home", "links", "comments", "people"]
+    SIDE = ["repo", "item", "home", "comments", "links", "people"]
     HOME_TABS = [("turn", "my turn"), ("todo", "todo"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
     MAIN_TABS = ["content", "answer"]
@@ -2383,7 +2391,7 @@ class Tui:
         self.panels = {
             "repo": Panel("repo", "Repo"),
             "item": Panel("item", "Item"),
-            "home": Panel("home", "Home", [t for _, t in self.HOME_TABS]),
+            "home": Panel("home", "Inbox", [t for _, t in self.HOME_TABS]),
             "links": Panel("links", "Links"),
             "comments": Panel("comments", "Comments"),
             "people": Panel("people", "People"),
@@ -2497,6 +2505,14 @@ class Tui:
         self.refresh_all()
         if self.item is None:
             self.focus = "home"
+        if not CONFIG.get("tutorial_done") and self.o.get("tutorial", True):
+            if self.popup_menu("first run — take a 2-minute tour of the screen? (F2 later)", [("yes", True), ("no", False)]) is True:
+                self.tutorial()
+            else:
+                CONFIG["tutorial_done"] = True
+                save_config()
+        if self.o.get("start_tour"):
+            self.tutorial()
 
     def rebuild_graph(self):
         self.cg = apply_filters(self.g, self.o["comments"], self.o["people"], self.o["closed_neighbors"])
@@ -2534,7 +2550,7 @@ class Tui:
         g, w = self.g, self.o["width"]
         n = g.nodes.get(self.item)
         if not n:
-            return [Row("(no current item — Enter on a row in Home)", kind="head")]
+            return [Row("(no current item — Enter on a row in Inbox)", kind="head")]
         n_links = sum(1 for r in self.panels["links"].rows if r.kind == "")
         meta = [f"updated {short_date(n.updated)}" if n.updated else "", ", ".join(n.labels),
                 f"{n.comments_total} comments" if n.comments_total else "", f"{n_links} links" if n_links else ""]
@@ -2679,7 +2695,9 @@ class Tui:
             n = g.nodes[m]
             via = "" if src.kind == "item" else f" (via {rel_days(src, g)} comment)"
             rows.append(Row(EDGE_LABEL[(t, o)] + node_label(g, n, w) + via, m))
-            rows.append(Row("   ↳ " + self.link_note(src, n, t, o), m, kind="note"))
+            note_w = max(20, (self.panels["links"].rect[3] or 40) - 5)
+            for i, line in enumerate(wrap(self.link_note(src, n, t, o), note_w)[:2]):
+                rows.append(Row(("   ↳ " if i == 0 else "     ") + line, m, kind="note"))
             if t != "closes":
                 self.link_pairs.append(self.link_pair(src, n, o))
         return rows or [Row("(no links)", kind="head")]
@@ -3367,7 +3385,7 @@ class Tui:
         else:
             repo_h, item_h = 4, 6
             rest = H - repo_h - item_h
-            lists = ["home", "links", "comments", "people"]
+            lists = ["home", "comments", "links", "people"]
             if rest < 4 * 3:
                 # too small: only the focused list panel gets space, the others collapse to their title bar
                 y = 0
@@ -3540,6 +3558,65 @@ class Tui:
         if len(p.rows) > hh:                          # scroll indicator on the right border
             pos = int((bh - 3) * min(p.top, max(len(p.rows) - hh, 1)) / max(len(p.rows) - hh, 1))
             self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
+
+    TOUR = [
+        ("home", "Inbox", "What needs you. Tabs ([ ]): my turn = someone else spoke last on something you are in, "
+                          "todo = what you marked with m, mentions, opened / active in the last days, waiting on others, "
+                          "mine, PRs by others, stale, all. Move with j/k, Enter makes a row the current item."),
+        ("item", "Item", "The current item: title, updated date, labels, comment and link counts, a one-line summary "
+                         "and its URL (click it to open the browser). Enter shows it in main."),
+        ("comments", "Comments", "The item's comments, newest on top: +Nd = days after the item opened, » = one-line "
+                                 "summary (made in the background). Enter reads one in main; m marks it for later."),
+        ("links", "Links", "Everything this item references or is referenced by: → refs, ← cited-by, → closes, "
+                           "← closed-by. The ↳ line says why: the sentence that made the reference, summarised. "
+                           "Enter jumps to that item; b comes back, f goes forward."),
+        ("people", "People", "Who is in the thread: author, commenters, mentioned people. Enter views the Inbox as that "
+                             "person (their turn, their mentions); u does the same by name."),
+        ("main", "Main", "Full text of whatever the side cursor is on (content tab), rendered as markdown. "
+                         "i translates it, a asks claude a question about it (answer tab), K/J scroll it from anywhere, "
+                         "[ ] switch tabs."),
+        (None, "Keys", "1-6 and 0 jump to panels, Tab cycles. + and _ change the screen mode (normal / half / full). "
+                       "/ searches the focused panel. ? opens the key menu for the panel, O the options menu. "
+                       "Shortcuts also work while your keyboard is in Hangul mode. q quits."),
+        (None, "Mouse and marks", "Click focuses and selects, double-click = Enter, wheel scrolls without moving the "
+                                  "cursor, drag the border between the side column and main to resize. m marks an item or "
+                                  "comment with a note; ~/gitgraph-todo.md is rewritten so the next session (or Claude) "
+                                  "can pick the work up; gg todo prints it."),
+    ]
+
+    def popup_step(self, title, lines, last=False):
+        """One tutorial step: Enter/Space/Right = next, Esc/q = stop. Returns True to continue."""
+        c = self.curses
+        hint = "⏎ next   Esc stop the tour" if not last else "⏎ finish"
+        while True:
+            y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2)
+            for i, l in enumerate(lines[:hh - 1]):
+                self.put(y + i, x, l)
+            self.put(y + hh - 1, x, hint, self.dim())
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            k = self.read_key()
+            if k in (10, 13, c.KEY_ENTER, ord(" "), c.KEY_RIGHT, ord("l")):
+                return True
+            if k in (27, ord("q")):
+                return False
+            if k == c.KEY_MOUSE and self.mouse_ev and self.mouse_ev[3] and (self.mouse_ev[0] & ~28) == 0:
+                return True
+
+    def tutorial(self):
+        if self.item is None:
+            r = next((r for r in self.panels["home"].rows if r.nid), None)
+            if r:
+                self.set_item(r.nid)
+        for i, (panel, title, text) in enumerate(self.TOUR):
+            if panel:
+                self.focus = panel
+                self.update_subject()
+            if not self.popup_step(f"tour {i + 1}/{len(self.TOUR)} — {title}", wrap(text, 72), last=i == len(self.TOUR) - 1):
+                break
+        CONFIG["tutorial_done"] = True
+        save_config()
+        self.msg = "tour finished — F2 shows it again, ? lists the keys"
 
     HINTS = {
         "home": "⏎ open item  m mark  [ ] section  / search  a ask  o browser  u view-as",
@@ -3756,7 +3833,8 @@ class Tui:
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
         ("*", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
-        ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Home as another person", ord("u")),
+        ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Inbox as another person", ord("u")),
+        ("*", "F2", "guided tour of the screen", 0),
         ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
         ("*", "r", "refetch from GitHub", ord("r")), ("*", "T", "colour theme", ord("T")),
         ("*", "$", "token usage", ord("$")), ("*", "q", "quit", ord("q")),
@@ -3957,6 +4035,8 @@ class Tui:
             self.key_menu()
         elif k == c.KEY_F1:
             self.popup_text("help", HELP.splitlines())
+        elif k == c.KEY_F2 or k == 0:
+            self.tutorial()
         return True
 
 
@@ -4202,9 +4282,9 @@ def update():
 # --------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", nargs="?", default="graph",
-                    help="graph (default) | ROOT (777 / #777 / owner/repo#777 / @login) | tui [ROOT] | show ID | "
-                         "ask ID \"question\" | update | config [KEY [VALUE]] | todo | check")
+    ap.add_argument("cmd", nargs="?", default="tui",
+                    help="tui [ROOT] (default) | ROOT (777 / #777 / owner/repo#777 / @login: tui on it) | graph [ROOT] "
+                         "(text graph) | show ID | ask ID \"question\" | tutorial | update | config [KEY [VALUE]] | todo | check")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
@@ -4230,6 +4310,8 @@ def main(argv=None):
     ap.add_argument("--summary", "-S", action="store_true",
                     help="one-line comment summaries via claude -p (graph/show; tui has it on by default)")
     ap.add_argument("--no-summary", action="store_true", help="tui: keep comment first lines instead of summaries")
+    ap.add_argument("--tour", action="store_true", help="tui: start with the guided tour")
+    ap.add_argument("--no-tour", action="store_true", help="tui: never offer the first-run tour")
     ap.add_argument("--depth", type=int, default=1, help="tui: initial tree expansion depth (default 1)")
     ap.add_argument("--days", type=int, default=7, help="tui home: 'opened in the last N days' window (default 7)")
     ap.add_argument("--theme", choices=list(THEMES), help="colour theme (default: config/env, else dark)")
@@ -4241,8 +4323,13 @@ def main(argv=None):
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check") and ROOT_RE.match(a.cmd):
-        a.root, a.cmd = a.cmd, "graph"   # `gg 777`
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial") and ROOT_RE.match(a.cmd):
+        a.arg, a.cmd = a.cmd, "tui"      # `gg 777` = tui starting on #777
+    if a.cmd == "graph" and a.arg and ROOT_RE.match(a.arg) and not a.root:
+        a.root = a.arg                   # `gg graph 777`
+    if a.cmd == "tutorial":
+        a.cmd = "tui"
+        a.tour = True
     if a.cmd == "update":
         return update()
     if a.cmd == "config":
@@ -4271,7 +4358,7 @@ def main(argv=None):
              "people": not a.no_people, "closed_neighbors": not a.no_closed_neighbors,
              "max_age_min": a.max_age, "width": a.width, "translate": a.translate,
              "layout": a.layout, "hops": a.hops, "root": a.arg or a.root, "summary": not a.no_summary,
-             "depth": a.depth, "days": a.days})
+             "depth": a.depth, "days": a.days, "start_tour": a.tour, "tutorial": not a.no_tour})
         return 0
     try:
         a.repo = resolve_repos(a.repo, interactive=True)

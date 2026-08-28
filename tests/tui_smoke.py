@@ -22,7 +22,7 @@ class Session:
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.environ.update(TERM="xterm-256color", LINES=str(ROWS), COLUMNS=str(COLS), GG_DEBUG="1")
-            os.execvp(sys.executable, [sys.executable, os.path.join(os.path.dirname(__file__), "..", "gitgraph.py"), "tui"] + args)
+            os.execvp(sys.executable, [sys.executable, os.path.join(os.path.dirname(__file__), "..", "gitgraph.py"), "tui", "--no-tour"] + args)
         self.scr = Screen(ROWS, COLS)
 
     def drain(self, t):
@@ -77,7 +77,7 @@ def main():
     s.key("\r", 2.0)
     check("Enter sets the item", "#" in s.line(5))
     check("Item panel shows the item", "2 Item" in s.text() and "#" in s.line(5))
-    s.key("4")
+    s.key("5")
     s.key("j")
     s.key("\r", 2.0)
     item_after_link = s.line(5)
@@ -94,7 +94,7 @@ def main():
     s.key("]", 1.0)
     check("home section tab", "2/10" in s.text())
     s.key("?", 1.0)
-    check("key menu popup", "keys — Home panel" in s.text())
+    check("key menu popup", "keys — Inbox panel" in s.text())
     s.key("\x1b", 0.5)
     s.key("O", 1.0)
     check("options popup", "options" in s.text() and "comments:" in s.text())
@@ -109,7 +109,7 @@ def main():
     check("ask opens the answer tab", "[answer]" in s.line(0))
     s.key("[", 0.5)
     # drag the border from the current position 15 columns to the right
-    home_row = next(i for i, l in enumerate(s.text().splitlines()) if "3 Home" in l)
+    home_row = next(i for i, l in enumerate(s.text().splitlines()) if "3 Inbox" in l)
     bx = next((i for i, ch in enumerate(s.line(home_row)) if ch == "╮"), None)   # Home's top border
     if bx is not None:
         s.mouse(0, bx, 10)
@@ -125,6 +125,9 @@ def main():
     s.key("m", 0.6)
     check("mark prompt or menu", "my note" in s.text() or "is marked" in s.text())
     s.key("\x1b", 0.5)
+    s.key("\x1bOQ", 0.8)                 # F2: tour
+    check("tour popup", "tour 1/" in s.text())
+    s.key("\r", 0.5); s.key("\r", 0.5); s.key("\x1b", 0.5)
     check("clean exit", s.quit())
     log = open(os.path.expanduser("~/.cache/gitgraph/tui.log")).read()
     check("no traceback", "Traceback" not in log)
