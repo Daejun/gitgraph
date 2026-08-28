@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.19.1"
+VERSION = "0.19.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -314,7 +314,6 @@ def github_remotes(d):
         hint = git_account_hint(d, host, url)
         if hint:      # a first guess for graphql(); anything already verified in accounts.json wins
             _pref_map().setdefault(host, {}).setdefault(repo, hint)
-            _acct_hint.setdefault(host, hint)      # also for the repos this one references
         out.append((0 if name == "origin" else 1 if name.lower().startswith("github") else 2, repo))
     return sorted(out)
 
@@ -378,19 +377,24 @@ def unfork(repos):
 
 
 def seed_account_hints(repos, d=None):
-    """For repos named on the command line (or in $GITGRAPH_REPOS) there is no discovery step, so take
-    the account hint from the git repo we are standing in: its credential config is host-scoped and is
-    usually the checkout of one of these repos. Only a first guess — accounts.json wins if it holds a
-    verified one, and a wrong guess costs the same single fallback it costs today."""
-    d = d or os.getcwd()
-    if not os.path.isdir(os.path.join(d, ".git")):
+    """For repos named on the command line (or in $GITGRAPH_REPOS) there is no discovery step, so look
+    for their checkouts the same way discovery does — the repo we are standing in (from any depth) plus
+    the ones a couple of levels below — and read the account each one uses from its git config. Only a
+    first guess: a verified account in accounts.json wins, and a wrong guess costs the one fallback it
+    costs today. Skipped entirely once every repo has a remembered account (i.e. after the first run)."""
+    if not repos:
         return
-    for repo in repos:
-        host = repo_host(repo)
-        hint = git_account_hint(d, host)
-        if hint:
-            _pref_map().setdefault(host, {}).setdefault(repo, hint)
-            _acct_hint.setdefault(host, hint)
+    if not all((_pref_map().get(repo_host(r)) or {}).get(r) for r in repos):
+        for repo, checkout in discover_repos(d or os.getcwd()):
+            host = repo_host(repo)
+            hint = git_account_hint(checkout, host)
+            if hint:
+                _pref_map().setdefault(host, {}).setdefault(repo, hint)
+    # what the primary repo uses is also the best guess for the repos it references (stubs)
+    primary = repos[0]
+    fav = (_pref_map().get(repo_host(primary)) or {}).get(primary)
+    if fav:
+        _acct_hint[repo_host(primary)] = fav
 
 
 def resolve_repos(explicit=None, interactive=False):
@@ -410,9 +414,13 @@ def resolve_repos(explicit=None, interactive=False):
                          + (f"\n  remotes seen but skipped:\n{seen}" if seen else "\n  no git remotes found here")
                          + "\n  -> pass -r owner/name, set GITGRAPH_REPOS, or run inside the repo")
     if len(cands) == 1:
-        return unfork([cands[0][0]])
+        picked = unfork([cands[0][0]])
+        seed_account_hints(picked)
+        return picked
     if interactive:
-        return unfork(choose_repos(cands))
+        picked = unfork(choose_repos(cands))
+        seed_account_hints(picked)
+        return picked
     raise ValueError("several repos under " + os.getcwd() + ": " + ", ".join(c[0] for c in cands)
                      + " — pass repos=[\"owner/name\", ...]")
 

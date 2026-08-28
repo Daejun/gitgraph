@@ -187,7 +187,7 @@ Repos on an Enterprise host are written `host/owner/name` (`-r ghe.example.com/t
 
 ## Accounts, network, cache
 
-- If a private repo answers `NOT_FOUND`, the other accounts registered in `gh auth status` for that host are tried automatically (no global account switch); the error names the host and the accounts tried. The account that worked is remembered per repo in `accounts.json`, and before that gg takes the account named in the checkout's own git config (`credential.<host>.username`, the helper `gh auth setup-git -u` writes, or a `user@` in the remote URL) — so the very first query goes to the right account instead of spending a round trip discovering it.
+- If a private repo answers `NOT_FOUND`, the other accounts registered in `gh auth status` for that host are tried automatically (no global account switch); the error names the host and the accounts tried. The account that worked is remembered per repo in `accounts.json`, and before that gg takes the account named in the git config of that repo's checkout — the one you are in, or one it finds a couple of levels below, the same scan repo discovery does (`credential.<host>.username`, the helper `gh auth setup-git -u` writes, or a `user@` in the remote URL) — so the very first query goes to the right account instead of spending a round trip discovering it.
 - Transient network errors (`TLS handshake timeout`, connection reset, 5xx) are retried `retries` times with backoff; then `gg` prints what to check (`gh api user`, `HTTPS_PROXY`, VPN/DNS).
 - Cache: `~/.cache/gitgraph/` — items per repo and state (`--max-age`, `--refresh`), translations, summaries. TUI logs (and stderr) go to `~/.cache/gitgraph/tui.log`.
 

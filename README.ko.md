@@ -187,7 +187,7 @@ Enterprise host의 repo는 `host/owner/name`으로 쓴다(`-r ghe.example.com/te
 
 ## 계정, 네트워크, 캐시
 
-- private repo가 `NOT_FOUND`면 그 host에 등록된 다른 `gh` 계정 토큰으로 자동 재시도한다(전역 계정 전환 없음). 실패 시 host와 시도한 계정을 에러에 적는다. 성공한 계정은 repo별로 `accounts.json`에 기억하고, 그 전에는 체크아웃의 git config가 지목하는 계정을 쓴다(`credential.<host>.username`, `gh auth setup-git -u`가 쓰는 helper, remote URL의 `user@`). 그래서 첫 쿼리부터 맞는 계정으로 나가고, 계정을 찾느라 왕복 한 번을 버리지 않는다.
+- private repo가 `NOT_FOUND`면 그 host에 등록된 다른 `gh` 계정 토큰으로 자동 재시도한다(전역 계정 전환 없음). 실패 시 host와 시도한 계정을 에러에 적는다. 성공한 계정은 repo별로 `accounts.json`에 기억하고, 그 전에는 그 repo 체크아웃의 git config가 지목하는 계정을 쓴다(지금 있는 저장소, 또는 repo 탐색과 같은 방식으로 두 단계 아래까지 찾은 체크아웃)(`credential.<host>.username`, `gh auth setup-git -u`가 쓰는 helper, remote URL의 `user@`). 그래서 첫 쿼리부터 맞는 계정으로 나가고, 계정을 찾느라 왕복 한 번을 버리지 않는다.
 - 일시적 네트워크 오류(`TLS handshake timeout`, connection reset, 5xx)는 `retries`회 backoff 재시도 후, 확인할 것(`gh api user`, `HTTPS_PROXY`, VPN/DNS)을 안내한다.
 - 캐시: `~/.cache/gitgraph/` — repo·state별 항목(`--max-age`, `--refresh`), 번역, 요약. TUI 로그(stderr)는 `~/.cache/gitgraph/tui.log`.
 

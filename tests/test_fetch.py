@@ -203,11 +203,14 @@ class TestGitAccountHint(FetchCase):
     """Which gh account a checkout uses is usually written in its own git config — gg reads it so the
     very first run (before accounts.json exists) does not spend a round trip on the wrong account."""
 
-    def git_repo(self, **config):
-        """A real `git init` repo (git only reads config from something it recognises as a repo)."""
-        d = os.path.join(self.tmp, f"repo{len(os.listdir(self.tmp))}")
+    def git_repo(self, remote=None, **config):
+        """A real `git init` repo (git only reads config from something it recognises as a repo), in its
+        own directory so a discovery walk of one test's repo never wanders into another's."""
+        d = os.path.join(self.tmp, f"co{len(os.listdir(self.tmp))}", "checkout")
         os.makedirs(d)
         subprocess.run(["git", "init", "-q", d], check=True, capture_output=True)
+        if remote:
+            subprocess.run(["git", "-C", d, "remote", "add", "origin", remote], check=True, capture_output=True)
         for key, value in config.items():
             subprocess.run(["git", "-C", d, "config", key.replace("__", "."), value],
                            check=True, capture_output=True)
@@ -244,7 +247,8 @@ class TestGitAccountHint(FetchCase):
         self.assertIsNone(gg.git_account_hint(d, "github.com"))
 
     def test_the_hint_is_used_for_the_first_query(self):
-        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        d = self.git_repo("https://github.com/test/repo.git",
+                          **{"credential.https://github.com.username": "carol"})
         self.write_fixture({"test/repo": {"issues": {"1": node(1, "hello")}, "pulls": {}}})
         os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
         gg.seed_account_hints(["test/repo"], d)
@@ -253,7 +257,8 @@ class TestGitAccountHint(FetchCase):
         self.assertEqual(tried, ["carol"], "the denied active account must not be tried at all")
 
     def test_the_hint_also_covers_repos_it_references(self):
-        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        d = self.git_repo("https://github.com/test/repo.git",
+                          **{"credential.https://github.com.username": "carol"})
         gg.seed_account_hints(["test/repo"], d)
         self.write_fixture({"other/side": {"issues": {"9": node(9, "x")}, "pulls": {}}})
         os.environ["FAKE_GH_DENY"] = json.dumps(["alice"])
@@ -261,16 +266,29 @@ class TestGitAccountHint(FetchCase):
         tried = [c["account"] for c in self.gh_calls() if c.get("query_head")]
         self.assertEqual(tried, ["carol"], "a stub repo of the same host gets the same first guess")
 
+    def test_a_checkout_below_the_current_directory_is_found_too(self):
+        """Standing next to the checkout, not in it: discovery already walks a couple of levels down,
+        so the hint comes from there as well."""
+        d = self.git_repo("https://github.com/test/repo.git",
+                          **{"credential.https://github.com.username": "carol"})
+        parent = os.path.dirname(d)                       # the checkout is one level below this
+        gg._acct_pref, gg._acct_hint = None, {}
+        gg.seed_account_hints(["test/repo"], parent)
+        self.assertEqual(gg._pref_map()["github.com"]["test/repo"], "carol")
+
     def test_a_verified_memory_beats_the_git_hint(self):
         with open(os.path.join(gg.CACHE_DIR, "accounts.json"), "w", encoding="utf-8") as f:
             json.dump({"github.com": {"test/repo": "alice"}}, f)
         gg._acct_pref = None
-        d = self.git_repo(**{"credential.https://github.com.username": "carol"})
+        d = self.git_repo("https://github.com/test/repo.git",
+                          **{"credential.https://github.com.username": "carol"})
         gg.seed_account_hints(["test/repo"], d)
         self.assertEqual(gg._pref_map()["github.com"]["test/repo"], "alice")
 
-    def test_a_directory_that_is_not_a_git_repo_is_skipped(self):
-        gg.seed_account_hints(["test/repo"], self.tmp)      # no .git: must not raise
+    def test_a_directory_with_no_checkout_is_skipped(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        gg.seed_account_hints(["test/repo"], empty)         # nothing to discover: must not raise
         self.assertNotIn("test/repo", gg._pref_map().get("github.com", {}))
 
 
