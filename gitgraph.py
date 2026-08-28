@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.23.0"
+VERSION = "0.24.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -61,6 +61,9 @@ CONFIG_KEYS = {
     "worktree_max": ("GITGRAPH_WORKTREE_MAX", "5", "review: how many PR worktrees to keep (oldest go first)"),
     "review_model": ("GITGRAPH_REVIEW_MODEL", "sonnet", "review: model for the review pass (claude only)"),
     "review_timeout": ("GITGRAPH_REVIEW_TIMEOUT", "900", "review: seconds one AI review call may take"),
+    "review_verify": ("GITGRAPH_REVIEW_VERIFY", "on",
+                      "review: check every finding in a call of its own that tries to disprove it (on | off)"),
+    "review_verify_model": ("GITGRAPH_REVIEW_VERIFY_MODEL", "sonnet", "review: model for that check (claude only)"),
     "review_max_bytes": ("GITGRAPH_REVIEW_MAX_BYTES", "400000",
                          "review: split the diff by file and review the parts in parallel beyond this size"),
     "review_subjective": ("GITGRAPH_REVIEW_SUBJECTIVE", "auto",
@@ -1468,9 +1471,15 @@ def _split_prose(body):
 
 
 def translate_body(n, g, lang=TR_LANG):
-    """Full-text translation of an item/comment body: prose only (code fences and log lines stay), long bodies are
-    split into ~1,200-character chunks translated in parallel (AI_PARALLEL). Cached in translations_full.json."""
-    body = (n.body or "")[:TR_FULL_CHARS]
+    """Full-text translation of an item/comment body (see translate_text)."""
+    kind = "comment" if n.kind == "comment" else ("pull request" if n.is_pr else "issue")
+    return translate_text(n.body or "", kind, lang)
+
+
+def translate_text(text, kind="issue", lang=TR_LANG):
+    """Prose only (code fences and log lines stay), long bodies split into ~1,200-character chunks
+    translated in parallel (AI_PARALLEL). Cached by text hash in translations_full.json."""
+    body = (text or "")[:TR_FULL_CHARS]
     if not body.strip():
         return ""
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -1479,7 +1488,6 @@ def translate_body(n, g, lang=TR_LANG):
     cached = (read_json(p) or {}).get(key)
     if cached:
         return cached
-    kind = "comment" if n.kind == "comment" else ("pull request" if n.is_pr else "issue")
     pieces = _split_prose(body)
     prose_idx = [i for i, (is_p, t) in enumerate(pieces) if is_p and t.strip()]
     if not prose_idx:
@@ -2582,7 +2590,9 @@ def anchor_findings(rv):
         except (TypeError, ValueError):
             line = None
         if line is not None and line in df.touched(f.side):
-            f.anchor, f.line = "ok", line
+            # "moved" is sticky: anchoring runs again after the verification pass, and a finding gg
+            # once had to pull onto another line should not quietly read as if it never moved.
+            f.anchor, f.line = ("moved" if f.anchor == "moved" else "ok"), line
         else:
             near = df.nearest(f.side, line if line is not None else 1)
             if near is None:
@@ -2830,8 +2840,9 @@ def review_prompt(rv, paths, body=""):
     return REVIEW_PROMPT.format(pr=pr_header(rv, paths, body), standards=std) + REVIEW_CONTRACT
 
 
-def run_review(rv, body="", on_step=None):
-    """Pass 1: categorise, gate on reachability, look for defects. Fills rv in place."""
+def run_review(rv, body="", on_step=None, verify=None):
+    """Pass 1: categorise, gate on reachability, look for defects; then pass 2 checks each finding in a
+    call of its own unless it is turned off. Fills rv in place."""
     if not rv.files:
         rv.status, rv.error = "failed", "nothing to review: the diff is empty"
         return rv
@@ -2874,11 +2885,17 @@ def run_review(rv, body="", on_step=None):
         c.cid = f"CHANGE-{i}"
     rv.reachability, rv.changes = reach, changes
     rv.findings = dedupe_findings(findings)
-    rv.status, rv.t1 = "done", time.time()
+    rv.status = "done"
     rv.error = ("; ".join(errors)[:300]) if errors else None
     anchor_findings(rv)
     apply_history(rv)
     save_review(rv)
+    if REVIEW_VERIFY if verify is None else verify:
+        run_verify(rv, on_step=on_step)
+    else:
+        cap_subjective(rv)
+        save_review(rv)
+    rv.t1 = time.time()
     return rv
 
 
@@ -2898,6 +2915,153 @@ def dedupe_findings(findings):
         if cur is None or (not cur.evidence and f.evidence):
             best[f.digest] = f
     return list(best.values())
+
+
+
+# ---------------------------------------------------------------- the verification pass
+# false-positive-guide.md tells the reviewer to check itself in the same session. Splitting that into
+# a call of its own per finding is the point: a fresh context cannot be dragged along by the reasoning
+# that produced the claim, and it can be told to argue the author's side first.
+REVIEW_VERIFY = cfg("review_verify").lower() not in ("off", "false", "0", "no", "")
+VERIFY_MODEL = cfg("review_verify_model")
+
+VERIFY_PROMPT = """You are checking ONE claim another reviewer made about this pull request. Your job is
+to disprove it. You are standing in a git worktree with the pull request's head checked out, so read
+whatever you need.
+
+{pr}
+
+--- the claim ---
+severity: {severity}
+where: {path}:{line} ({side})
+title: {title}
+body: {body}
+evidence offered: {evidence}
+
+--- how to check it ---
+
+STEP 1 — is it even there? Open {path} and read the code at and around line {line}. Quote it. If the
+code does not say what the claim says it says, the claim is FALSE. Reviewers hallucinate line numbers,
+invent function names and get arithmetic wrong; this step catches most of that.
+
+STEP 2 — argue as the author. Build the strongest case that the code is fine as written:
+- a defensive check: is there a path where untrusted or invalid data actually reaches this code? If
+  the claim only says a check "would be safer", it is FALSE.
+- API misuse: is there a real caller that misuses it, or only a hypothetical one?
+- locking: read the callers two or three levels up and say which of them already holds the lock. A
+  lock taken higher in the chain, or an RCU-style scheme, makes the claim FALSE.
+- use after free: separate use-after-free (report) from use-then-free and free-after-use (fine).
+  Write the alloc -> use -> free -> use sequence with locations, or say there is none.
+- a leak: was ownership handed to something else, was the object put on a list or queue, is there a
+  callback or deferred work that frees it? Then FALSE.
+- reordering: only a race, a violated dependency, a lock-order inversion or an invalid state makes
+  reordering a defect. Otherwise FALSE.
+- a race: name the structure, name the lock that should protect it, and show two paths that can run
+  at the same time. If you cannot, it is at best PLAUSIBLE.
+- uninitialised: writing to a variable initialises it, and passing it to a function that writes before
+  it reads is fine. Only reading an uninitialised value counts. A zeroing allocator initialises every
+  field whose zero value is correct.
+- performance or design: if the description or a comment shows the author chose this deliberately,
+  it is FALSE.
+- a style or design remark: is the surrounding code in this same file already like this, or is there
+  a plausible engineering reason to write it this way? Then FALSE. Never argue from who or what wrote
+  the code.
+
+STEP 3 — answer as the reviewer, with code. Take each of your own arguments from STEP 2 and either
+refute it by quoting code or accept it. If you dismiss the claim because a comment or a document says
+so, open the implementation it describes and quote that instead: comments get copied between
+implementations that do not behave alike, and a defect waved away by a stale comment is worse than a
+false positive.
+
+STEP 4 — verdict.
+- CONFIRMED: you followed the path in the code and it is wrong. You can name every hop.
+- PLAUSIBLE: the code could behave that way but you could not close the path — a caller you cannot
+  see, a condition you cannot evaluate.
+- FALSE: you refuted it with code, or STEP 1 showed the claim does not match what is there.
+
+"Unlikely in practice" never makes a deadlock, a crash or data corruption FALSE; only "the code cannot
+reach that state" does. The other way round, "this could become a problem some day" is not CONFIRMED.
+"""
+
+VERIFY_CONTRACT = """
+Print nothing after these markers but the object between them. Use exactly these fields.
+
+<<<GG_VERDICT
+{"verdict": "CONFIRMED|PLAUSIBLE|FALSE",
+ "reason": "one or two sentences naming the code you read",
+ "line": 222}
+GG_VERDICT>>>
+
+`line` is optional. Give it only when the claim is right about the defect but wrong about where it is,
+and it must still be a line this diff changed on the same side.
+"""
+
+
+def verify_prompt(rv, f):
+    return VERIFY_PROMPT.format(
+        pr=pr_header(rv, [f.path] if rv.file(f.path) else [x.path for x in rv.files], rv.body),
+        severity=f.severity, path=f.path, line=f.line, side=f.side,
+        title=f.title, body=f.body, evidence=f.evidence or "(none given)") + VERIFY_CONTRACT
+
+
+def verify_finding(rv, f):
+    """One adversarial call. Sets verdict / verdict_reason on f; leaves it PLAUSIBLE when the check
+    itself fails — an unusable answer is not evidence that the finding is wrong."""
+    try:
+        out = claude_call(verify_prompt(rv, f), VERIFY_MODEL, "verify",
+                          timeout=REVIEW_TIMEOUT, cwd=rv.worktree, tools=REVIEW_TOOLS)
+    except Exception as e:  # noqa: BLE001
+        f.verdict, f.verdict_reason = "PLAUSIBLE", f"could not be checked: {str(e)[:120]}"
+        return f
+    d = _json_block(out, "GG_VERDICT") or {}
+    verdict = str(d.get("verdict", "")).upper()
+    if verdict not in VERDICTS:
+        f.verdict, f.verdict_reason = "PLAUSIBLE", "the check did not answer in the agreed form"
+        return f
+    f.verdict = verdict
+    f.verdict_reason = str(d.get("reason") or "").strip()[:1000]
+    if verdict != "FALSE" and isinstance(d.get("line"), int):
+        f.line = d["line"]                      # re-anchored below, so a wrong correction cannot stick
+    return f
+
+
+def run_verify(rv, findings=None, on_step=None):
+    """Pass 2 over the open findings, AI_PARALLEL at a time."""
+    todo = [f for f in (rv.findings if findings is None else findings)
+            if f.state == "new" and f.verdict is None]
+    if not todo:
+        return rv
+    rv.status, rv.verify = "verifying", True
+    done = 0
+    progress("verify", 0, len(todo), "checking findings")
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(AI_PARALLEL, len(todo)))) as pool:
+        for _ in pool.map(lambda f: verify_finding(rv, f), todo):
+            done += 1
+            progress("verify", done, len(todo), "checking findings")
+            if on_step:
+                on_step(done, len(todo))
+    anchor_findings(rv)
+    cap_subjective(rv)
+    rv.status = "done"
+    save_review(rv)
+    return rv
+
+
+SUBJECTIVE_CAP = 3
+
+
+def cap_subjective(rv):
+    """slop-indicators.md's hard cap, in code: at most three opinions, the most concrete first.
+    Volume is the problem being avoided, so the rest are dropped rather than hidden."""
+    subj = [f for f in rv.findings if f.subjective and f.state == "new" and f.verdict != "FALSE"]
+    if len(subj) <= SUBJECTIVE_CAP:
+        return rv
+    subj.sort(key=lambda f: (f.verdict != "CONFIRMED", not f.evidence, f.path or "", f.line or 0))
+    for f in subj[SUBJECTIVE_CAP:]:
+        f.verdict = "FALSE"
+        f.verdict_reason = f"beyond the cap of {SUBJECTIVE_CAP} style remarks per pull request"
+    return rv
 
 
 # ---------------------------------------------------------------- CLI
@@ -2950,8 +3114,8 @@ def review_summary_rows(rv):
     return rows
 
 
-def do_review(target, repos, refresh=False, as_json=False, no_ai=False, to_tui=False, opts=None,
-              color=True):
+def do_review(target, repos, refresh=False, as_json=False, no_ai=False, verify=True, to_tui=False,
+              opts=None, color=True):
     """gg review <PR>: the TUI in review mode, or the result on stdout (--print / --json)."""
     repo, number = parse_pr_target(target, repos)
     if to_tui:
@@ -2966,7 +3130,7 @@ def do_review(target, repos, refresh=False, as_json=False, no_ai=False, to_tui=F
     if not no_ai and not rv.error and not rv.findings and not rv.engine and ai_available():
         log(f"reviewing {repo}#{number} with {CLAUDE_BIN} {REVIEW_MODEL} "
             f"({len(rv.files)} files, {len(review_chunks(rv))} call(s))…")
-        run_review(rv, rv.body)
+        run_review(rv, rv.body, verify=verify)
         if USAGE["calls"]:
             log(usage_line())          # do_review returns before main()'s own usage line
     if as_json:
@@ -4237,7 +4401,7 @@ class Tui:
         self.mode = "browse"               # browse (the graph) | review (one PR's diff and findings)
         self.rv, self.rv_path, self._new_rv = None, None, None
         self._told_review = False
-        self.rv_folded, self.rv_checked = set(), set()
+        self.rv_folded, self.rv_checked, self.rv_tr = set(), set(), {}
         self.mode_focus = {"browse": "home", "review": "rfiles"}
         self.review_files_width = float(cfg("review_files_width") or 0.22)
         self.review_findings_width = float(cfg("review_findings_width") or 0.30)
@@ -4598,6 +4762,19 @@ class Tui:
         if k == ord("R"):
             self.run_review_bg()
             return True
+        if k in (ord("d"), ord("i")) and self.focus == "rfind":
+            self.review_details(translate=k == ord("i"))
+            return True
+        if k == ord("V") and self.focus == "rfind":
+            f = self.review_finding()
+            if f is None:
+                self.msg = "no finding under the cursor"
+                return True
+            f.verdict, f.verdict_reason = None, None
+            self.msg = f"checking again: {trunc(f.title, 50)}"
+            self.refresh_review(keep=False)
+            self.run_bg(lambda: run_verify(self.rv, [f]), "review")
+            return True
         if k == ord("x") and self.focus == "rfind":
             f = self.review_finding()
             if f is None:
@@ -4619,6 +4796,44 @@ class Tui:
                 self.msg = f"copied {url} ({', '.join(copy_to_clipboard(url)) or 'no clipboard tool'})"
             return True
         return None
+
+    def review_details(self, translate=False):
+        """d / i on a finding: the whole thing — the panel only has room for its title.
+        i shows it in `lang`; what would be posted is always the original (see P)."""
+        f = self.review_finding()
+        if f is None:
+            self.msg = "no finding under the cursor"
+            return
+        title, body = f.title, f.body
+        if translate:
+            if not ai_available():
+                self.msg = f"{CLAUDE_BIN} is not installed — cannot translate"
+                return
+            key = (f.fid, "tr")
+            if key not in self.rv_tr:
+                self.msg = f"translating to {TR_LANG}…"
+                self.draw()
+                try:
+                    self.rv_tr[key] = translate_text(f"{f.title}\n\n{f.body}", "pull request")
+                except Exception as e:  # noqa: BLE001
+                    self.msg = f"translation failed: {str(e)[:120]}"
+                    return
+            title, _, body = self.rv_tr[key].partition("\n\n")
+        w = max(self.panels["rfind"].rect[3] * 2, 60)
+        lines = [f"[{f.severity}] {title}", ""]
+        lines += wrap(body, w) or [""]
+        if f.verdict:
+            lines += ["", f"verdict: {f.verdict}"] + wrap(f.verdict_reason or "", w)
+        lines += ["", f"{f.path}:{f.line} ({f.side})"
+                      + {"moved": "  ⚠ moved onto the nearest changed line",
+                         "unanchored": "  ⊘ not on a line of this diff — cannot be posted"}.get(f.anchor, "")]
+        if f.evidence:
+            lines += ["", "evidence:"] + wrap(f.evidence, w)
+        if f.diff:
+            lines += ["", "suggested fix:"] + f.diff.splitlines()
+        if translate:
+            lines += ["", f"(translated; d shows the original — what P would post)"]
+        self.popup_text(f"finding {f.fid}" + (f" — {TR_LANG}" if translate else ""), lines)
 
     def review_url(self):
         """The PR, or the file and line the cursor is on inside it."""
@@ -5998,7 +6213,7 @@ class Tui:
         "item": "⏎ read in main  m mark  i translate  a ask  o browser  d details",
         "rfiles": "⏎ show this file's diff  r reload  R refetch  o browser  v back to the graph",
         "rdiff": "⏎ fold/unfold a hunk  J K scroll  o open this line on GitHub  v back to the graph",
-        "rfind": "⏎ jump to the line  x ignore  [ ] tab  o browser  v back to the graph",
+        "rfind": "⏎ jump to the line  d read it  i in " + TR_LANG + "  V check again  x ignore  [ ] tab  v back",
     }
 
     def state_snapshot(self):
@@ -6398,6 +6613,9 @@ class Tui:
         ("review", "v Esc", "back to the graph", ord("v")),
         ("review", "r", "reload the PR and its diff", ord("r")),
         ("review", "R", "refetch it, ignoring the cached findings", ord("R")),
+        ("rfind", "d", "read the whole finding (body, evidence, suggested fix)", ord("d")),
+        ("rfind", "i", f"the same in {TR_LANG} — what P posts is always the original", ord("i")),
+        ("rfind", "V", "check this finding again (a fresh call that tries to disprove it)", ord("V")),
         ("rfind", "x", "ignore this finding / take it back", ord("x")),
     ]
 
@@ -7370,6 +7588,8 @@ def main(argv=None):
     ap.add_argument("--print", action="store_true", dest="print_",
                     help="review: print the result instead of opening the TUI")
     ap.add_argument("--no-ai", action="store_true", help="review: the diff only, never call the AI CLI")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="review: skip the pass that tries to disprove each finding")
     a = ap.parse_intermixed_args(argv)
     cache_hygiene()
     if a.theme:
@@ -7443,6 +7663,7 @@ def main(argv=None):
             if not a.arg:
                 ap.error('review needs a PR: gg review 123 (also #123, owner/name#123, a pull request URL)')
             return do_review(a.arg, a.repo, refresh=a.refresh, as_json=a.json, no_ai=a.no_ai,
+                             verify=not a.no_verify,
                              to_tui=not (a.print_ or a.json), opts=a,
                              color=a.color == "always" or (a.color == "auto" and sys.stdout.isatty()))
         elif a.cmd == "show":

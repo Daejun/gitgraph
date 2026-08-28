@@ -1,6 +1,6 @@
 # gg에 PR 리뷰 모드를 넣는 계획
 
-상태: 1~3단계 구현됨 — `gg review <PR>`와 TUI의 `v`가 worktree를 펼쳐 diff를 3열로 그리고, `R`이 내장 프로토콜로 pass 1을 돌린다. 4~7단계(검증 pass, 게시, 증분, review_cmd)가 남았다.
+상태: 1~4단계 구현됨 — worktree·3열 diff·내장 프로토콜 pass 1·검증 pass 2·주관적 억제까지. 5~7단계(게시, 증분 재리뷰, review_cmd)가 남았다.
 
 결정된 것(인터뷰):
 
@@ -434,7 +434,10 @@ gg review <PR> --post --dry-run  보낼 mutation 페이로드만 출력하고 �
 
 #760에서 나온 하나는 같은 PR이 만든 형제 함수 둘이 `-ENOMEM`을 서로 다르게 다루는 것으로, 근거가 `gc.c:508-521 → 1087-1095 → 889-896 → 1323-1324` 네 단계로 붙고 적용 가능한 diff까지 나왔다. #779의 0건은 침묵이 맞는 쪽으로 보인다(리팩터링 성격). CHANGE 분류는 두 PR 모두 파일이 아니라 락·자원·제어흐름 단위로 갈렸다.
 
-4단계 완료 조건: false-positive-guide.md의 각 절이 pass 2에서 실제로 발동하는지 하나씩 확인.
+4단계 실측(같은 worktree, 지적 2건 병렬, 1m23s, 2회 호출 $0.85):
+
+- #760의 진짜 지적 → **CONFIRMED**. 원래 근거(4홉)를 그대로 받아쓰지 않고 `gc.c:1330`, `1488-1489`를 직접 더 따라가 migrated block이 버려지는 지점까지 짚었다.
+- 일부러 넣은 거짓 양성("sbi를 NULL 체크 없이 dereference한다 — `if (!sbi) return -EINVAL;`를 넣어라") → **FALSE**. 호출자 체인을 `mtfs_gc_migrate_zone`까지 올라가 sbi가 이미 dereference된 것을 보이고, "gc.c 어디에도 `if (!sbi)` 패턴이 없다"며 파일 자체 관례와 대조했다. false-positive-guide.md의 1절(방어적 코딩 요구)과 13절(암묵적 guard)이 그대로 발동한 것이다.
 
 ---
 

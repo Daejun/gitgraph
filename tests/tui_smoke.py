@@ -762,6 +762,7 @@ def review_with_a_clone():
         s.settle()
         txt = s.text()
         check("the finding lands in the Findings panel", "fake finding 1 in data.c" in txt, txt[:900])
+        check("it was checked in a call of its own (verdict shown)", "✓" in txt, txt[:900])
         st = (s.cache("state.json") or {}).get("review") or {}
         f = st.get("finding") or {}
         check("state.json carries the finding for gg mcp",
@@ -771,6 +772,9 @@ def review_with_a_clone():
         s.key("2", 0.6)                       # the Diff panel flags the line
         check("the flagged line is marked in the diff", "⚠" in s.text(), s.text()[:900])
         s.key("3", 0.6)
+        s.key("d", 1.0)                       # the panel only has room for the title
+        check("d reads the whole finding", "the fake AI CLI always says this" in s.text(), s.text()[:900])
+        s.key("\x1b", 0.6)
         s.key("x", 1.0)                       # ignore it
         check("x ignores a finding", "ignored" in s.text(), s.text()[:300])
         check("no traceback with a real worktree", "Traceback" not in s.log(),

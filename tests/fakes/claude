@@ -15,6 +15,7 @@ What it answers:
         {"ref","sentence"} (why)     -> "WHY:<ref>"
   * a review prompt (it carries the GG_REVIEW contract) -> a GG_REVIEW block naming the files that
     are actually in the diff it was given, with one finding on the first changed line of each
+  * a verification prompt (GG_VERDICT contract) -> a GG_VERDICT block, CONFIRMED by default
   * anything else (TR_FULL_PROMPT full-text translation, ASK_PROMPT question) -> plain text:
         full-text translation        -> "TRFULL:" + the body that followed the prompt header
         question                     -> "ANSWER: <the question line>"
@@ -24,6 +25,7 @@ Env vars (all optional):
   FAKE_AI_BAD_LEN=1  return an array of the wrong length                        (-> claude_json raises)
   FAKE_AI_IS_ERROR=1 return a well-formed JSON reply with is_error true
   FAKE_AI_SLEEP=N    sleep N seconds first (pending markers: "» 요약 중…", "⟳ 번역 중…")
+  FAKE_AI_VERDICT=S  the raw reply for a verification prompt (default: CONFIRMED)
   FAKE_AI_REVIEW=S   the raw reply for a review prompt (one whose contract marker it carries), instead
                      of the generated one — for malformed-answer tests
   FAKE_AI_LOG=PATH   append one JSON line per call {argv, prompt} so tests can assert batch sizes,
@@ -117,6 +119,10 @@ def main():
         if os.environ.get("FAKE_AI_BAD_LEN"):
             out = out[:-1] if len(out) > 1 else out + ["extra"]
         result = json.dumps(out, ensure_ascii=False)
+    elif "GG_VERDICT>>>" in prompt:
+        result = os.environ.get("FAKE_AI_VERDICT") or (
+            '<<<GG_VERDICT\n{"verdict": "CONFIRMED", "reason": "the fake AI CLI always says this"}'
+            "\nGG_VERDICT>>>")
     elif "GG_REVIEW>>>" in prompt:
         result = review_reply(prompt)
     elif "=== question ===" in prompt:

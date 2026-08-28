@@ -69,6 +69,7 @@ gg update                 # 설치 갱신
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | 캐시를 채울 때(첫 실행·갱신) 동시에 도는 `gh` 쿼리 수. GitHub 왕복 한 번이 무엇을 묻든 ~0.4s라 첫 실행 속도를 좌우한다. open 항목이 수백 개인 repo에서는 12로 올리면 더 빨라진다 |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (아래 참조) |
+| `review_verify` · `review_verify_model` | `GITGRAPH_REVIEW_VERIFY` · `GITGRAPH_REVIEW_VERIFY_MODEL` | `on` · `sonnet` | 리뷰 모드: 지적마다 반증을 시도하는 단계와 그 모델 |
 | `review_model` · `review_timeout` · `review_max_bytes` | `GITGRAPH_REVIEW_MODEL` · `GITGRAPH_REVIEW_TIMEOUT` · `GITGRAPH_REVIEW_MAX_BYTES` | `sonnet` · `900` · `400000` | 리뷰 모드: 리뷰를 돌릴 모델(claude 전용), 한 번의 호출 상한(초), 이보다 큰 diff는 파일 단위로 쪼개 병렬로 돈다 |
 | `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | 리뷰 모드: Files·Findings 열의 폭 |
 | `worktree_keep_days` · `worktree_max` | `GITGRAPH_WORKTREE_KEEP_DAYS` · `GITGRAPH_WORKTREE_MAX` | `7` · `5` | 리뷰 모드: PR worktree를 얼마나 오래, 몇 개까지 두는지. 커널 체크아웃 하나가 1G를 훌쩍 넘으니 형식적인 값이 아니다 — `gg cache`가 실제 용량과 함께 보여준다 |
@@ -205,19 +206,26 @@ PR 위에서 `v`를 누르면 화면 전체가 Files · Diff · Findings 세 패
 | Enter | 위 표 참고 |
 | `x` | 이 지적을 무시 / 무시 취소 (PR별로 기억되며 새 커밋이 와도 유지) |
 | `R` · `r` | 리뷰를 돌린다(먼저 물어본다) · PR과 diff만 다시 읽는다(캐시된 지적은 유지) |
+| `d` · `i` | 지적 전문(본문·근거·제안 diff)을 읽는다 · 같은 것을 `lang`으로. `P`가 올리는 것은 언제나 원문이다 |
+| `V` | 이 지적을 다시 검증한다(반증을 시도하는 새 호출) |
 | `o` · `y` | PR을(커서가 줄 위에 있으면 그 파일·줄을) 브라우저로 · 그 URL 복사 |
 | `/` `n` `N` · `?` | 포커스된 패널에서 검색 · 그 패널의 키 메뉴 |
 
 ```
 gg review 779             # PR #779의 리뷰 모드로 TUI 시작
 gg review 779 --print     # 리뷰를 돌려 결과를 stdout으로 (--no-ai: diff만, AI 호출 없음)
+gg review 779 --print --no-verify   # 반증 단계를 건너뛴다
 gg review 779 --json      # 같은 내용을 JSON으로
 gg review 779 --refresh   # 이 head에 캐시된 것을 무시하고 다시 읽기
 ```
 
 `R`이 리뷰를 돌린다. gg는 프롬프트가 아니라 절차를 안고 있다 — 커널 리뷰 프롬프트 모음에서 뽑아낸 규율이다. hunk를 판단하기 전에 그 hunk가 든 함수 전체를 읽고(worktree가 그래서 있다), diff를 CHANGE-N 단위로 — 루프 하나, 락 하나, 할당 하나, 바뀐 반환값 하나 — 쪼갠 뒤 하나씩 본다. 먼저 바뀐 코드가 설명이 말하는 용례로 실행되기는 하는지 따지고, 저자가 틀렸다고 가정한 뒤 옳다는 증거를 요구하며, `file:line -> file:line`으로 짚지 못하는 지적은 버린다. 응답은 고정 필드로만 받고, gg는 저장하기 전에 모든 지적을 diff가 실제로 건드린 줄에 못 박는다(GitHub은 그 밖의 줄을 거부한다). `review_max_bytes`를 넘는 diff는 파일 단위로 쪼개 병렬로 돈다.
 
-돈과 시간이 드니 저절로 시작하지 않는다. `R`은 먼저 묻고(파일 수와 호출 수를 보여준다), 결과는 head SHA에 묶여 캐시되며, `r`은 PR만 다시 읽는다. private 커널형 저장소에서 claude sonnet으로 각 1회 호출 실측: 2파일 +163 −166이 7분 14초에 지적 0건, 4파일 +466 −155가 6분 39초에 1건 — 같은 PR이 만든 형제 함수 둘이 오류 코드를 다르게 다루는 것으로, 근거가 4단계로 붙고 적용 가능한 diff까지 나왔다.
+그다음 모든 지적을 **그것을 반증하려 드는 별도 호출**로 한 번 더 건다. 커널 프롬프트 모음은 같은 세션에서 스스로를 검토하라고 시키는데, 호출을 쪼개는 것이 핵심이다 — 새 문맥은 그 지적을 만들어 낸 추론에 끌려가지 않는다. 그 호출은 먼저 해당 줄의 코드를 열어 읽고(리뷰어는 줄 번호를 곧잘 지어낸다), 저자 편에서 반론을 세운 뒤(정말 잘못된 데이터가 도달하는 경로가 있나, 호출자가 이미 그 락을 쥐고 있지 않나, 소유권이 넘어가지 않았나, 주변 코드가 이미 그렇게 쓰여 있지 않나), 마지막에 코드로 스스로에게 답한다. 결과는 `✓` CONFIRMED, `?` PLAUSIBLE, 또는 기각이다. 기각된 것은 내용으로 기억되어 같은 PR을 나중에 다시 리뷰해도 되살아나지 않는다. `review_verify off`면 이 단계를 건너뛰고 전부 PLAUSIBLE로 남는다.
+
+style·design 의견은 커널 프롬프트와 같은 규율을 받는다. PR당 최대 3건, 그리고 확정된 결함이 열려 있는 동안에는 통째로 감춘다(`review_subjective`).
+
+돈과 시간이 드니 저절로 시작하는 것은 없다. `R`은 먼저 묻고(파일 수와 호출 수를 보여준다), 결과는 head SHA에 묶여 캐시되며, `r`은 PR만 다시 읽는다. private 커널형 저장소에서 claude sonnet 실측 — 리뷰 pass: 2파일 +163 −166이 7분 14초에 0건, 4파일 +466 −155가 6분 39초에 1건(같은 PR이 만든 형제 함수 둘이 오류 코드를 다르게 다루는 것, 근거 4단계 + 적용 가능한 diff). 검증 pass: 지적 2건 병렬로 1분 23초, $0.85 — 진짜 지적은 확정했고(원래 주장보다 두 홉을 더 따라갔다), 일부러 심어 둔 "NULL 체크를 넣어라"는 호출자를 거슬러 올라가 기각하면서 그 파일의 다른 함수도 그 포인터를 검사하지 않는다는 점을 짚었다.
 
 리뷰 모드의 나머지는 AI CLI가 아예 없어도 동작한다.
 

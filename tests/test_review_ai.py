@@ -289,5 +289,145 @@ class TestRunReview(RunReviewCase):
         self.assertEqual(self.calls, [])
 
 
+
+VERDICT = '<<<GG_VERDICT\n{"verdict": "%s", "reason": "%s"}\nGG_VERDICT>>>'
+
+
+class TestVerifyPass(RunReviewCase):
+    """Pass 2: one call per finding whose whole job is to disprove it."""
+
+    def one(self, **kw):
+        rv = review()
+        f = gg.Finding(severity=kw.pop("severity", "bug"), path="fs/f2fs/data.c", line=221,
+                       side="RIGHT", title="lock leak", body="b", evidence="e", **kw)
+        rv.findings = [f]
+        return rv, f
+
+    def test_a_confirmed_verdict_lands_on_the_finding(self):
+        self.answer(VERDICT % ("CONFIRMED", "out_unlock at data.c:224 does not drop it"))
+        rv, f = self.one()
+        gg.run_verify(rv)
+        self.assertEqual(f.verdict, "CONFIRMED")
+        self.assertIn("data.c:224", f.verdict_reason)
+        self.assertEqual(rv.status, "done")
+
+    def test_a_disproved_finding_goes_to_dropped_and_stays_there(self):
+        self.answer(VERDICT % ("FALSE", "the caller holds i_lock at data.c:198"))
+        rv, f = self.one()
+        gg.run_verify(rv)
+        self.assertEqual(f.verdict, "FALSE")
+        self.assertEqual(gg._find_bucket(f), "dropped")
+        _, _, dropped = gg.review_history(rv.repo, rv.number)
+        self.assertIn(f.digest, dropped)
+        later = review()
+        later.findings = [gg.Finding(path="fs/f2fs/data.c", line=221, title="lock leak")]
+        gg.apply_history(later)
+        self.assertEqual(later.findings[0].verdict, "FALSE")
+
+    def test_the_check_runs_in_the_worktree_and_sees_the_claim(self):
+        self.answer(VERDICT % ("CONFIRMED", "r"))
+        rv, f = self.one()
+        gg.run_verify(rv)
+        p = self.calls[0]["prompt"]
+        self.assertEqual(self.calls[0]["cwd"], rv.worktree)
+        self.assertEqual(self.calls[0]["phase"], "verify")
+        for want in ("lock leak", "fs/f2fs/data.c", "evidence offered: e", "GG_VERDICT>>>",
+                     "STEP 2 — argue as the author."):
+            self.assertIn(want, p, want)
+
+    def test_an_unusable_answer_leaves_it_plausible_rather_than_dropping_it(self):
+        self.answer("I am not sure, it depends.")
+        rv, f = self.one()
+        gg.run_verify(rv)
+        self.assertEqual(f.verdict, "PLAUSIBLE")
+        self.assertIn("agreed form", f.verdict_reason)
+
+    def test_a_crashing_check_does_not_drop_the_finding(self):
+        self.answer(ValueError("claude: rate limited"))
+        rv, f = self.one()
+        gg.run_verify(rv)
+        self.assertEqual(f.verdict, "PLAUSIBLE")
+        self.assertIn("rate limited", f.verdict_reason)
+
+    def test_a_corrected_line_is_re_anchored(self):
+        self.answer('<<<GG_VERDICT\n{"verdict": "CONFIRMED", "reason": "r", "line": 999}\nGG_VERDICT>>>')
+        rv, f = self.one()
+        gg.run_verify(rv)
+        self.assertIn(f.line, rv.file("fs/f2fs/data.c").touched("RIGHT"))
+        self.assertEqual(f.anchor, "moved")
+
+    def test_an_already_settled_finding_is_not_checked_again(self):
+        self.answer(VERDICT % ("CONFIRMED", "r"))
+        rv, f = self.one(state="ignored")
+        gg.run_verify(rv)
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(f.verdict)
+
+    def test_run_review_verifies_by_default_and_can_be_told_not_to(self):
+        self.answer(block(GOOD), VERDICT % ("FALSE", "no"))
+        rv = review()
+        gg.run_review(rv)
+        self.assertEqual(rv.findings[0].verdict, "FALSE")
+        self.assertEqual(len(self.calls), 2)
+
+        self.calls.clear()
+        os.remove(gg.reviews_path("test/repo"))   # else the FALSE above is carried forward, as it should be
+        self.answer(block(GOOD))
+        rv2 = review()
+        gg.run_review(rv2, verify=False)
+        self.assertIsNone(rv2.findings[0].verdict)
+        self.assertEqual(len(self.calls), 1)
+
+
+class TestSubjectiveDiscipline(RunReviewCase):
+    def subjective(self, n):
+        rv = review()
+        rv.findings = [gg.Finding(severity="style", path="fs/f2fs/data.c", line=221,
+                                  title=f"remark {i}", evidence="e" if i < 2 else None)
+                       for i in range(n)]
+        return rv
+
+    def test_at_most_three_remarks_survive(self):
+        rv = self.subjective(6)
+        gg.cap_subjective(rv)
+        kept = [f for f in rv.findings if f.verdict != "FALSE"]
+        self.assertEqual(len(kept), gg.SUBJECTIVE_CAP)
+        self.assertTrue(all("cap of 3" in f.verdict_reason for f in rv.findings if f.verdict == "FALSE"))
+
+    def test_the_ones_with_evidence_are_the_ones_kept(self):
+        rv = self.subjective(6)
+        gg.cap_subjective(rv)
+        kept = [f.title for f in rv.findings if f.verdict != "FALSE"]
+        self.assertIn("remark 0", kept)
+        self.assertIn("remark 1", kept)
+
+    def test_three_or_fewer_are_left_alone(self):
+        rv = self.subjective(3)
+        gg.cap_subjective(rv)
+        self.assertEqual([f.verdict for f in rv.findings], [None, None, None])
+
+    def test_defects_are_never_capped(self):
+        rv = review()
+        rv.findings = [gg.Finding(severity="bug", path="a", line=1, title=f"bug {i}") for i in range(6)]
+        gg.cap_subjective(rv)
+        self.assertEqual([f.verdict for f in rv.findings], [None] * 6)
+
+    def test_remarks_are_held_back_while_a_confirmed_defect_stands(self):
+        rv = review()
+        rv.findings = [gg.Finding(severity="bug", path="fs/f2fs/data.c", line=221, title="real",
+                                  verdict="CONFIRMED"),
+                       gg.Finding(severity="style", path="fs/f2fs/data.c", line=221, title="remark")]
+        self.assertTrue(gg.subjective_held(rv))
+        shown = [r.text for r in gg.findings_rows(rv, "open", 40)]
+        self.assertFalse(any("remark" in t for t in shown))
+        self.assertTrue(any("held back" in t for t in shown))
+
+    def test_a_merely_plausible_defect_does_not_hold_them_back(self):
+        rv = review()
+        rv.findings = [gg.Finding(severity="bug", path="fs/f2fs/data.c", line=221, title="maybe",
+                                  verdict="PLAUSIBLE"),
+                       gg.Finding(severity="style", path="fs/f2fs/data.c", line=221, title="remark")]
+        self.assertFalse(gg.subjective_held(rv))
+
 if __name__ == "__main__":
     unittest.main()
