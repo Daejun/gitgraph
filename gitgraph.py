@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.15.1"
+VERSION = "0.16.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -896,8 +896,33 @@ def ai_backend(binpath=None):
     return "generic"
 
 
+AI_FAILURES = []   # {"bin", "msg", "t"} appended when the AI CLI fails; the tui offers to switch
+
+
+def switch_ai(name):
+    """Use another AI CLI from now on (this process and the config file)."""
+    global CLAUDE_BIN, IS_CLAUDE
+    CLAUDE_BIN = name
+    IS_CLAUDE = os.path.basename(name) == "claude"
+    CONFIG["claude_bin"] = name
+    save_config()
+
+
+def installed_ais(exclude=None):
+    import shutil
+    return [n for n in AI_BACKENDS if n != exclude and shutil.which(n)]
+
+
 def claude_call(prompt, model, phase, timeout=300):
     """Run the configured AI CLI non-interactively; return the reply text and add its usage (claude only) to USAGE."""
+    try:
+        return _ai_call(prompt, model, phase, timeout)
+    except Exception as e:  # noqa: BLE001
+        AI_FAILURES.append({"bin": CLAUDE_BIN, "msg": str(e)[:200], "t": time.time()})
+        raise
+
+
+def _ai_call(prompt, model, phase, timeout=300):
     kind = ai_backend()
     outfile = None
     if kind == "claude":
@@ -2564,6 +2589,8 @@ HELP = """gg tui — lazygit style layout
                   drag the border between the side column and main to resize (gg config side_width keeps it)
   O               options menu (comments / translation / summaries / people / hops / theme / screen)
   ?               key menu for the focused panel (Enter runs the action)     F1  this text
+  (AI failures)   when the AI CLI fails (not logged in, expired token, missing), a popup offers to switch to an
+                  installed alternative (codex / gemini / grok), keep trying, or turn AI features off
 
   legend          YYYY-MM-DD = when the issue/PR was opened, +Nd = a comment N days later; [I] issue [PR] pull request,
                   [draft]/[merged]/[closed] only when not open; → refs / ← cited-by; → closes / ← closed-by;
@@ -2711,6 +2738,7 @@ class Tui:
         self.last_refresh, self._new_g = time.time(), None
         self.enriched = set()
         self.ask_thread, self.ask_state = None, None
+        self.ai_prompted = 0   # how many AI failures the switch popup has already handled
         self.mouse_ev, self.last_click = None, (0.0, -1, "")
         self.tr_saved = self.o["translate"] if self.o["translate"] != "none" else "zh"
         global PROGRESS
@@ -4509,6 +4537,29 @@ class Tui:
         if code is not None and code != ord("q"):
             self.handle_key(code)
 
+    def offer_ai_switch(self, fail):
+        """After an AI CLI failure: switch to an installed alternative, keep trying, or turn AI features off."""
+        cur = os.path.basename(fail["bin"])
+        alts = installed_ais(exclude=cur)
+        items = [(f"switch to {a}   ({AI_BACKENDS[a][0].split(':')[0]})", ("switch", a)) for a in alts]
+        items += [(f"keep {cur} and try again later" + (f"   (login: {AI_BACKENDS[cur][1]})" if cur in AI_BACKENDS and AI_BACKENDS[cur][1] else ""), ("keep", None)),
+                  ("turn AI features off for this session (no translation / summaries / questions)", ("off", None))]
+        choice = self.popup_menu(f"{cur} failed: {trunc(fail['msg'], 70)}", items)
+        if not choice or choice[0] == "keep":
+            self.msg = f"{cur} kept — gg ai switches the AI CLI"
+            return
+        if choice[0] == "off":
+            self.o["translate"], self.o["summary"], self.auto_tr = "none", False, False
+            self.enriched = set()
+            self.msg = "AI features off for this session (gg ai / O to change)"
+            self.refresh_all()
+            return
+        switch_ai(choice[1])
+        self.enriched = set()
+        self.ai_prompted = len(AI_FAILURES)
+        self.msg = f"AI CLI = {choice[1]} (saved with gg config claude_bin)"
+        self.refresh_all()
+
     def options_menu(self):
         o = self.o
         items = [(f"comments: {o['comments']}  (cycle)", ord("c")),
@@ -4516,6 +4567,7 @@ class Tui:
                  (f"summaries: {'on' if o['summary'] else 'off'}  (toggle)", ord("s")),
                  (f"people nodes: {'on' if o['people'] else 'off'}  (toggle)", ord("p")),
                  (f"hops: {o['hops']}  (cycle 1/2/3)", ord("h")),
+                 (f"AI CLI: {os.path.basename(CLAUDE_BIN)}  (gg ai to change)", None),
                  (f"theme: {THEME}  (cycle)", ord("T")),
                  (f"screen mode: {self.screen}  (cycle)", ord("+")),
                  (f"side width: {self.side_width:.2f}  (drag the border with the mouse; gg config side_width)", None),
@@ -4547,6 +4599,9 @@ class Tui:
                 top = self.panels["main"].top
                 self.refresh_main()
                 self.panels["main"].top = top
+            if len(AI_FAILURES) > self.ai_prompted and not self.busy():
+                self.ai_prompted = len(AI_FAILURES)
+                self.offer_ai_switch(AI_FAILURES[-1])
             self.scr.timeout(400 if self.busy() else 500)
             self.draw()
             k = self.read_key()

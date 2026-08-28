@@ -57,7 +57,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 
 | key | env | default | meaning |
 |---|---|---|---|
-| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | the AI CLI for translation / summaries / questions, chosen with `gg ai`: `claude` (`-p --output-format json --model …`), `codex` (`codex exec … -o FILE`), `gemini` / `grok` / anything else (`-p PROMPT`, its own default model). Only claude reports token usage |
+| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | the AI CLI for translation / summaries / questions, chosen with `gg ai`: `claude` (`-p --output-format json --model …`), `codex` (`codex exec … -o FILE`), `gemini` / `grok` / anything else (`-p PROMPT`, its own default model). Only claude reports token usage. When the chosen CLI fails (not logged in, expired token, missing) the TUI pops up an offer to switch to an installed alternative, keep trying, or turn AI features off for the session |
 | `repos` | `GITGRAPH_REPOS` | | default repos, comma separated |
 | `me` | `GITGRAPH_ME` | gh accounts | logins that count as "me" in the TUI home |
 | `lang` | `GITGRAPH_LANG` | `Korean` | language of translations, summaries and answers |

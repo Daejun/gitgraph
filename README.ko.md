@@ -57,7 +57,7 @@ gg update                 # 설치 갱신
 
 | 키 | 환경변수 | 기본값 | 의미 |
 |---|---|---|---|
-| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | 번역·요약·질문에 쓰는 AI CLI, `gg ai`로 선택: `claude`(`-p --output-format json --model …`), `codex`(`codex exec … -o FILE`), `gemini`/`grok`/그 밖(`-p PROMPT`, 자체 기본 모델). 토큰 집계는 claude만 |
+| `claude_bin` | `GITGRAPH_CLAUDE` | `claude` | 번역·요약·질문에 쓰는 AI CLI, `gg ai`로 선택: `claude`(`-p --output-format json --model …`), `codex`(`codex exec … -o FILE`), `gemini`/`grok`/그 밖(`-p PROMPT`, 자체 기본 모델). 토큰 집계는 claude만. 선택한 CLI가 실패하면(로그인 안 됨·토큰 만료·미설치) TUI가 팝업으로 설치된 대안으로 전환 / 계속 시도 / 이 세션 AI 기능 끄기를 제안 |
 | `repos` | `GITGRAPH_REPOS` | | 기본 repo, 콤마 구분 |
 | `me` | `GITGRAPH_ME` | gh 계정들 | TUI home에서 "나"로 볼 login |
 | `lang` | `GITGRAPH_LANG` | `Korean` | 번역·요약·답변 언어 |
