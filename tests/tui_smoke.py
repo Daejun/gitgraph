@@ -697,6 +697,57 @@ def ai_failure_popup():
         s.kill()
 
 
+def review_mode():
+    """0.22.0: v opens the three-column review of a PR. The fixture home has no clone of test/repo, so
+    this also pins what happens when the worktree cannot be made: an explanation, not a traceback."""
+    s = Session(["--no-summary", "-t", "none", "5"])       # gg 5 = start on PR #5
+    try:
+        s.wait_for("6 People", 30)
+        s.settle()
+        check("the tui starts on the PR", (current_item(s) or "").endswith("#5"), str(current_item(s)))
+        s.key("v", 2.0)
+        s.settle()
+        txt = s.text()
+        check("review mode draws its three panels",
+              all(t in txt for t in ("1 Files", "2 Diff", "3 Findings")), txt[:400])
+        check("the graph panels are gone", "6 People" not in txt, txt[:200])
+        st = s.cache("state.json") or {}
+        check("state.json says review mode",
+              st.get("mode") == "review" and (st.get("review") or {}).get("number") == 5,
+              str(st.get("review"))[:300])
+        check("a missing local clone is explained, not a traceback", "no local clone" in txt, txt[:700])
+        s.key("3")
+        s.key("]", 0.8)
+        check("the Findings tabs switch", "[posted]" in s.text(), s.line(0))
+        for _ in range(4):
+            s.key("]", 0.4)
+        check("the github tab lists the PR's threads even though the worktree failed",
+              "@bob" in s.text(), s.text()[:700])
+        s.key("v", 1.0)
+        check("v returns to the graph", "6 People" in s.text(), s.text()[:200])
+        check("the graph is still usable afterwards", "test/repo" in s.text())
+        check("no traceback in review mode", "Traceback" not in s.log(),
+              "\n".join(l for l in s.log().splitlines() if "Traceback" in l or "Error" in l)[:600])
+    finally:
+        s.kill()
+
+
+def review_mode_narrow():
+    """80 columns: the three columns stack instead of being squeezed into nothing."""
+    s = Session(["--no-summary", "-t", "none", "5"], rows=30, cols=80)
+    try:
+        s.wait_for("6 People", 30)
+        s.settle()
+        s.key("v", 2.0)
+        s.settle()
+        txt = s.text()
+        check("narrow review stacks the panels",
+              all(t in txt for t in ("1 Files", "2 Diff", "3 Findings")), txt[:500])
+        check("no traceback when narrow", "Traceback" not in s.log())
+    finally:
+        s.kill()
+
+
 def main():
     home = testenv.make_home()
     print(f"# temp HOME: {home}")
@@ -726,6 +777,8 @@ def main():
     finally:
         s.kill()
 
+    review_mode()
+    review_mode_narrow()
     cold_start_paints_early()
     cross_repo_mark()
     portrait_and_theme()

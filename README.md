@@ -38,6 +38,7 @@ gg graph                  # text graph: overview of everything open, as a tree
 gg graph -l log           # git log --graph style timeline
 gg graph 768 --hops 1     # text graph around #768
 gg show 748               # one node in detail: every edge, comments, body
+gg review 779             # review a PR: its diff from a worktree of your own checkout (v in the TUI)
 gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with the item as context
 gg ai [NAME]              # list / pick the AI CLI: claude, codex, gemini, grok, … (installed ones are shown)
 gg config [KEY [VALUE]]   # persistent settings
@@ -68,6 +69,9 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | how many `gh` queries run at the same time while filling the cache (first run, refresh). A round trip to GitHub costs ~0.4s whatever it asks for, so this is what makes a cold start fast; on a repo with hundreds of open items raising it to 12 is measurably quicker still |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
+| `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | review mode: width of the Files and Findings columns |
+| `worktree_keep_days` · `worktree_max` | `GITGRAPH_WORKTREE_KEEP_DAYS` · `GITGRAPH_WORKTREE_MAX` | `7` · `5` | review mode: how long a PR worktree is kept, and how many. A kernel checkout is well over a gigabyte, so these are not a formality — `gg cache` lists them with their real size |
+| `review_subjective` | `GITGRAPH_REVIEW_SUBJECTIVE` | `auto` | review mode: style/design remarks — `auto` hides them while a confirmed defect stands, `always`, `never` |
 | `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | markdown written from the marks made with `m` |
 | `theme` | `GITGRAPH_THEME` | `dark` | colour theme, like vim's `bg=`: `dark` (256 colours), `light` (darker tones for a light background), `basic` (8 colours, no dim, no dark blue — PuTTY and other plain terminals). `--theme` for one run, `T` in the TUI to cycle |
 
@@ -165,6 +169,55 @@ Under tmux enable mouse reporting (`set -g mouse on`).
 
 Tests: `python3 tests/run.py` runs everything — a syntax check, the stdlib-`unittest` suites, the golden renderings and `tests/tui_smoke.py`, which drives the TUI in a pseudo-terminal and renders it with `tests/vt.py`. It all runs against a fixture repo in a throwaway `HOME`, so no `gh` login, no network and no AI CLI are needed, and your own cache is never touched. One suite: `python3 tests/run.py unit`; one test: `python3 -m unittest tests.test_parse.TestRefs.test_fence`.
 
+## Review mode (`v`, `gg review`)
+
+`v` on a pull request replaces the whole screen with three panels — Files, Diff, Findings — and `v` (or Esc) goes back to the graph. `gg review 779` starts there directly.
+
+The code comes from **your own checkout, not the API**: gg fetches `refs/pull/N/head` and the base branch into `refs/gg/<owner>__<name>/pr-N` in the clone it discovered, checks the head out as a detached `git worktree` under `~/.cache/gitgraph/worktrees/<repo>/pr-N`, and lets `git diff <merge-base> …` produce the patch. Nothing is truncated the way `pulls/N/files` truncates a large PR, and a review can open the whole function a hunk sits in — not just the hunk. Without a local clone of the repo, review mode says so and stops; it never guesses.
+
+```
+╭─1 Files────────────────────╮╭─2 Diff  extent.c ──────────────────────╮╭─3 Findings [open] posted─╮
+│#779 mtfs: update owner ext…││▾ @@ -220,6 +220,7 @@ mtfs_drop_extent  ││● bug 1                   │
+│open · @someone · 0113d1f   ││    220       if (!page)                ││ #1 ✓ lock leak on the ou…│
+│2 files +163 -166           ││    221 -         return -ENOMEM;       ││   extent.c:221           │
+│                            ││⚠   221 +         goto out_unlock;      ││● logic 1                 │
+│▸ extent.c    +163 -156 ⚠   ││    222 +                               ││ #2 ? renaming segno wid… │
+│  mtfs.h        +0 -10      ││    223       spin_lock(&sbi->lock);    ││   gc.c:88                │
+│                            ││    224   out_unlock:                   ││                          │
+│worktree 789.7K             ││    225       spin_unlock(&sbi->lock);  ││                          │
+╰────────────────────────────╯╰────────────────────────────────────────╯╰──────────────────────────╯
+ ⏎ show this file's diff  r reload  R refetch  o browser  v back to the graph
+```
+
+| panel | shows | Enter |
+|---|---|---|
+| 1 Files | the PR, then one row per changed file: `+added -deleted` and the worst finding on it (`⚠` defect, `ℹ` remark). The last line is what the worktree costs on disk | show that file's diff in Diff |
+| 2 Diff | the file's unified diff, five lines of context, hunks foldable. The gutter is the line number in the new file (the old one for removed lines) and a marker when a finding sits there. Tabs expand to four columns | fold / unfold the hunk |
+| 3 Findings | tabs (`[` `]`): **open** · **posted** · **ignored** · **dropped** (disproved) · **changes** (how the review split the diff up, and whether the changed code is reachable at all) · **github** (the review threads already on the PR, so you do not repeat a human). Each finding shows its verdict — `✓` confirmed, `?` plausible — its file and line, and `⚠` when gg had to pull it onto the nearest changed line (GitHub refuses a comment anywhere else) | jump the Diff panel to that line |
+
+The screen adapts: three columns while the diff can keep 56 of them, otherwise Findings folds into a strip under the diff, and at ≤ 84 columns the three stack. `+`/`_` and the panel keys work as everywhere else.
+
+| key | action |
+|---|---|
+| `v` · Esc | into review mode on the PR under the cursor · back to the graph |
+| `1` `2` `3` · Tab | Files · Diff · Findings · cycle |
+| Enter | see the table above |
+| `x` | ignore this finding, or take the ignore back (remembered per PR, across new commits) |
+| `r` · `R` | reload the PR and its diff · refetch, ignoring what is cached for this head |
+| `o` · `y` | open the PR — or the exact file and line under the cursor — in the browser · copy that URL |
+| `/` `n` `N` · `?` | search the focused panel · key menu for it |
+
+```
+gg review 779             # the TUI in review mode on PR #779
+gg review 779 --print     # the PR, its files and any cached findings, to stdout
+gg review 779 --json      # the same as JSON (files, hunks are re-read from the worktree)
+gg review 779 --refresh   # ignore what is cached for this head and read it again
+```
+
+Findings are produced by an AI pass that is not wired up yet (`docs/PLAN-review-mode.md` has the design); until it lands the Findings panel shows GitHub's own review threads and whatever was cached earlier. Everything else here works without an AI CLI.
+
+While review mode is open, `gg mcp` reports it: `gg_state` names the PR, its files, the finding counts and the finding under the cursor, and `gg_context` takes `finding:<fid>` for one finding in full or `file:<path>` for the reviewed file straight out of the worktree.
+
 ## Local data
 
 Everything gg keeps is under `~/.cache/gitgraph/` (mode 0700, files 0600 — it contains the bodies and comments of private repos) plus two small files under `~/.config/gitgraph/`:
@@ -176,10 +229,12 @@ Everything gg keeps is under `~/.cache/gitgraph/` (mode 0700, files 0600 — it 
 | `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI results keyed by text hash | capped (oldest dropped beyond 20k entries) |
 | `tui.log` | tui stderr / progress | cut back beyond 1 MB |
 | `accounts.json` | which gh account can see which repo | overwritten when it changes |
+| `reviews__<repo>.json` | review findings per PR of one repo, and what was posted / ignored / disproved | kept; the per-digest history survives new commits so nothing is re-offered |
+| `worktrees/<repo>/pr-N/` | the PR head checked out for review (a real `git worktree` of your clone) | dropped after `worktree_keep_days`, and beyond `worktree_max` oldest first; `gg cache clear review` removes them properly (`git worktree remove` plus the `refs/gg/…` refs) |
 | `state.json`, `cmd*.json` | what the tui shows (for `gg mcp`) | overwritten |
 | `~/.config/gitgraph/config.json`, `todo.json` (+ the `todo_file` markdown) | settings, your marks | yours |
 
-`gg cache` lists all of it with sizes and ages; `gg cache clear all|items|ai|logs|owner/name` removes it (everything is re-fetched or re-generated on demand).
+`gg cache` lists all of it with sizes and ages; `gg cache clear all|items|ai|logs|review|owner/name` removes it (everything is re-fetched or re-generated on demand).
 
 ## GitHub Enterprise
 

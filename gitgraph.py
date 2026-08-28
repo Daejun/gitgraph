@@ -14,6 +14,7 @@ Usage:
   gg todo done|remove ID                  tick off / delete a mark (ID: 750, #750, owner/name#750, comment url); clear-done drops ticked ones
   gg check [-r owner/name]                diagnose: gh accounts for the host, access, open counts, GraphQL fields
   gg mcp                                  MCP stdio server for Claude Code in another window (claude mcp add -s user gg -- gg mcp)
+  gg review 123                           a PR's changed files and diff, from a worktree of the local checkout
   gg cache [clear all|items|ai|logs|REPO] what is stored locally (issue/PR bodies, AI results, logs) and how to remove it
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
@@ -30,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.21.0"
+VERSION = "0.22.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -56,6 +57,12 @@ CONFIG_KEYS = {
     "expanded_weight": ("GITGRAPH_EXPANDED_WEIGHT", "2", "tui: how much taller the focused side panel is"),
     "screen_mode": ("GITGRAPH_SCREEN_MODE", "normal", "tui: normal | half | full (+ / _ cycle at runtime)"),
     "border": ("GITGRAPH_BORDER", "rounded", "tui: rounded | single | double | bold | hidden"),
+    "worktree_keep_days": ("GITGRAPH_WORKTREE_KEEP_DAYS", "7", "review: drop a PR worktree unused for this many days"),
+    "worktree_max": ("GITGRAPH_WORKTREE_MAX", "5", "review: how many PR worktrees to keep (oldest go first)"),
+    "review_subjective": ("GITGRAPH_REVIEW_SUBJECTIVE", "auto",
+                          "review: style/design remarks — auto (hidden while a confirmed defect stands) | always | never"),
+    "review_files_width": ("GITGRAPH_REVIEW_FILES_WIDTH", "0.22", "review: fraction of the width for the Files column"),
+    "review_findings_width": ("GITGRAPH_REVIEW_FINDINGS_WIDTH", "0.30", "review: fraction of the width for the Findings column"),
 }
 
 
@@ -134,7 +141,7 @@ def config_cmd(args):
     if not args:
         for k, (env, default, help_) in CONFIG_KEYS.items():
             src = "env" if os.environ.get(env) else ("config" if CONFIG.get(k) else "default")
-            print(f"{k:12} = {cfg(k) or '(empty)':24} [{src:7}]  {help_}")
+            print(f"{k:21} = {cfg(k) or '(empty)':24} [{src:7}]  {help_}")
         print(f"\nfile: {CONFIG_PATH}   (env var wins over the file; CLI options win over both)")
         return 0
     if args[0] == "unset":
@@ -229,6 +236,8 @@ def discover_repos(root, depth=2):
             rank = (d.count(os.sep), rank_remote, os.path.basename(d) != split_repo(repo)[2], d)
             if repo not in best or rank < best[repo][0]:
                 best[repo] = (rank, d)
+    for repo, (_, d) in best.items():
+        CHECKOUTS[repo] = d          # `gg review` needs the tree itself, not just the repo name
     return sorted(((repo, d) for repo, (rank, d) in best.items()), key=lambda x: best[x[0]][0])
 
 
@@ -368,6 +377,8 @@ def unfork(repos):
     for repo in repos:
         parent = parent_repo(repo)
         if parent:
+            if repo in CHECKOUTS:
+                CHECKOUTS.setdefault(parent, CHECKOUTS[repo])   # the PR lives upstream, the objects here
             if parent not in out:
                 log(f"{repo} is a fork of {parent}; using {parent} (pass -r {repo} to look at the fork itself)")
                 out.append(parent)
@@ -1136,6 +1147,11 @@ def switch_ai(name):
     IS_CLAUDE = os.path.basename(name) == "claude"
     CONFIG["claude_bin"] = name
     save_config()
+
+
+def ai_available():
+    import shutil
+    return bool(shutil.which(CLAUDE_BIN))
 
 
 def installed_ais(exclude=None):
@@ -1953,6 +1969,701 @@ def resolve_root(g, root):
 
 
 # --------------------------------------------------------------------------
+# PR review: local worktree, diff model, findings cache
+# --------------------------------------------------------------------------
+# Reviewing a PR needs the code, not just the patch: the analysis has to be able to open the whole
+# function a hunk sits in. So gg pulls refs/pull/N/head into a detached worktree of a checkout it
+# already found (docs/PLAN-review-mode.md) and lets git produce the diff — no API truncation, and the
+# context width is ours to choose.
+WORKTREE_KEEP_DAYS = int(cfg("worktree_keep_days") or 7)
+WORKTREE_MAX = int(cfg("worktree_max") or 5)
+
+SEVERITIES = ["reach", "bug", "regress", "logic", "style", "design"]
+SUBJECTIVE = ("style", "design")
+VERDICTS = ["CONFIRMED", "PLAUSIBLE", "FALSE"]
+
+
+class Hunk:
+    __slots__ = ("old_start", "old_lines", "new_start", "new_lines", "heading", "lines",
+                 "_old_left", "_new_left", "_old_no", "_new_no")
+
+    def __init__(self, old_start, old_lines, new_start, new_lines, heading=""):
+        self.old_start, self.old_lines = old_start, old_lines
+        self.new_start, self.new_lines = new_start, new_lines
+        self.heading = heading
+        self.lines = []                 # [(tag, old_no, new_no, text)]  tag: " " | "+" | "-"
+        self._old_left, self._new_left = old_lines, new_lines
+        self._old_no, self._new_no = old_start, new_start
+
+    @property
+    def header(self):
+        o = f"-{self.old_start}" + (f",{self.old_lines}" if self.old_lines != 1 else "")
+        n = f"+{self.new_start}" + (f",{self.new_lines}" if self.new_lines != 1 else "")
+        return f"@@ {o} {n} @@" + (f" {self.heading}" if self.heading else "")
+
+    def done(self):
+        return self._old_left <= 0 and self._new_left <= 0
+
+    def touched(self, side):
+        """Line numbers this hunk changed on one side — the only lines GitHub accepts a comment on."""
+        want = "+" if side == "RIGHT" else "-"
+        idx = 2 if side == "RIGHT" else 1
+        return {ln[idx] for ln in self.lines if ln[0] == want and ln[idx] is not None}
+
+
+class DiffFile:
+    __slots__ = ("path", "old_path", "status", "additions", "deletions", "hunks", "binary", "no_newline")
+
+    def __init__(self):
+        self.path, self.old_path, self.status = None, None, "modified"
+        self.additions, self.deletions = 0, 0
+        self.hunks, self.binary, self.no_newline = [], False, False
+
+    def touched(self, side):
+        out = set()
+        for h in self.hunks:
+            out |= h.touched(side)
+        return out
+
+    def nearest(self, side, line):
+        """The changed line closest to `line` on `side`, or None when the file has none."""
+        cand = self.touched(side)
+        return min(cand, key=lambda n: (abs(n - line), n)) if cand else None
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: ?(.*))?$")
+_GIT_AB_RE = re.compile(r"^a/(.+) b/\1$")
+
+
+def parse_unified_diff(text):
+    """`git diff` output -> [DiffFile].
+
+    Paths are taken from the ---/+++ (or rename) lines, never from `diff --git`, whose `a/X b/Y` split
+    is ambiguous when a path contains a space. Header lines are only read outside a hunk, and a hunk
+    ends when its declared line counts run out — that is what keeps a context line reading `--- foo`
+    from being mistaken for a file header.
+    """
+    files, f, h = [], None, None
+
+    def flush():
+        nonlocal f, h
+        if f is not None:
+            if f.path is None:
+                f.path = f.old_path
+            if f.old_path is None:
+                f.old_path = f.path
+            files.append(f)
+        f, h = None, None
+
+    for raw in (text or "").splitlines():
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if h is not None and not h.done():
+            tag, body = (" ", "") if line == "" else (line[0], line[1:])
+            if tag == "\\":                       # "\ No newline at end of file": not a content line
+                f.no_newline = True
+                continue
+            if tag == " ":
+                h.lines.append((" ", h._old_no, h._new_no, body))
+                h._old_no += 1
+                h._new_no += 1
+                h._old_left -= 1
+                h._new_left -= 1
+                continue
+            if tag == "-":
+                h.lines.append(("-", h._old_no, None, body))
+                h._old_no += 1
+                h._old_left -= 1
+                f.deletions += 1
+                continue
+            if tag == "+":
+                h.lines.append(("+", None, h._new_no, body))
+                h._new_no += 1
+                h._new_left -= 1
+                f.additions += 1
+                continue
+            h = None                              # malformed hunk: fall through and re-read as a header
+        if line.startswith("diff --git "):
+            flush()
+            f = DiffFile()
+            m = _GIT_AB_RE.match(line[len("diff --git "):])
+            if m:
+                f.path = f.old_path = m.group(1)
+            continue
+        if f is None:
+            continue
+        if line.startswith("@@"):
+            m = _HUNK_RE.match(line)
+            if m:
+                h = Hunk(int(m.group(1)), int(m.group(2) or 1), int(m.group(3)), int(m.group(4) or 1),
+                         (m.group(5) or "").strip())
+                f.hunks.append(h)
+                if h.done():                      # an empty hunk cannot consume lines
+                    h = None
+            continue
+        if line.startswith("new file mode "):
+            f.status = "added"
+        elif line.startswith("deleted file mode "):
+            f.status = "deleted"
+        elif line.startswith("rename from "):
+            f.status, f.old_path = "renamed", line[len("rename from "):]
+        elif line.startswith("rename to "):
+            f.status, f.path = "renamed", line[len("rename to "):]
+        elif line.startswith("copy from "):
+            f.status, f.old_path = "copied", line[len("copy from "):]
+        elif line.startswith("copy to "):
+            f.status, f.path = "copied", line[len("copy to "):]
+        elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            f.binary = True
+        elif line.startswith("--- "):
+            p = line[4:]
+            if p != "/dev/null":
+                f.old_path = p[2:] if p.startswith("a/") else p
+            else:
+                f.status = "added"
+        elif line.startswith("+++ "):
+            p = line[4:]
+            if p != "/dev/null":
+                f.path = p[2:] if p.startswith("b/") else p
+            else:
+                f.status = "deleted"
+    flush()
+    return files
+
+
+class Change:
+    __slots__ = ("cid", "kind", "path", "symbol", "summary")
+
+    def __init__(self, cid="", kind="", path="", symbol="", summary=""):
+        self.cid, self.kind, self.path, self.symbol, self.summary = cid, kind, path, symbol, summary
+
+    def to_json(self):
+        return {"cid": self.cid, "kind": self.kind, "path": self.path, "symbol": self.symbol,
+                "summary": self.summary}
+
+    @classmethod
+    def from_json(cls, d):
+        return cls(**{k: d.get(k, "") for k in ("cid", "kind", "path", "symbol", "summary")})
+
+
+class Finding:
+    FIELDS = ("fid", "cid", "severity", "path", "line", "end_line", "side", "title", "body",
+              "evidence", "diff", "verdict", "verdict_reason", "anchor", "state", "posted_at",
+              "thread_url", "digest", "error")
+    __slots__ = FIELDS
+
+    def __init__(self, **kw):
+        for k in self.FIELDS:
+            setattr(self, k, kw.get(k))
+        self.severity = self.severity or "logic"
+        self.side = self.side or "RIGHT"
+        self.anchor = self.anchor or "ok"
+        self.state = self.state or "new"
+        self.title = self.title or ""
+        self.body = self.body or ""
+        if not self.digest:
+            self.digest = finding_digest(self.path or "", self.title)
+        if not self.fid:
+            self.fid = self.digest
+
+    @property
+    def subjective(self):
+        return self.severity in SUBJECTIVE
+
+    @property
+    def postable(self):
+        return self.anchor in ("ok", "moved") and self.verdict != "FALSE" and self.state == "new"
+
+    def to_json(self):
+        return {k: getattr(self, k) for k in self.FIELDS if getattr(self, k) is not None}
+
+    @classmethod
+    def from_json(cls, d):
+        return cls(**{k: d.get(k) for k in cls.FIELDS})
+
+
+def finding_digest(path, title):
+    """Same defect, same key — so a re-review after new commits does not re-offer what was already
+    posted, ignored or disproved."""
+    norm = re.sub(r"\s+", " ", (title or "").strip().lower())
+    return hashlib.sha1(f"{path}\n{norm}".encode()).hexdigest()[:12]
+
+
+class Review:
+    def __init__(self, repo, number, **kw):
+        self.repo, self.number = repo, number
+        self.pr_id = kw.get("pr_id")
+        self.title = kw.get("title", "")
+        self.state = kw.get("state")
+        self.draft = kw.get("draft", False)
+        self.author = kw.get("author")
+        self.url = kw.get("url")
+        self.head_ref = kw.get("head_ref")
+        self.base_ref = kw.get("base_ref")
+        self.head_oid = kw.get("head_oid")
+        self.base_oid = kw.get("base_oid")
+        self.merge_base = kw.get("merge_base")
+        self.clone = kw.get("clone")
+        self.worktree = kw.get("worktree")
+        self.wt_size = kw.get("wt_size", 0)
+        self.files = kw.get("files") or []
+        self.changes = kw.get("changes") or []
+        self.findings = kw.get("findings") or []
+        self.threads = kw.get("threads") or []
+        self.reachability = kw.get("reachability")
+        self.engine = kw.get("engine")
+        self.model = kw.get("model")
+        self.verify = kw.get("verify", False)
+        self.status = kw.get("status", "idle")
+        self.error = kw.get("error")
+        self.created = kw.get("created")
+        self.t0 = kw.get("t0")
+        self.t1 = kw.get("t1")
+
+    @property
+    def id(self):
+        return f"{self.repo}#{self.number}"
+
+    def state_label(self):
+        if self.state == "OPEN":
+            return "draft" if self.draft else "open"
+        return (self.state or "?").lower()
+
+    def file(self, path):
+        return next((f for f in self.files if f.path == path), None)
+
+    def by_file(self, path):
+        return [f for f in self.findings if f.path == path]
+
+    def counts(self):
+        c = {"open": 0, "confirmed": 0, "plausible": 0, "posted": 0, "ignored": 0, "dropped": 0}
+        for f in self.findings:
+            if f.verdict == "FALSE":
+                c["dropped"] += 1
+            elif f.state == "posted":
+                c["posted"] += 1
+            elif f.state == "ignored":
+                c["ignored"] += 1
+            else:
+                c["open"] += 1
+                if f.verdict == "CONFIRMED":
+                    c["confirmed"] += 1
+                elif f.verdict == "PLAUSIBLE":
+                    c["plausible"] += 1
+        return c
+
+    def stats(self):
+        return sum(f.additions for f in self.files), sum(f.deletions for f in self.files)
+
+    def to_json(self):
+        return {"base_oid": self.base_oid, "merge_base": self.merge_base, "head_ref": self.head_ref,
+                "base_ref": self.base_ref, "title": self.title, "engine": self.engine,
+                "model": self.model, "verify": self.verify, "created": self.created,
+                "reachability": self.reachability,
+                "files": [{"path": f.path, "status": f.status, "additions": f.additions,
+                           "deletions": f.deletions} for f in self.files],
+                "changes": [c.to_json() for c in self.changes],
+                "findings": [f.to_json() for f in self.findings]}
+
+
+# ---------------------------------------------------------------- checkouts
+CHECKOUTS = {}          # repo -> a local clone of it (filled by discovery; see find_checkout)
+_scanned_for_checkouts = False
+
+
+def find_checkout(repo):
+    """A local clone of `repo`. Discovery already walks the tree, so this only rescans when a repo was
+    named on the command line and never discovered."""
+    global _scanned_for_checkouts
+    d = CHECKOUTS.get(repo)
+    if d and os.path.isdir(d):
+        return d
+    if not _scanned_for_checkouts:
+        _scanned_for_checkouts = True
+        try:
+            for r, path in discover_repos(os.getcwd()):
+                CHECKOUTS.setdefault(r, path)
+                parent = _parent_cache.get(r)
+                if parent:
+                    CHECKOUTS.setdefault(parent, path)
+        except OSError:
+            pass
+    d = CHECKOUTS.get(repo)
+    return d if d and os.path.isdir(d) else None
+
+
+def git_out(clone, *args, check=True, timeout=600):
+    r = subprocess.run(["git", "-C", clone] + list(args), capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode:
+        err = (r.stderr or r.stdout or "").strip().splitlines()
+        raise ValueError(f"git {' '.join(args[:3])}: {(err[-1] if err else 'exit ' + str(r.returncode))[:200]}")
+    return r.stdout
+
+
+def clone_remote_for(clone, repo):
+    """The remote of `clone` that points at `repo`, else an https URL for it (git's credential helper —
+    what `gh auth setup-git` installs — supplies the token). The clone is often a fork, so the remote
+    we want is not necessarily origin."""
+    for line in git_out(clone, "remote", "-v", check=False).splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        m = _REMOTE_RE.match(parts[1])
+        if m and make_repo(resolve_ssh_alias(m.group("host").lower()), m.group("owner"),
+                           m.group("name")) == repo:
+            return parts[0]
+    host, owner, name = split_repo(repo)
+    return f"https://{host}/{owner}/{name}.git"
+
+
+# ---------------------------------------------------------------- worktrees
+def worktrees_dir():
+    return os.path.join(CACHE_DIR, "worktrees")
+
+
+def worktree_path(repo, number):
+    return os.path.join(worktrees_dir(), repo.replace("/", "__"), f"pr-{number}")
+
+
+def pr_ref(repo, number, base=False):
+    """Where gg parks a fetched PR head. Namespaced by repo, because a fork's clone is also where the
+    parent's PRs are fetched from, and both can have a #7."""
+    return f"refs/gg/{repo.replace('/', '__')}/pr-{number}" + ("-base" if base else "")
+
+
+def dir_size(path):
+    total = 0
+    for dirpath, _, names in os.walk(path):
+        for n in names:
+            try:
+                total += os.lstat(os.path.join(dirpath, n)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def drop_pr_refs(clone, repo, number):
+    """Remove the refs/gg/… refs a review left in the user's clone. Kept out of drop_worktree(), which
+    also runs when a head moved and the ref is about to be checked out again."""
+    if not (clone and os.path.isdir(clone)):
+        return
+    for ref in (pr_ref(repo, number), pr_ref(repo, number, base=True)):
+        subprocess.run(["git", "-C", clone, "update-ref", "-d", ref], capture_output=True, text=True)
+
+
+def drop_worktree(wt, clone=None):
+    """Remove a review worktree properly: `git worktree remove` first, so the clone's .git/worktrees
+    metadata goes with it — an rm -rf alone leaves a stale entry behind."""
+    import shutil
+    if clone and os.path.isdir(clone):
+        subprocess.run(["git", "-C", clone, "worktree", "remove", "--force", wt],
+                       capture_output=True, text=True)
+        subprocess.run(["git", "-C", clone, "worktree", "prune"], capture_output=True, text=True)
+    if os.path.isdir(wt):
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+def review_worktree(repo, number, base_ref, head_oid=None):
+    """(clone, worktree, merge_base) for PR `number` of `repo`. Fetches refs/pull/N/head and the base
+    branch into refs/gg/ and checks the head out detached under the cache."""
+    clone = find_checkout(repo)
+    if not clone:
+        home = os.path.expanduser("~")
+        raise ValueError(f"no local clone of {repo} found under {os.getcwd().replace(home, '~')} "
+                         f"(this directory and 2 levels below)\n"
+                         f"  -> run gg from inside the checkout, or clone it there")
+    remote = clone_remote_for(clone, repo)
+    head_ref, base_local = pr_ref(repo, number), pr_ref(repo, number, base=True)
+    progress("review", 0, None, f"fetching #{number} from {remote}")
+    git_out(clone, "fetch", "--no-tags", remote,
+            f"+refs/pull/{number}/head:{head_ref}", f"+refs/heads/{base_ref}:{base_local}")
+    merge_base = git_out(clone, "merge-base", base_local, head_ref).strip()
+    oid = git_out(clone, "rev-parse", head_ref).strip()
+    wt = worktree_path(repo, number)
+    have = git_out(wt, "rev-parse", "HEAD", check=False).strip() if os.path.exists(os.path.join(wt, ".git")) else ""
+    if have != oid:
+        drop_worktree(wt, clone)
+        os.makedirs(os.path.dirname(wt), exist_ok=True)
+        progress("review", 0, None, f"checking out {oid[:7]}")
+        git_out(clone, "worktree", "add", "--detach", wt, head_ref)
+        for d in (worktrees_dir(), os.path.dirname(wt), wt):
+            try:
+                os.chmod(d, 0o700)      # a checkout of a private repo, like the rest of the cache
+            except OSError:
+                pass
+    prune_worktrees(keep=wt)
+    return clone, wt, merge_base
+
+
+def worktree_entries():
+    """[(repo, number, path, mtime)] for every review worktree in the cache."""
+    out, root = [], worktrees_dir()
+    if not os.path.isdir(root):
+        return out
+    for slug in sorted(os.listdir(root)):
+        d = os.path.join(root, slug)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if not name.startswith("pr-") or not os.path.isdir(p):
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            out.append((slug.replace("__", "/"), name[3:], p, max(st.st_mtime, st.st_atime)))
+    return out
+
+
+def prune_worktrees(keep=None):
+    """Drop review worktrees unused for WORKTREE_KEEP_DAYS, then the oldest beyond WORKTREE_MAX.
+    A kernel checkout is well over a gigabyte, so this is not a formality."""
+    now, entries = time.time(), worktree_entries()
+    doomed = [e for e in entries if e[2] != keep and now - e[3] > WORKTREE_KEEP_DAYS * 86400]
+    rest = [e for e in entries if e not in doomed]
+    rest.sort(key=lambda e: -e[3])
+    doomed += [e for e in rest[WORKTREE_MAX:] if e[2] != keep]
+    for repo, number, path, _ in doomed:
+        # CHECKOUTS.get, not find_checkout: hygiene must not walk the filesystem, and must not run
+        # `git worktree` inside a clone it merely guessed at. A leftover .git/worktrees entry is
+        # harmless — the next `git worktree prune` in that clone clears it.
+        drop_worktree(path, CHECKOUTS.get(repo))
+        drop_pr_refs(CHECKOUTS.get(repo), repo, number)
+        log(f"review: removed worktree {repo}#{number}")
+    return len(doomed)
+
+
+# ---------------------------------------------------------------- PR metadata
+PR_META_Q = """
+query($owner:String!,$name:String!,$number:Int!){
+ repository(owner:$owner,name:$name){ pullRequest(number:$number){
+  id number title state isDraft url headRefName baseRefName headRefOid baseRefOid
+  author{login} headRepository{ nameWithOwner }
+  reviewThreads(first:100){ nodes{ id isResolved isOutdated path line diffSide
+   comments(first:10){ nodes{ author{login} body createdAt url } } } } } } }
+"""
+
+
+def pr_meta(repo, number):
+    """head/base oids and the review threads already on the PR. The diff itself comes from git."""
+    host, owner, name = split_repo(repo)
+    d = graphql(PR_META_Q, {"owner": owner, "name": name, "number": int(number)}, host)
+    pr = ((d or {}).get("repository") or {}).get("pullRequest")
+    if not pr:
+        raise ValueError(f"{repo}#{number} is not a pull request (or is not visible)")
+    threads = []
+    for t in ((pr.get("reviewThreads") or {}).get("nodes") or []):
+        cs = ((t.get("comments") or {}).get("nodes") or [])
+        threads.append({"id": t.get("id"), "path": t.get("path"), "line": t.get("line"),
+                        "side": t.get("diffSide"), "resolved": bool(t.get("isResolved")),
+                        "outdated": bool(t.get("isOutdated")),
+                        "comments": [{"author": ((c.get("author") or {}).get("login") or "?"),
+                                      "body": c.get("body") or "", "created": c.get("createdAt"),
+                                      "url": c.get("url")} for c in cs]})
+    return {"pr_id": pr.get("id"), "title": pr.get("title") or "", "state": pr.get("state"),
+            "draft": bool(pr.get("isDraft")), "url": pr.get("url"),
+            "author": ((pr.get("author") or {}).get("login") or "?"),
+            "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName"),
+            "head_oid": pr.get("headRefOid"), "base_oid": pr.get("baseRefOid"), "threads": threads}
+
+
+DIFF_CONTEXT = 5
+
+
+def review_diff(clone, merge_base, ref, paths=None):
+    args = ["-c", "core.quotePath=false", "diff", "--no-color", f"-U{DIFF_CONTEXT}",
+            "--find-renames", "--no-ext-diff", f"{merge_base}", ref]
+    if paths:
+        args += ["--"] + list(paths)
+    return git_out(clone, *args)
+
+
+# ---------------------------------------------------------------- findings cache
+def reviews_path(repo):
+    return _cache_path("reviews", repo)
+
+
+def load_reviews(repo):
+    d = read_json(reviews_path(repo))
+    return d if isinstance(d, dict) else {}
+
+
+def review_history(repo, number):
+    """What is known about this PR across head SHAs: which digests were posted, ignored, disproved."""
+    e = load_reviews(repo).get(str(number)) or {}
+    return ({k: v for k, v in (e.get("posted") or {}).items()},
+            {k: v for k, v in (e.get("ignored") or {}).items()},
+            {k: v for k, v in (e.get("dropped") or {}).items()})
+
+
+def save_review(rv):
+    """Store this head's findings and fold the per-digest history forward, so a re-review after new
+    commits neither re-posts nor rediscovers what is already settled."""
+    d = load_reviews(rv.repo)
+    e = d.setdefault(str(rv.number), {})
+    e.setdefault("reviews", {})
+    e.setdefault("posted", {})
+    e.setdefault("ignored", {})
+    e.setdefault("dropped", {})
+    if rv.head_oid:
+        e["reviews"] = {rv.head_oid: rv.to_json()}     # only the current head's detail is worth keeping
+    for f in rv.findings:
+        if f.state == "posted":
+            e["posted"][f.digest] = {"head_oid": rv.head_oid, "at": f.posted_at or time.time(),
+                                     "thread_url": f.thread_url}
+        elif f.state == "ignored":
+            e["ignored"][f.digest] = {"at": time.time()}
+        elif f.verdict == "FALSE":
+            e["dropped"][f.digest] = {"at": time.time(), "reason": f.verdict_reason or ""}
+    write_json(reviews_path(rv.repo), d)
+    return reviews_path(rv.repo)
+
+
+def cached_review(repo, number, head_oid):
+    e = (load_reviews(repo).get(str(number)) or {}).get("reviews") or {}
+    return e.get(head_oid)
+
+
+def apply_history(rv):
+    """Carry posted / ignored / disproved verdicts of earlier head SHAs onto this run's findings."""
+    posted, ignored, dropped = review_history(rv.repo, rv.number)
+    for f in rv.findings:
+        if f.digest in posted:
+            f.state, f.posted_at = "posted", posted[f.digest].get("at")
+            f.thread_url = posted[f.digest].get("thread_url")
+        elif f.digest in ignored:
+            f.state = "ignored"
+        elif f.digest in dropped and not f.verdict:
+            f.verdict, f.verdict_reason = "FALSE", dropped[f.digest].get("reason") or "disproved earlier"
+    return rv
+
+
+def anchor_findings(rv):
+    """GitHub refuses an inline comment on a line the diff does not touch, so pin every finding to a
+    real changed line before it can ever be posted."""
+    for f in rv.findings:
+        df = rv.file(f.path)
+        if df is None:
+            f.anchor = "unanchored"
+            continue
+        try:
+            line = int(f.line)
+        except (TypeError, ValueError):
+            line = None
+        if line is not None and line in df.touched(f.side):
+            f.anchor, f.line = "ok", line
+        else:
+            near = df.nearest(f.side, line if line is not None else 1)
+            if near is None:
+                f.anchor = "unanchored"
+            else:
+                f.line, f.anchor = near, "moved"
+        if f.end_line is not None and (f.anchor != "ok" or f.line is None or f.end_line < f.line):
+            f.end_line = None
+    return rv
+
+
+def review_load(repo, number, refresh=False, meta=None):
+    """PR metadata + worktree + parsed diff. No AI: this is the half that works without an AI CLI."""
+    meta = meta or pr_meta(repo, number)
+    rv = Review(repo, int(number), **{k: v for k, v in meta.items() if k != "threads"})
+    rv.threads = meta["threads"]
+    try:
+        rv.clone, rv.worktree, rv.merge_base = review_worktree(repo, number, rv.base_ref, rv.head_oid)
+        rv.wt_size = dir_size(rv.worktree)  # a filesystem walk: once per load, never per redraw
+        progress("review", 0, None, "diffing")
+        rv.files = parse_unified_diff(review_diff(rv.clone, rv.merge_base, pr_ref(repo, number)))
+        rv.status = "done"
+    except (ValueError, OSError, subprocess.SubprocessError) as e:
+        rv.status, rv.error = "failed", str(e)
+        return rv                           # the metadata and review threads are still worth showing
+    cached = None if refresh else cached_review(repo, number, rv.head_oid)
+    if cached:
+        rv.changes = [Change.from_json(c) for c in cached.get("changes") or []]
+        rv.findings = [Finding.from_json(f) for f in cached.get("findings") or []]
+        rv.reachability = cached.get("reachability")
+        rv.engine, rv.model = cached.get("engine"), cached.get("model")
+        rv.verify, rv.created = cached.get("verify", False), cached.get("created")
+        anchor_findings(rv)
+    apply_history(rv)
+    return rv
+
+
+def standards_files(worktree):
+    """Project convention files a review should read first (sashiko's GEMINI.md step, generalised)."""
+    return [n for n in ("CLAUDE.md", "AGENTS.md", "GEMINI.md", "CONTRIBUTING.md", "CODING_STYLE.md")
+            if os.path.isfile(os.path.join(worktree or "", n))]
+
+
+# ---------------------------------------------------------------- CLI
+PR_TARGET_RE = re.compile(r"^(?:(?P<repo>[\w.-]+/[\w.-]+(?:/[\w.-]+)?)?#|#?)(?P<num>\d+)$")
+
+
+def parse_pr_target(s, repos):
+    """'123' / '#123' / 'owner/name#123' / a pull URL -> (repo, number)."""
+    s = (s or "").strip()
+    m = URL_RE.search(s)
+    if m:
+        return qualify(m.group("repo"), m.group("host")), int(m.group("num"))
+    m = PR_TARGET_RE.match(s)
+    if not m:
+        raise ValueError(f"cannot parse {s!r}: use 123, #123, owner/name#123 or a pull request URL")
+    repo = m.group("repo")
+    if repo:
+        repo = qualify(repo, repo_host(repos[0]) if repos else DEFAULT_HOST)
+    return repo or (repos[0] if repos else ""), int(m.group("num"))
+
+
+def review_summary_rows(rv):
+    """Rows for `gg review --print`: the PR, its files, and whatever findings are cached."""
+    add, dele = rv.stats()
+    rows = [Row(f"{rv.repo}#{rv.number}  {rv.title}", kind="head"),
+            Row(f"{rv.state_label()}  @{rv.author}  {rv.head_oid[:7] if rv.head_oid else '?'}"
+                f"  {rv.head_ref} → {rv.base_ref}", kind="head"),
+            Row(f"{len(rv.files)} file{'s' if len(rv.files) != 1 else ''}  +{add} -{dele}"
+                f"  worktree {fmt_bytes(rv.wt_size) if rv.worktree else '-'}"
+                f"  {(rv.worktree or '').replace(os.path.expanduser('~'), '~')}", kind="head"),
+            Row("")]
+    for f in rv.files:
+        mark = {"added": "+", "deleted": "-", "renamed": "→", "copied": "≡"}.get(f.status, " ")
+        extra = "  (binary)" if f.binary else ""
+        if f.status == "renamed" and f.old_path != f.path:
+            extra += f"  ← {f.old_path}"
+        rows.append(Row(f" {mark} {f.path}   +{f.additions} -{f.deletions}"
+                        f"  {len(f.hunks)} hunk{'s' if len(f.hunks) != 1 else ''}{extra}",
+                        f"file:{f.path}"))
+    if rv.findings:
+        rows.append(Row(""))
+        rows.append(Row(f"findings ({', '.join(f'{k} {v}' for k, v in rv.counts().items() if v)})", kind="head"))
+        for i, f in enumerate(rv.findings, 1):
+            mark = {"CONFIRMED": "✓", "PLAUSIBLE": "?", "FALSE": "·"}.get(f.verdict, " ")
+            rows.append(Row(f" {mark} #{i} [{f.severity}] {f.title}   {f.path}:{f.line}",
+                            f"finding:{f.fid}"))
+    elif rv.threads:
+        rows.append(Row(""))
+        rows.append(Row(f"{len(rv.threads)} existing review thread(s) on GitHub", kind="head"))
+    return rows
+
+
+def do_review(target, repos, refresh=False, as_json=False, color=True):
+    """gg review <PR> — stage 1: the worktree and the parsed diff. The AI passes land in 0.22.0."""
+    repo, number = parse_pr_target(target, repos)
+    rv = review_load(repo, number, refresh=refresh)
+    if as_json:
+        d = rv.to_json()
+        d.update({"repo": rv.repo, "number": rv.number, "head_oid": rv.head_oid,
+                  "worktree": rv.worktree, "url": rv.url})
+        print(json.dumps(d, ensure_ascii=False, indent=1))
+        return 0
+    rows = review_summary_rows(rv)
+    print(ansi_rows(rows, Graph(repo)) if color else "\n".join(r.text for r in rows))
+    if rv.error:
+        print(f"error: {rv.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
 # labels
 # --------------------------------------------------------------------------
 def trunc(s, n):
@@ -2055,6 +2766,10 @@ THEMES = {
         "issue": (2, 2, True, False), "pr": (12, 4, True, False), "draft": (12, 4, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
         "url": (39, 6, True, False), "fold": (3, 3, True, False), "md_h": (214, 3, True, False), "md_code": (250, 7, False, False), "md_quote": (None, None, False, True), "md_bold": (None, None, True, False), "sum": (180, 3, False, False),
+        "diff_add": (114, 2, False, False), "diff_del": (167, 1, False, False), "diff_hunk": (39, 6, True, False),
+        "diff_ctx": (None, None, False, True),
+        "sev_reach": (201, 5, True, False), "sev_bug": (196, 1, True, False), "sev_regress": (208, 3, True, False),
+        "sev_logic": (220, 3, False, False), "sev_style": (39, 6, False, False), "sev_design": (78, 2, False, False),
         "people": ([39, 208, 42, 205, 226, 51, 141, 203, 118, 214, 81, 171, 190, 99, 209, 45], [1, 2, 3, 4, 5, 6]),
     },
     "light": {  # light background: darker tones, grey instead of dim
@@ -2064,6 +2779,10 @@ THEMES = {
         "issue": (22, 2, True, False), "pr": (4, 4, True, False), "draft": (4, 4, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (30, 6, False, False),
         "url": (4, 4, True, False), "fold": (130, 3, True, False), "md_h": (130, 3, True, False), "md_code": (240, 0, False, False), "md_quote": (8, 8, False, False), "md_bold": (None, None, True, False), "sum": (94, 3, False, False),
+        "diff_add": (22, 2, False, False), "diff_del": (124, 1, False, False), "diff_hunk": (4, 4, True, False),
+        "diff_ctx": (8, 8, False, False),
+        "sev_reach": (90, 5, True, False), "sev_bug": (124, 1, True, False), "sev_regress": (130, 3, True, False),
+        "sev_logic": (94, 3, False, False), "sev_style": (24, 6, False, False), "sev_design": (22, 2, False, False),
         "people": ([18, 88, 22, 90, 130, 24, 54, 94, 28, 124, 30, 91, 52, 58, 23, 89], [1, 2, 3, 4, 5, 6]),
     },
     "basic": {  # 8 colours only, no dim, no dark blue: PuTTY and other plain terminals
@@ -2073,6 +2792,10 @@ THEMES = {
         "issue": (2, 2, True, False), "pr": (3, 3, True, False), "draft": (3, 3, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
         "url": (6, 6, True, False), "fold": (7, 7, True, False), "md_h": (3, 3, True, False), "md_code": (7, 7, False, False), "md_quote": (8, 8, False, False), "md_bold": (None, None, True, False), "sum": (7, 7, False, False),
+        "diff_add": (2, 2, False, False), "diff_del": (1, 1, False, False), "diff_hunk": (6, 6, True, False),
+        "diff_ctx": (7, 7, False, False),
+        "sev_reach": (5, 5, True, False), "sev_bug": (1, 1, True, False), "sev_regress": (3, 3, True, False),
+        "sev_logic": (3, 3, False, False), "sev_style": (6, 6, False, False), "sev_design": (2, 2, False, False),
         "people": ([2, 3, 5, 6, 1, 7], [2, 3, 5, 6, 1, 7]),
     },
 }
@@ -2223,8 +2946,17 @@ _ITEM_HEAD = re.compile(r"^\S+ \[[^\]]*\](?:\[[^\]]*\])? ")
 _DATE_HEAD = re.compile(r"^(?:\d{4}-\d\d-\d\d|\+\d+d(?: \d\d-\d\d)?|\d\d-\d\d) ")
 
 
+DIFF_KINDS = ("diff_add", "diff_del", "diff_ctx", "diff_hunk")
+
+
 def segments(row, g):
     t = row.text
+    if row.kind in DIFF_KINDS:
+        if row.kind != "diff_hunk" and t[:1] in ("⚠", "ℹ"):
+            return [(t[:2], "sev_bug" if t[0] == "⚠" else "sev_logic"), (t[2:], row.kind)]
+        return [(t, row.kind)]
+    if row.kind.startswith("sev_"):
+        return [(t, row.kind)]
     if row.kind in ("head", "sec"):
         return [(t, "head")]
     if row.kind in ("link", "conn"):
@@ -2702,6 +3434,202 @@ def render_show(g, nid, width=100):
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------ review rows
+# Files / Diff / Findings, the three panels of review mode. Every row carries the style it wants in
+# its `kind` (diff_add … , sev_bug …), so segments() colours them without a node lookup: review ids
+# ("file:…", "line:…", "finding:…") are not in the graph.
+SEV_LABEL = {"reach": "unreachable", "bug": "bug", "regress": "regression",
+             "logic": "logic", "style": "style", "design": "design"}
+SEV_MARK = {"reach": "⚠", "bug": "⚠", "regress": "⚠", "logic": "ℹ", "style": "ℹ", "design": "ℹ"}
+VERDICT_MARK = {"CONFIRMED": "✓", "PLAUSIBLE": "?", "FALSE": "·"}
+ANCHOR_MARK = {"moved": " ⚠", "unanchored": " ⊘"}
+DIFF_GUTTER = 10        # marker(2) + line number(5) + space + tag + space
+TAB_WIDTH = 4
+
+
+def expand_tabs(s, tw=TAB_WIDTH):
+    """Tabs to the next stop, measured in display columns (a CJK character is two)."""
+    if "\t" not in s:
+        return s
+    out, col = [], 0
+    for ch in s:
+        if ch == "\t":
+            n = tw - (col % tw) or tw
+            out.append(" " * n)
+            col += n
+        else:
+            out.append(ch)
+            col += dw(ch)
+    return "".join(out)
+
+
+def short_path(path, w):
+    """The path if it fits, else its last components, else the truncated basename."""
+    if dw(path) <= w:
+        return path
+    base = path.rsplit("/", 1)[-1]
+    return base if dw(base) <= w else trunc(base, w)
+
+
+def review_files_rows(rv, width, sel=None):
+    """The PR, then one row per changed file. `sel` is the path the Diff panel is showing."""
+    add, dele = rv.stats()
+    head = [f"#{rv.number} {rv.title}",
+            f"{rv.state_label()} · @{rv.author or '?'} · {(rv.head_oid or '')[:7]}",
+            f"{len(rv.files)} file{'s' if len(rv.files) != 1 else ''}  +{add} -{dele}"]
+    if rv.status in ("worktree", "running", "verifying"):
+        head.append(f"⋯ {rv.status}")
+    elif rv.error:
+        head.append(rv.error)
+    rows = [Row(trunc(t, width), kind="head") for t in head]
+    rows.append(Row(""))
+    worst = {}
+    for f in rv.findings:
+        if f.verdict != "FALSE" and f.state != "ignored":
+            cur = worst.get(f.path)
+            if cur is None or SEVERITIES.index(f.severity) < SEVERITIES.index(cur):
+                worst[f.path] = f.severity
+    for f in rv.files:
+        mark = {"added": "+", "deleted": "-", "renamed": "→", "copied": "≡"}.get(f.status, " ")
+        cur = "▸" if f.path == sel else " "
+        sev = SEV_MARK.get(worst.get(f.path), "")
+        tail = f" +{f.additions} -{f.deletions} {sev}".rstrip()
+        name = short_path(f.path, max(width - dw(tail) - 3, 6))
+        pad = " " * max(width - dw(tail) - dw(name) - 3, 1)
+        rows.append(Row(f"{cur}{mark}{name}{pad}{tail}", f"file:{f.path}"))
+    if rv.worktree:
+        rows.append(Row(""))
+        rows.append(Row(trunc(f"worktree {fmt_bytes(rv.wt_size)}", width), kind="head"))
+    return rows
+
+
+def diff_rows(rv, path, width, collapsed=frozenset()):
+    """One file's diff. Rows carry `line:<path>:<side>:<n>` so a finding can jump onto its own line."""
+    f = rv.file(path) if path else None
+    if f is None:
+        return [Row("(no file selected — ⏎ on one in Files)", kind="head")]
+    if f.binary:
+        return [Row(f"{f.path}: binary file, no diff", kind="head")]
+    if not f.hunks:
+        return [Row(f"{f.path}: {f.status}, no content change", kind="head")]
+    flag = {}          # (side, line) -> marker of the worst finding sitting there
+    for fi in rv.findings:
+        if fi.path != path or fi.verdict == "FALSE" or fi.state == "ignored" or fi.line is None:
+            continue
+        key = (fi.side, fi.line)
+        if key not in flag or SEVERITIES.index(fi.severity) < SEVERITIES.index(flag[key][1]):
+            flag[key] = (SEV_MARK[fi.severity], fi.severity)
+    body = max(width - DIFF_GUTTER, 12)
+    rows = []
+    for hi, h in enumerate(f.hunks):
+        nid = f"hunk:{path}#{hi}"
+        folded = nid in collapsed
+        rows.append(Row(f"{'▸' if folded else '▾'} {clip(h.header, 0, max(width - 2, 8))}",
+                        nid, None, "diff_hunk"))
+        if folded:
+            continue
+        for tag, old_no, new_no, text in h.lines:
+            side = "LEFT" if tag == "-" else "RIGHT"
+            no = old_no if tag == "-" else new_no
+            mark = flag.get((side, no), ("  ",))[0]
+            kind = {"+": "diff_add", "-": "diff_del"}.get(tag, "diff_ctx")
+            rows.append(Row(f"{mark:<2}{no if no is not None else '':>5} {tag} "
+                            f"{clip(expand_tabs(text), 0, body)}",
+                            f"line:{path}:{side}:{no}", None, kind))
+        rows.append(Row(""))
+    return rows
+
+
+FIND_TABS = [("open", "open"), ("posted", "posted"), ("ignored", "ignored"),
+             ("dropped", "dropped"), ("changes", "changes"), ("github", "github")]
+
+
+def _find_bucket(f):
+    if f.verdict == "FALSE":
+        return "dropped"
+    return {"posted": "posted", "ignored": "ignored"}.get(f.state, "open")
+
+
+def subjective_held(rv):
+    """slop-indicators.md's rule, in code: opinions stay out of the way while a real defect stands."""
+    if cfg("review_subjective") != "auto":
+        return False
+    return any(f.verdict == "CONFIRMED" and not f.subjective and _find_bucket(f) == "open"
+               for f in rv.findings)
+
+
+def findings_rows(rv, tab, width, checked=frozenset()):
+    if tab == "changes":
+        return changes_rows(rv, width)
+    if tab == "github":
+        return threads_rows(rv, width)
+    if rv.status in ("worktree", "running", "verifying"):
+        return [Row(f"⋯ {rv.status}…", kind="head")]
+    if rv.error:
+        return [Row("review failed", kind="head"), Row(trunc(rv.error, width * 3), kind="note")]
+    if not rv.findings and not rv.engine:
+        return [Row("no review yet — R runs one" if ai_available() else
+                    f"no AI CLI ({CLAUDE_BIN}) — diff only", kind="head")]
+    picked = [f for f in rv.findings if _find_bucket(f) == tab]
+    if not picked:
+        return [Row(f"nothing {tab}", kind="head")]
+    held = subjective_held(rv) if tab == "open" else False
+    rows, n_held, seen = [], 0, None
+    order = sorted(picked, key=lambda f: (SEVERITIES.index(f.severity), f.path or "", f.line or 0))
+    for i, f in enumerate(order, 1):
+        if held and f.subjective:
+            n_held += 1
+            continue
+        if f.severity != seen:
+            seen = f.severity
+            rows.append(Row(f"● {SEV_LABEL[f.severity]} "
+                            f"{sum(1 for x in order if x.severity == f.severity)}", kind="head"))
+        sel = "•" if f.fid in checked else " "
+        v = VERDICT_MARK.get(f.verdict, " ")
+        rows.append(Row(f"{sel}#{i} {v} {trunc(f.title, max(width - 6, 8))}",
+                        f"finding:{f.fid}", f"line:{f.path}:{f.side}:{f.line}", f"sev_{f.severity}"))
+        rows.append(Row(f"   {short_path(f.path or '?', max(width - 12, 8))}:{f.line}"
+                        f"{ANCHOR_MARK.get(f.anchor, '')}", f"finding:{f.fid}", None, "note"))
+    if n_held:
+        rows.append(Row(f"● {n_held} subjective held back (a confirmed defect stands)", kind="head"))
+    return rows
+
+
+def changes_rows(rv, width):
+    """What the review broke the diff into before judging it (review-core.md TASK 1B)."""
+    if not rv.changes:
+        return [Row("no change analysis yet", kind="head")]
+    rows, seen = [], None
+    if rv.reachability:
+        v = rv.reachability.get("verdict", "?")
+        rows.append(Row(f"reachability: {v}", kind="head"))
+        rows.append(Row(f"   {trunc(rv.reachability.get('reason', ''), width * 3)}", kind="note"))
+    for c in rv.changes:
+        if c.kind != seen:
+            seen = c.kind
+            rows.append(Row(f"● {c.kind}", kind="head"))
+        rows.append(Row(f" {c.cid} {trunc(c.symbol or c.path or '', max(width - 12, 8))}",
+                        f"change:{c.cid}", f"file:{c.path}"))
+        rows.append(Row(f"   {trunc(c.summary, max(width - 4, 8))}", f"change:{c.cid}", None, "note"))
+    return rows
+
+
+def threads_rows(rv, width):
+    """Review threads already on the PR — so gg does not repeat what a human already said."""
+    if not rv.threads:
+        return [Row("no review threads on this PR", kind="head")]
+    rows = []
+    for t in rv.threads:
+        state = " (resolved)" if t.get("resolved") else (" (outdated)" if t.get("outdated") else "")
+        first = (t.get("comments") or [{}])[0]
+        rows.append(Row(f"@{first.get('author', '?')} "
+                        f"{short_path(t.get('path') or '?', max(width - 16, 8))}:{t.get('line')}{state}",
+                        f"thread:{t.get('id')}", f"line:{t.get('path')}:{t.get('side')}:{t.get('line')}"))
+        rows.append(Row(f"   {trunc(first.get('body', ''), max(width - 4, 8))}",
+                        f"thread:{t.get('id')}", None, "note"))
+    return rows
+
+
 # --------------------------------------------------------------------------
 # TUI (curses): keyboard cursor over the same rows
 # --------------------------------------------------------------------------
@@ -2890,7 +3818,7 @@ def hangul_keys(ch):
         parts = [_CHO[o // 588], _JUNG[(o % 588) // 28], _JONG[o % 28].strip()]
         return "".join(JAMO_KEY.get(j, "") for j in parts if j)
     return ""
-LIST_KINDS = ("", "link", "mention", "sec")
+LIST_KINDS = ("", "link", "mention", "sec") + DIFF_KINDS + tuple(f"sev_{s}" for s in SEVERITIES)
 
 
 class Panel:
@@ -2944,7 +3872,9 @@ class Panel:
                 self.top = self.cur - h + 1
 
     def find(self, nid, near=None):
-        hits = [i for i, r in enumerate(self.rows) if r.nid == nid and r.kind in ("", "mention")]
+        hits = [i for i, r in enumerate(self.rows)
+                if r.nid == nid and (r.kind in ("", "mention") or r.kind in DIFF_KINDS
+                                     or r.kind.startswith("sev_"))]
         if not hits:
             return None
         return min(hits, key=lambda i: abs(i - (near if near is not None else self.cur)))
@@ -2964,6 +3894,7 @@ class Panel:
 
 class Tui:
     SIDE = ["repo", "item", "home", "comments", "links", "people"]
+    MODES = {"browse": SIDE, "review": ["rfiles", "rdiff", "rfind"]}
     HOME_TABS = [("todo", "todo"), ("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
     MAIN_TABS = ["content", "answer"]
@@ -2983,6 +3914,12 @@ class Tui:
         self.tr_thread, self.tr_pending = None, None
         self.collapsed = set()
         self.focus, self.screen = "home", cfg("screen_mode") if cfg("screen_mode") in ("normal", "half", "full") else "normal"
+        self.mode = "browse"               # browse (the graph) | review (one PR's diff and findings)
+        self.rv, self.rv_path, self._new_rv = None, None, None
+        self.rv_folded, self.rv_checked = set(), set()
+        self.mode_focus = {"browse": "home", "review": "rfiles"}
+        self.review_files_width = float(cfg("review_files_width") or 0.22)
+        self.review_findings_width = float(cfg("review_findings_width") or 0.30)
         self.side_width = float(cfg("side_width") or 0.4)
         self.expand_focused = cfg("expand_focused").lower() not in ("false", "0", "no", "")
         self.expanded_weight = float(cfg("expanded_weight") or 2)
@@ -2995,6 +3932,9 @@ class Tui:
             "comments": Panel("comments", "Comments"),
             "people": Panel("people", "People"),
             "main": Panel("main", "Main", self.MAIN_TABS, scroll_only=True),
+            "rfiles": Panel("rfiles", "Files"),
+            "rdiff": Panel("rdiff", "Diff"),
+            "rfind": Panel("rfind", "Findings", [t for _, t in FIND_TABS]),
         }
         self.panels["home"].tab = 1        # todo is the first tab, but the Inbox opens on my turn
         self.visible = []                  # panel keys drawn in the current layout
@@ -3023,6 +3963,9 @@ class Tui:
         self.sel = None          # main-panel drag selection: {"start": (row, col), "end": (row, col), "live": bool}
         sys.stdout.flush()
         self.load(refresh=False)
+
+    def side_keys(self):
+        return self.MODES[self.mode]
 
     # ------------------------------------------------------------------ background work
     def on_progress(self, phase, done, total, detail=""):
@@ -3201,9 +4144,145 @@ class Tui:
         self.panels["comments"].set_rows(self.comments_rows(), keep)
         self.panels["people"].set_rows(self.people_rows(), keep)
         self.refresh_main(keep)
+        if self.rv is not None:
+            self.refresh_review(keep)
         if self.subject is None or self.subject not in self.g.nodes:
             self.subject = self.item
         self.enrich()
+
+    # ------------------------------------------------------------------ review mode
+    def refresh_review(self, keep=True):
+        rv = self.rv
+        if rv is None:
+            return
+        if self.rv_path is None or rv.file(self.rv_path) is None:
+            self.rv_path = rv.files[0].path if rv.files else None
+        fw = max(self.panels["rfiles"].rect[3], 20)
+        dwid = max(self.panels["rdiff"].rect[3], 40)
+        vw = max(self.panels["rfind"].rect[3], 24)
+        self.panels["rfiles"].set_rows(review_files_rows(rv, fw, self.rv_path), keep)
+        self.panels["rdiff"].set_rows(diff_rows(rv, self.rv_path, dwid, self.rv_folded), keep)
+        self.panels["rfind"].set_rows(
+            findings_rows(rv, FIND_TABS[self.panels["rfind"].tab][0], vw, self.rv_checked), keep)
+        self.panels["rdiff"].title = "Diff  " + short_path(self.rv_path or "-", max(dwid - 12, 8))
+
+    def review_subject(self):
+        """The PR the cursor is on, following a comment up to its item."""
+        nid = self.subject or self.item
+        n = self.g.nodes.get(nid) if nid else None
+        if n is not None and n.kind == "comment":
+            n = self.g.nodes.get(n.parent)
+        return n if (n is not None and n.kind == "item" and n.is_pr) else None
+
+    def toggle_review(self):
+        """v: into review mode on the current PR, or back out of it."""
+        if self.mode == "review":
+            self.mode_focus["review"] = self.focus
+            self.mode, self.focus = "browse", self.mode_focus.get("browse", "home")
+            return
+        n = self.review_subject()
+        if n is None:
+            self.msg = "v opens the review of a pull request — put the cursor on one first"
+            return
+        if n.stub:
+            self.msg = f"{self.g.label_num(n)} was only referenced here, not fetched — open it first"
+            return
+        self.mode_focus["browse"] = self.focus
+        self.mode, self.focus = "review", self.mode_focus.get("review", "rfiles")
+        if self.rv is not None and (self.rv.repo, self.rv.number) == (n.repo, n.number):
+            self.refresh_review()
+        else:
+            self.load_review(n.repo, n.number)
+
+    def load_review(self, repo, number, refresh=False):
+        """The worktree, the diff and whatever findings are cached, in the background."""
+        node = self.g.nodes.get(f"{repo}#{number}")
+        self.rv = Review(repo, number, status="worktree", title=(node.title if node else ""),
+                         state=(node.state if node else None), author=(node.author if node else None))
+        self.rv_path, self.rv_folded = None, set()
+        self.refresh_review(keep=False)
+
+        def job():
+            try:
+                self._new_rv = review_load(repo, int(number), refresh=refresh)
+            except (GhError, ValueError, OSError, subprocess.SubprocessError) as e:
+                failed = self.rv                        # no metadata: keep the placeholder, add the reason
+                failed.status, failed.error = "failed", str(e)
+                self._new_rv = failed
+
+        self.run_bg(job, "review")
+
+    def review_enter(self, r):
+        if self.focus == "rfiles" and (r.nid or "").startswith("file:"):
+            self.rv_path = r.nid[5:]
+            self.panels["rdiff"].cur = self.panels["rdiff"].top = 0
+            self.refresh_review(keep=False)
+            self.focus = "rdiff"
+        elif self.focus == "rfind" and r.jump and r.jump.startswith("line:"):
+            path, _, _ = r.jump[5:].rsplit(":", 2)
+            if path != self.rv_path:
+                self.rv_path = path
+                self.refresh_review(keep=False)
+            if not self.panels["rdiff"].goto_nid(r.jump):
+                self.msg = "that line is not in this diff any more"
+            self.focus = "rdiff"
+        elif self.focus == "rfind" and r.jump and r.jump.startswith("file:"):
+            self.rv_path = r.jump[5:]
+            self.refresh_review(keep=False)
+            self.focus = "rdiff"
+        elif self.focus == "rdiff" and (r.nid or "").startswith("hunk:"):
+            self.rv_folded ^= {r.nid}
+            self.refresh_review()
+
+    def review_finding(self):
+        r = self.panels["rfind"].current()
+        fid = r.nid[8:] if r and (r.nid or "").startswith("finding:") else None
+        return next((f for f in (self.rv.findings if self.rv else []) if f.fid == fid), None)
+
+    def review_key(self, k):
+        """Review-mode keys. None means 'not mine' — the shared keys below still run."""
+        if k in (ord("v"), 27):
+            self.toggle_review()
+            return True
+        if self.rv is None:
+            return None
+        if k in (ord("r"), ord("R")):
+            self.load_review(self.rv.repo, self.rv.number, refresh=k == ord("R"))
+            return True
+        if k == ord("x") and self.focus == "rfind":
+            f = self.review_finding()
+            if f is None:
+                self.msg = "no finding under the cursor"
+                return True
+            f.state = "new" if f.state == "ignored" else "ignored"
+            save_review(self.rv)
+            self.msg = f"{'ignored' if f.state == 'ignored' else 'restored'}: {trunc(f.title, 50)}"
+            self.refresh_review(keep=False)
+            return True
+        if k == ord("o"):
+            url = self.review_url()
+            if url:
+                self.open_url(url)
+            return True
+        if k == ord("y"):
+            url = self.review_url()
+            if url:
+                self.msg = f"copied {url} ({', '.join(copy_to_clipboard(url)) or 'no clipboard tool'})"
+            return True
+        return None
+
+    def review_url(self):
+        """The PR, or the file and line the cursor is on inside it."""
+        rv = self.rv
+        if rv is None or not rv.url:
+            return None
+        r = self.panels[self.focus].current()
+        nid = (r.nid or "") if r else ""
+        if self.focus == "rdiff" and nid.startswith("line:"):
+            path, side, no = nid[5:].rsplit(":", 2)
+            frag = f"R{no}" if side == "RIGHT" else f"L{no}"
+            return f"{rv.url}/files#diff-{hashlib.sha256(path.encode()).hexdigest()}{frag}"
+        return rv.url
 
     def repo_rows(self):
         g = self.g
@@ -3803,6 +4882,8 @@ class Tui:
         r = p.current()
         if not r:
             return
+        if self.mode == "review":
+            return self.review_enter(r)
         if self.focus == "home":
             self.set_item(r.nid)
             if r.kind == "mention" and r.jump in self.g.nodes:      # the comment that put it here / was marked
@@ -3848,15 +4929,17 @@ class Tui:
         host, owner, name = split_repo(n.repo)
         return f"https://{host}/{owner}/{name}/issues/{n.number}"
 
-    def open_browser(self):
-        url = self.node_url(self.subject or self.item)
-        if not url:
-            return
+    def open_url(self, url):
         try:
             subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.msg = f"opened {url}"
         except OSError as e:
             self.msg = f"cannot open browser: {e}"
+
+    def open_browser(self):
+        url = self.node_url(self.subject or self.item)
+        if url:
+            self.open_url(url)
 
     def details(self):
         nid = self.subject or self.item
@@ -4177,6 +5260,10 @@ class Tui:
                 self.panels[key].rect = (y + 1, x + 1, hh - 2, ww - 2)
                 vis.append(key)
 
+        if self.mode == "review":
+            self.layout_review(place, H, w, portrait)
+            self.visible = vis
+            return
         if self.screen == "full":
             place(self.focus, 0, 0, H, w)
         elif self.screen == "half" or portrait:
@@ -4226,6 +5313,55 @@ class Tui:
                     y += hh
             place("main", 0, side_w, H, w - side_w)
         self.visible = vis
+
+    def layout_review(self, place, H, w, portrait):
+        """Files | Diff | Findings. Three columns eat width fast, so the fallbacks are pinned numbers
+        (docs/PLAN-review-mode.md §1) rather than the browse layout's ratios."""
+        f = self.focus if self.focus in self.MODES["review"] else "rfiles"
+        if self.screen == "full":
+            place(f, 0, 0, H, w)
+            return
+        files_w = max(22, min(int(w * self.review_files_width), 40))
+        find_w = max(26, min(int(w * self.review_findings_width), 52))
+        if self.screen == "half":
+            if f == "rdiff":
+                place("rdiff", 0, 0, H, w)
+            else:
+                side = max(24, min(files_w if f == "rfiles" else find_w, w - 40))
+                place(f, 0, 0, H, side)
+                place("rdiff", 0, side, H, w - side)
+            return
+        if portrait:
+            top, bot = max(5, H // 5), max(6, H // 4)
+            if self.expand_focused:
+                if f == "rfiles":
+                    top += H // 6
+                elif f == "rfind":
+                    bot += H // 6
+            mid = H - top - bot
+            if mid < 4:                      # no room for three: the focused panel keeps the screen
+                place(f, 0, 0, H, w)
+                return
+            place("rfiles", 0, 0, top, w)
+            place("rdiff", top, 0, mid, w)
+            place("rfind", top + mid, 0, bot, w)
+            return
+        diff_w = w - files_w - find_w
+        if diff_w < 56 and w >= 100:
+            find_w = 26
+            diff_w = w - files_w - find_w
+        if diff_w >= 56:
+            place("rfiles", 0, 0, H, files_w)
+            place("rdiff", 0, files_w, H, diff_w)
+            place("rfind", 0, files_w + diff_w, H, find_w)
+            return
+        strip = 0 if H < 16 else max(6, H // 4)     # too narrow for three columns: Findings goes under
+        place("rfiles", 0, 0, H, files_w)
+        place("rdiff", 0, files_w, H - strip, w - files_w)
+        if strip:
+            place("rfind", H - strip, files_w, strip, w - files_w)
+        else:
+            self.panels["rfind"].rect = (H - 1, files_w, 0, w - files_w)   # title bar only
 
     # ------------------------------------------------------------------ drawing
     def apply_theme(self):
@@ -4367,7 +5503,8 @@ class Tui:
         focused = key == self.focus
         tl, tr, bl, br, hz, vt = self.border
         attr = (self.style_attr("fold") | c.A_BOLD) if focused else self.dim()
-        num = self.SIDE.index(key) + 1 if key in self.SIDE else 0
+        keys = self.side_keys()
+        num = keys.index(key) + 1 if key in keys else 0
         title = f"{num} {p.title}"
         zones = []                                   # (start col, end col, action) within the title, for mouse clicks
         if p.tabs:
@@ -4510,6 +5647,9 @@ class Tui:
         "main": "[ ] content / answer  i translate  a ask  K J scroll  o browser",
         "repo": "r refresh (changed only)  R refetch all  c t s p h toggles  T theme  $ tokens",
         "item": "⏎ read in main  m mark  i translate  a ask  o browser  d details",
+        "rfiles": "⏎ show this file's diff  r reload  R refetch  o browser  v back to the graph",
+        "rdiff": "⏎ fold/unfold a hunk  J K scroll  o open this line on GitHub  v back to the graph",
+        "rfind": "⏎ jump to the line  x ignore  [ ] tab  o browser  v back to the graph",
     }
 
     def state_snapshot(self):
@@ -4528,15 +5668,31 @@ class Tui:
             return {"id": nid, "kind": "person", "label": nid, "title": "", "url": "", "text": ""}
         r = self.panels[self.focus].current()
         return {"pid": os.getpid(), "updated": datetime.now().isoformat(timespec="seconds"), "updated_ts": time.time(),
-                "repos": self.o["repos"], "me": self.me, "focus": self.focus,
+                "repos": self.o["repos"], "me": self.me, "focus": self.focus, "mode": self.mode,
                 "inbox_tab": self.HOME_TABS[self.panels["home"].tab][1],
                 "item": node_info(self.item), "subject": node_info(self.subject),
+                "review": self.review_info(),
                 "cursor_row": r.text.strip() if r else "", "answer": (self.answer or "")[:4000],
                 "todo_open": sum(1 for e in self.todo if not e.get("done"))}
 
+    def review_info(self):
+        """The review half of the snapshot: null in browse mode, so old readers see no change."""
+        rv = self.rv
+        if self.mode != "review" or rv is None:
+            return None
+        f = self.review_finding()
+        return {"repo": rv.repo, "number": rv.number, "url": rv.url or "", "head_oid": rv.head_oid or "",
+                "status": rv.status, "error": rv.error or "", "file": self.rv_path or "",
+                "files": [x.path for x in rv.files], "counts": rv.counts(),
+                "finding": None if f is None else
+                {"fid": f.fid, "severity": f.severity, "verdict": f.verdict, "state": f.state,
+                 "anchor": f.anchor, "path": f.path, "line": f.line, "side": f.side,
+                 "title": f.title, "body": (f.body or "")[:2000]}}
+
     def write_state(self):
         st = self.state_snapshot()
-        sig = (st["item"], st["subject"], st["focus"], st["inbox_tab"], st["cursor_row"], st["me"], st["todo_open"], st["answer"])
+        sig = (st["item"], st["subject"], st["focus"], st["mode"], json.dumps(st["review"], sort_keys=True),
+               st["inbox_tab"], st["cursor_row"], st["me"], st["todo_open"], st["answer"])
         if sig != getattr(self, "_state_sig", None) or time.time() - getattr(self, "_state_t", 0) > 20:
             self._state_sig, self._state_t = sig, time.time()
             try:
@@ -4555,7 +5711,13 @@ class Tui:
             pass
         msg = "unknown command"
         try:
-            if cmd.get("op") == "open" and cmd.get("id") in self.g.nodes:
+            if cmd.get("op") == "open" and str(cmd.get("id", "")).startswith("finding:"):
+                if self.mode != "review" or not self.panels["rfind"].goto_nid(cmd["id"]):
+                    msg = "gg is not showing that finding"
+                else:
+                    self.focus = "rfind"
+                    msg = f"gg now shows {cmd['id']}"
+            elif cmd.get("op") == "open" and cmd.get("id") in self.g.nodes:
                 self.set_item(cmd["id"])
                 self.focus = "item"
                 msg = f"gg now shows {self.g.label_num(self.g.nodes[cmd['id']])}"
@@ -4601,15 +5763,15 @@ class Tui:
             self._size = (h, w)
             scr.erase()
         self.layout()
-        widths = tuple(self.panels[k].rect[3] for k in self.SIDE + ["main"])
+        widths = tuple(p.rect[3] for p in self.panels.values())
         if widths != getattr(self, "_widths", None):
             self._widths = widths
             self.refresh_all()          # "…" truncation follows the new panel widths
             self.layout()
         for key in self.visible:
             self.draw_box(key)
-        for key in self.SIDE:                         # collapsed title bars in the tiny layout
-            if key not in self.visible and self.panels[key].rect[3] and self.screen == "normal" and w > 84:
+        for key in self.side_keys():                  # collapsed title bars in the tiny layout
+            if key not in self.visible and self.panels[key].rect[3] and self.screen == "normal":
                 self.draw_box(key)
         if self.busy():
             bottom = self.progress_text()
@@ -4619,8 +5781,11 @@ class Tui:
         elif self.msg:
             bottom, attr = self.msg, c.A_BOLD
         else:
-            bottom = (f"{self.HINTS.get(self.focus, '')}   1-6 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit"
-                      if w >= 110 else f"{self.HINTS.get(self.focus, '')[:max(0, w - 30)]}  1-6 0 Tab  + _  ? q")
+            nav = ("1-3 Tab panels  + _ screen  ? keys  q quit" if self.mode == "review" else
+                   "1-6 0 Tab panels  + _ screen  b f back/fwd  ? keys  q quit")
+            short = "1-3 Tab  + _  ? q" if self.mode == "review" else "1-6 0 Tab  + _  ? q"
+            bottom = (f"{self.HINTS.get(self.focus, '')}   {nav}"
+                      if w >= 110 else f"{self.HINTS.get(self.focus, '')[:max(0, w - 30)]}  {short}")
             attr = self.dim()
         self.put(h - 1, 0, bottom, attr, fill=w - 1)
         scr.refresh()
@@ -4840,10 +6005,16 @@ class Tui:
                 self.update_subject()
         elif key == "main":
             self.refresh_main()
+        elif key == "rfind":
+            p.cur = 0
+            self.refresh_review(keep=False)
         self.enrich()
 
     def cycle_focus(self, d):
-        order = self.SIDE + ["main"]
+        order = self.side_keys() + (["main"] if self.mode == "browse" else [])
+        if self.focus not in order:
+            self.focus = order[0]
+            return
         self.focus = order[(order.index(self.focus) + d) % len(order)]
         if self.focus == "repo":
             self.focus = order[(order.index("repo") + d) % len(order)]
@@ -4863,21 +6034,27 @@ class Tui:
         ("*", "a", "ask claude about the selection", ord("a")),
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
         ("*", "y", "copy the URL of the selection", ord("y")),
-        ("*", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
-        ("*", "Del", "remove the mark on the selection", 0),
-        ("*", "C", "open Claude Code next to gg (tmux pane / full screen), connected via gg mcp", ord("C")),
-        ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
-        ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Inbox as another person", ord("u")),
-        ("*", "F2", "guided tour of the screen", 0),
-        ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
-        ("*", "r", "refresh what changed on GitHub (background)", ord("r")),
-        ("*", "R", "refetch everything", ord("R")), ("*", "T", "colour theme", ord("T")),
+        ("browse", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
+        ("browse", "Del", "remove the mark on the selection", 0),
+        ("browse", "C", "open Claude Code next to gg (tmux pane / full screen), connected via gg mcp", ord("C")),
+        ("browse", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
+        ("browse", "b f", "back / forward", ord("b")), ("browse", "u", "view Inbox as another person", ord("u")),
+        ("browse", "F2", "guided tour of the screen", 0),
+        ("browse", "v", "review this pull request (Files / Diff / Findings)", ord("v")),
+        ("*", "/", "search in this panel", ord("/")), ("browse", "O", "options menu (toggles)", ord("O")),
+        ("browse", "r", "refresh what changed on GitHub (background)", ord("r")),
+        ("browse", "R", "refetch everything", ord("R")), ("*", "T", "colour theme", ord("T")),
         ("*", "$", "token usage", ord("$")), ("*", "q", "quit", ord("q")),
         ("main", "K J", "scroll", ord("J")),
+        ("review", "v Esc", "back to the graph", ord("v")),
+        ("review", "r", "reload the PR and its diff", ord("r")),
+        ("review", "R", "refetch it, ignoring the cached findings", ord("R")),
+        ("rfind", "x", "ignore this finding / take it back", ord("x")),
     ]
 
     def key_menu(self):
-        items = [(f"{keys:6} {desc}", code) for ctx, keys, desc, code in self.KEYMENU if ctx in ("*", self.focus)]
+        items = [(f"{keys:6} {desc}", code) for ctx, keys, desc, code in self.KEYMENU
+                 if ctx in ("*", self.focus, self.mode)]
         code = self.popup_menu(f"keys — {self.panels[self.focus].title} panel", items)
         if code is not None and code != ord("q"):
             self.handle_key(code)
@@ -4934,6 +6111,11 @@ class Tui:
                     self.enriched = set()
                     self.rebuild_graph()
                     self.msg = getattr(self, "_refresh_note", "refreshed")
+                if self._new_rv is not None:                        # the worktree and diff are ready
+                    self.rv, self._new_rv = self._new_rv, None
+                    self.rv_path = None
+                    if self.rv.error:
+                        self.msg = f"review failed: {self.rv.error.splitlines()[0]}"
                 self.refresh_all()                                  # rows + next enrich jobs
             if not self.busy() and time.time() - getattr(self, "last_refresh", self.t0) > self.o["max_age_min"] * 60:
                 self.refresh_bg()                                   # auto: every max-age minutes, incrementally
@@ -4978,12 +6160,20 @@ class Tui:
             return True
         if k == c.KEY_RESIZE:
             return True
+        if self.mode == "review":
+            handled = self.review_key(k)
+            if handled is not None:
+                return handled
+        elif k == ord("v"):
+            self.toggle_review()
+            return True
         # ---- panels ----
-        if ord("1") <= k <= ord("6"):
-            self.focus = self.SIDE[k - ord("1")]
+        keys = self.side_keys()
+        if ord("1") <= k <= ord("9") and k - ord("1") < len(keys):
+            self.focus = keys[k - ord("1")]
             self.update_subject()
             return True
-        if k == ord("0"):
+        if k == ord("0") and self.mode == "browse":
             self.focus = "main"
             return True
         if k == 9:
@@ -5361,6 +6551,7 @@ CACHE_KINDS = {   # filename prefix -> (group, purpose)
     "summaries.json": ("ai", "one-line summaries of comments and items"),
     "whys.json": ("ai", "link reasons"),
     "tui.log": ("logs", "tui stderr / progress log"),
+    "reviews__": ("review", "AI review findings of one repo's PRs, with what was posted / ignored / disproved"),
     "accounts.json": ("state", "which gh account can see which repo (saves a round trip on start-up)"),
     "state.json": ("state", "what the tui shows now (read by gg mcp)"),
     "cmd.json": ("state", "command from gg mcp to the tui"),
@@ -5387,6 +6578,9 @@ def cache_files():
         if os.path.isfile(path):
             st = os.stat(path)
             out.append((name, path, st.st_size, st.st_mtime, st.st_atime) + cache_kind(name))
+    for repo, number, path, mtime in worktree_entries():          # directories, and by far the biggest
+        out.append((f"worktrees/{repo}#{number}", path, dir_size(path), mtime, mtime,
+                    "review", "git worktree of a PR head, checked out for reviewing it"))
     return out
 
 
@@ -5405,7 +6599,10 @@ def cache_hygiene():
     except OSError:
         return
     now = time.time()
+    prune_worktrees()
     for name, path, size, mtime, atime, group, _ in cache_files():
+        if os.path.isdir(path):
+            continue
         secure(path)
         if group == "items" and now - max(mtime, atime) > ITEMS_KEEP_DAYS * 86400:
             try:
@@ -5448,11 +6645,19 @@ def cache_cmd(args):
         n = 0
         for name, path, size, mtime, atime, group, _ in files:
             hit = (what == "all" or what == group or
-                   (what not in ("all", "items", "ai", "logs", "state") and group == "items" and what.replace("/", "__") in name))
-            if hit:
+                   (what not in ("all", "items", "ai", "logs", "state", "review") and
+                    group in ("items", "review") and what.replace("/", "__") in name.replace("#", "__")))
+            if not hit:
+                continue
+            if os.path.isdir(path):
+                repo_, _, num_ = name.split("/", 1)[1].partition("#")
+                clone_ = find_checkout(repo_)
+                drop_worktree(path, clone_)
+                drop_pr_refs(clone_, repo_, num_)
+            else:
                 os.remove(path)
-                n += 1
-        print(f"removed {n} file(s) from {CACHE_DIR.replace(home, '~')}")
+            n += 1
+        print(f"removed {n} item(s) from {CACHE_DIR.replace(home, '~')}")
         return 0
     if not files:
         print(f"nothing cached in {CACHE_DIR.replace(home, '~')}")
@@ -5467,7 +6672,7 @@ def cache_cmd(args):
         print(f"{group:6} {fmt_bytes(size):>8} {ages:>6}  {name} — {purpose}")
     print(f"\ntotal {fmt_bytes(total)}.  Also: {CONFIG_PATH.replace(home, '~')} (settings), "
           f"{TODO_JSON.replace(home, '~')} + {todo_md_path().replace(home, '~')} (marks).")
-    print("clear: gg cache clear all | items | ai | logs | owner/name")
+    print("clear: gg cache clear all | items | ai | logs | review | owner/name")
     return 0
 
 
@@ -5531,6 +6736,17 @@ def state_text():
     lines = [f"gg tui state ({age}s ago{'; the tui may have exited' if age > 60 else ''}):",
              f"repos: {', '.join(st.get('repos', []))}   viewing as: {', '.join('@' + m for m in st.get('me', []))}",
              f"focused panel: {st.get('focus')}   Inbox tab: {st.get('inbox_tab')}"]
+    rv = st.get("review")
+    if rv:
+        c = rv.get("counts") or {}
+        lines.append(f"REVIEW MODE on {rv['repo']}#{rv['number']} ({rv.get('status')}), head {rv.get('head_oid', '')[:7]}"
+                     + (f" — {rv['error']}" if rv.get("error") else ""))
+        lines.append(f"  files: {', '.join(rv.get('files') or []) or '-'}   showing: {rv.get('file') or '-'}")
+        lines.append("  findings: " + (", ".join(f"{k} {v}" for k, v in c.items() if v) or "none"))
+        f = rv.get("finding")
+        if f:
+            lines.append(f"  cursor finding: [{f['severity']}/{f.get('verdict') or 'unverified'}] {f['title']}"
+                         f"  {f['path']}:{f['line']}\n  {f.get('body', '')[:600]}")
     it = st.get("item")
     if it:
         lines.append(f"current item: {it['label']} — {it['title']}  ({it['url']})")
@@ -5548,12 +6764,14 @@ def state_text():
 
 MCP_TOOLS = [
     {"name": "gg_state", "description": "What the user is looking at right now in gg tui: repo, current issue/PR, the "
-                                         "comment or item shown in the main panel, focused panel, Inbox tab, last answer.",
+                                         "comment or item shown in the main panel, focused panel, Inbox tab, last answer. In review mode it "
+                                         "reports the PR under review, its files, finding counts and the finding at the cursor.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "gg_context", "description": "Full material for what is on screen in gg (or a given id): body, metadata, "
                                            "the whole comment thread in order, linked issues/PRs with the sentence that made "
-                                           "each link. Use before answering questions about it.",
-     "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "description": "777 / owner/repo#777 / @login; default: what gg shows"}}}},
+                                           "each link. Use before answering questions about it. While gg is in review mode, "
+                                           "finding:<fid> gives one finding in full and file:<path> the reviewed file from the PR worktree.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "description": "777 / owner/repo#777 / @login / finding:<fid> / file:<path>; default: what gg shows"}}}},
     {"name": "gg_todo", "description": "The user's marks made with m in gg tui (their next-work list with notes), as markdown.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "gg_show", "description": "Details of one issue/PR: every edge with the referencing sentence, comments, body.",
@@ -5571,6 +6789,42 @@ MCP_TOOLS = [
 ]
 
 
+def review_context(st, want):
+    """gg_context material for `finding:<fid>` / `file:<path>` of the review gg has open, else None."""
+    rv = st.get("review")
+    if not rv:
+        return None
+    if not want:
+        want = "finding:" + (rv.get("finding") or {}).get("fid", "") if rv.get("finding") else ""
+    if want.startswith("finding:"):
+        f = rv.get("finding") or {}
+        if f.get("fid") != want[8:]:
+            return (f"gg is reviewing {rv['repo']}#{rv['number']} but the cursor is not on {want} — "
+                    "ask the user to select it, or pass file:<path>")
+        review = load_reviews(rv["repo"]).get(str(rv["number"])) or {}
+        cached = (review.get("reviews") or {}).get(rv.get("head_oid")) or {}
+        full = next((x for x in cached.get("findings") or [] if x.get("fid") == f["fid"]), f)
+        out = [f"[finding {full.get('severity')}/{full.get('verdict') or 'unverified'}] {full.get('title')}",
+               f"{rv['repo']}#{rv['number']}  {full.get('path')}:{full.get('line')} ({full.get('side')})",
+               "", full.get("body") or ""]
+        if full.get("evidence"):
+            out += ["", "evidence: " + full["evidence"]]
+        if full.get("diff"):
+            out += ["", "suggested fix:", full["diff"]]
+        return "\n".join(out)
+    if want.startswith("file:"):
+        path = want[5:]
+        wt = worktree_path(rv["repo"], rv["number"])
+        full = os.path.join(wt, path)
+        head = f"[review file] {rv['repo']}#{rv['number']}  {path}\nworktree: {wt}"
+        try:
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                return head + "\n\n" + fh.read()[:200000]
+        except OSError as e:
+            return f"{head}\n\ncannot read it: {e}"
+    return None
+
+
 def mcp_call(name, a):
     a = a or {}
     st = read_json(STATE_PATH) or {}
@@ -5585,6 +6839,9 @@ def mcp_call(name, a):
         return "\n".join(r.text for r in rows)
     g = build_graph(repos, "open", 15)
     if name == "gg_context":
+        ctx = review_context(st, a.get("id"))
+        if ctx:
+            return ctx
         nid = resolve_root(g, a["id"]) if a.get("id") else ((st.get("subject") or st.get("item") or {}).get("id"))
         if not nid or nid not in g.nodes:
             return "nothing on screen; pass an id"
@@ -5721,8 +6978,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="tui",
                     help="tui [ROOT] (default) | ROOT (777 / #777 / owner/repo#777 / @login: tui on it) | graph [ROOT] "
-                         "(text graph) | show ID | ask ID \"question\" | tutorial | update | config [KEY [VALUE]] | todo | check | mcp | cache [clear …]")
-    ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
+                         "(text graph) | show ID | ask ID \"question\" | review PR | tutorial | update | config [KEY [VALUE]] | todo | check | mcp | cache [clear …]")
+    ap.add_argument("arg", nargs="?", help="ID for show|ask, PR for review, initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"gg {VERSION}")
@@ -5754,6 +7011,7 @@ def main(argv=None):
     ap.add_argument("--theme", choices=list(THEMES), help="colour theme (default: config/env, else dark)")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="ANSI colours (auto = when stdout is a terminal)")
+    ap.add_argument("--json", action="store_true", help="review: the review as JSON on stdout")
     a = ap.parse_intermixed_args(argv)
     cache_hygiene()
     if a.theme:
@@ -5761,7 +7019,7 @@ def main(argv=None):
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check", "tutorial", "mcp", "cache", "ai") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "review", "update", "config", "todo", "check", "tutorial", "mcp", "cache", "ai") and ROOT_RE.match(a.cmd):
         a.arg, a.cmd = a.cmd, "tui"      # `gg 777` = tui starting on #777
     if a.cmd == "graph" and a.arg and ROOT_RE.match(a.arg) and not a.root:
         a.root = a.arg                   # `gg graph 777`
@@ -5823,6 +7081,11 @@ def main(argv=None):
             g = build_graph(a.repo, a.state, a.max_age, a.refresh)
             log(f"asking {model_label(ASK_MODEL)}…")
             print(ask_claude(g, resolve_root(g, a.arg), a.question))
+        elif a.cmd == "review":
+            if not a.arg:
+                ap.error('review needs a PR: gg review 123 (also #123, owner/name#123, a pull request URL)')
+            return do_review(a.arg, a.repo, refresh=a.refresh, as_json=a.json,
+                             color=a.color == "always" or (a.color == "auto" and sys.stdout.isatty()))
         elif a.cmd == "show":
             if not a.arg:
                 ap.error("show needs an ID")

@@ -38,6 +38,7 @@ gg graph                  # 텍스트 그래프: open 항목 전체 개요 (tree
 gg graph -l log           # git log --graph 식 시간축
 gg graph 768 --hops 1     # #768 주변 텍스트 그래프
 gg show 748               # 노드 상세: edge 전부(참조가 나온 문장 포함), 코멘트, 본문
+gg review 779             # PR 리뷰: 내 체크아웃의 worktree에서 뽑은 diff (TUI에서는 v)
 gg ask 4563 "왜 #3859를 언급해?"   # 그 항목(본문+코멘트 전체)을 context로 claude에게 단발 질문
 gg ai [NAME]              # AI CLI 목록/선택: claude, codex, gemini, grok, … (설치된 것 표시)
 gg config [KEY [VALUE]]   # 설정 저장
@@ -68,6 +69,9 @@ gg update                 # 설치 갱신
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | 캐시를 채울 때(첫 실행·갱신) 동시에 도는 `gh` 쿼리 수. GitHub 왕복 한 번이 무엇을 묻든 ~0.4s라 첫 실행 속도를 좌우한다. open 항목이 수백 개인 repo에서는 12로 올리면 더 빨라진다 |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (아래 참조) |
+| `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | 리뷰 모드: Files·Findings 열의 폭 |
+| `worktree_keep_days` · `worktree_max` | `GITGRAPH_WORKTREE_KEEP_DAYS` · `GITGRAPH_WORKTREE_MAX` | `7` · `5` | 리뷰 모드: PR worktree를 얼마나 오래, 몇 개까지 두는지. 커널 체크아웃 하나가 1G를 훌쩍 넘으니 형식적인 값이 아니다 — `gg cache`가 실제 용량과 함께 보여준다 |
+| `review_subjective` | `GITGRAPH_REVIEW_SUBJECTIVE` | `auto` | 리뷰 모드: style/design 의견 — `auto`는 확정된 결함이 있는 동안 감춘다, `always`, `never` |
 | `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | `m`으로 표시한 것으로 만드는 markdown |
 | `theme` | `GITGRAPH_THEME` | `dark` | 색 테마, vim의 `bg=`처럼: `dark`(256색), `light`(밝은 배경용 진한 색), `basic`(8색, dim·진한 파랑 없음 — PuTTY 등). 한 번만 바꾸려면 `--theme`, TUI에서는 `T`로 순환 |
 
@@ -165,6 +169,55 @@ tmux 안이면 마우스 보고를 켜야 한다(`set -g mouse on`).
 
 테스트: `python3 tests/run.py`가 전부 돌린다 — 문법 검사, stdlib `unittest` 묶음, golden 렌더링, 그리고 pty에서 TUI를 돌려 `tests/vt.py`로 화면을 그려 검사하는 `tests/tui_smoke.py`. 전부 임시 `HOME`의 fixture repo를 쓰므로 `gh` 로그인·네트워크·AI CLI가 없어도 되고, 내 캐시는 건드리지 않는다. 한 묶음만: `python3 tests/run.py unit`, 테스트 하나만: `python3 -m unittest tests.test_parse.TestRefs.test_fence`.
 
+## 리뷰 모드 (`v`, `gg review`)
+
+PR 위에서 `v`를 누르면 화면 전체가 Files · Diff · Findings 세 패널로 바뀌고, `v`(또는 Esc)로 그래프로 돌아온다. `gg review 779`로 바로 시작할 수도 있다.
+
+코드는 **API가 아니라 내 체크아웃에서** 가져온다. 찾아둔 clone에 `refs/pull/N/head`와 base 브랜치를 `refs/gg/<owner>__<name>/pr-N`으로 fetch하고, head를 `~/.cache/gitgraph/worktrees/<repo>/pr-N`에 detached `git worktree`로 펼친 뒤 `git diff <merge-base> …`가 패치를 만든다. 큰 PR에서 `pulls/N/files`가 잘라먹는 일이 없고, hunk 조각이 아니라 그 hunk가 든 함수 전체를 열어볼 수 있다. 로컬 clone이 없으면 그렇다고 말하고 멈춘다 — 추측하지 않는다.
+
+```
+╭─1 Files────────────────────╮╭─2 Diff  extent.c ──────────────────────╮╭─3 Findings [open] posted─╮
+│#779 mtfs: update owner ext…││▾ @@ -220,6 +220,7 @@ mtfs_drop_extent  ││● bug 1                   │
+│open · @someone · 0113d1f   ││    220       if (!page)                ││ #1 ✓ lock leak on the ou…│
+│2 files +163 -166           ││    221 -         return -ENOMEM;       ││   extent.c:221           │
+│                            ││⚠   221 +         goto out_unlock;      ││● logic 1                 │
+│▸ extent.c    +163 -156 ⚠   ││    222 +                               ││ #2 ? renaming segno wid… │
+│  mtfs.h        +0 -10      ││    223       spin_lock(&sbi->lock);    ││   gc.c:88                │
+│                            ││    224   out_unlock:                   ││                          │
+│worktree 789.7K             ││    225       spin_unlock(&sbi->lock);  ││                          │
+╰────────────────────────────╯╰────────────────────────────────────────╯╰──────────────────────────╯
+ ⏎ 이 파일의 diff  r 다시 읽기  R 다시 받기  o 브라우저  v 그래프로
+```
+
+| 패널 | 내용 | Enter |
+|---|---|---|
+| 1 Files | PR 한 줄, 그 아래 변경 파일마다 `+추가 -삭제`와 그 파일에 걸린 가장 무거운 지적(`⚠` 결함, `ℹ` 의견). 맨 아래 줄은 worktree가 디스크에서 차지하는 용량 | 그 파일의 diff를 Diff에 띄운다 |
+| 2 Diff | 그 파일의 unified diff, 컨텍스트 5줄, hunk 접기 가능. gutter는 새 파일 기준 줄 번호(삭제된 줄은 옛 번호)와 그 줄에 지적이 있을 때의 표시. 탭은 4칸으로 편다 | hunk 접기/펴기 |
+| 3 Findings | 탭(`[` `]`): **open** · **posted** · **ignored** · **dropped**(반증된 것) · **changes**(리뷰가 diff를 어떻게 쪼갰는지, 바뀐 코드가 실행되기는 하는지) · **github**(PR에 이미 달린 리뷰 스레드 — 사람이 한 말을 반복하지 않도록). 지적마다 판정(`✓` 확정, `?` 그럴듯함), 파일과 줄, 그리고 gg가 가장 가까운 변경 줄로 당겨야 했을 때의 `⚠`(GitHub은 diff 밖 줄의 코멘트를 거부한다) | Diff를 그 줄로 옮긴다 |
+
+화면은 폭에 맞춰 접힌다. diff가 56칸을 지킬 수 있으면 3열, 아니면 Findings가 diff 아래 가로 스트립으로, 84칸 이하에서는 셋이 세로로 쌓인다. `+`/`_`와 패널 키는 다른 곳과 똑같이 동작한다.
+
+| 키 | 동작 |
+|---|---|
+| `v` · Esc | 커서가 있는 PR의 리뷰 모드로 · 그래프로 복귀 |
+| `1` `2` `3` · Tab | Files · Diff · Findings · 순환 |
+| Enter | 위 표 참고 |
+| `x` | 이 지적을 무시 / 무시 취소 (PR별로 기억되며 새 커밋이 와도 유지) |
+| `r` · `R` | PR과 diff를 다시 읽기 · 이 head에 캐시된 것을 무시하고 다시 받기 |
+| `o` · `y` | PR을(커서가 줄 위에 있으면 그 파일·줄을) 브라우저로 · 그 URL 복사 |
+| `/` `n` `N` · `?` | 포커스된 패널에서 검색 · 그 패널의 키 메뉴 |
+
+```
+gg review 779             # PR #779의 리뷰 모드로 TUI 시작
+gg review 779 --print     # PR과 변경 파일, 캐시된 지적을 stdout으로
+gg review 779 --json      # 같은 내용을 JSON으로
+gg review 779 --refresh   # 이 head에 캐시된 것을 무시하고 다시 읽기
+```
+
+지적을 만들어 내는 AI 단계는 아직 붙지 않았다(설계는 `docs/PLAN-review-mode.md`). 그때까지 Findings 패널은 GitHub의 리뷰 스레드와 예전에 캐시된 것을 보여준다. 나머지는 AI CLI 없이 전부 동작한다.
+
+리뷰 모드가 열려 있으면 `gg mcp`도 그것을 보고한다. `gg_state`가 어떤 PR인지, 파일 목록과 지적 개수, 커서 아래 지적을 알려주고, `gg_context`는 `finding:<fid>`로 지적 전문을, `file:<path>`로 worktree에 있는 그 파일을 그대로 준다.
+
 ## 로컬 데이터
 
 gg가 보관하는 것은 모두 `~/.cache/gitgraph/`(디렉터리 0700, 파일 0600 — private repo의 본문·코멘트가 들어 있음)와 `~/.config/gitgraph/`의 작은 파일 둘입니다:
@@ -176,10 +229,12 @@ gg가 보관하는 것은 모두 `~/.cache/gitgraph/`(디렉터리 0700, 파일 
 | `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI 결과(텍스트 해시 기준) | 상한(2만 건 넘으면 오래된 것부터 삭제) |
 | `tui.log` | tui stderr/진행 로그 | 1 MB 넘으면 잘라냄 |
 | `accounts.json` | 어느 gh 계정이 어느 repo를 볼 수 있는지 | 바뀔 때 덮어씀 |
+| `reviews__<repo>.json` | repo 하나의 PR별 리뷰 지적과 게시·무시·반증 이력 | 유지. digest별 이력은 새 커밋이 와도 살아남아 같은 지적을 다시 내놓지 않는다 |
+| `worktrees/<repo>/pr-N/` | 리뷰하려고 펼친 PR head (내 clone의 진짜 `git worktree`) | `worktree_keep_days` 지나면, 또 `worktree_max`를 넘으면 오래된 것부터 삭제. `gg cache clear review`가 제대로 걷어낸다(`git worktree remove` + `refs/gg/…` 참조) |
 | `state.json`, `cmd*.json` | tui가 보는 것(`gg mcp`용) | 덮어씀 |
 | `~/.config/gitgraph/config.json`, `todo.json`(+ `todo_file` markdown) | 설정, 마킹 | 사용자 것 |
 
-`gg cache`로 크기·나이와 함께 목록을 보고, `gg cache clear all|items|ai|logs|owner/name`으로 지운다(지워도 필요할 때 다시 받거나 만든다).
+`gg cache`로 크기·나이와 함께 목록을 보고, `gg cache clear all|items|ai|logs|review|owner/name`으로 지운다(지워도 필요할 때 다시 받거나 만든다).
 
 ## GitHub Enterprise
 

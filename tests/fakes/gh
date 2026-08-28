@@ -36,6 +36,9 @@ Env vars read in "script" mode:
                           A number missing from the fixture answers as "not found" for that query kind
                           (an aliased key holding null, e.g. resolve_stubs' "missing" case; a dropped
                           alias entirely for fetch_items).
+                          pr_meta()'s single-PR query (review mode) is answered from the same "pulls"
+                          node plus fixed head/base oids and one review thread, so review mode can be
+                          driven offline up to the point where it wants a local git checkout.
 
   FAKE_GH_DENY           JSON list of logins that get a NOT_FOUND GraphQL error for every repository
                           query, regardless of which repo/kind — for multi-account-fallback tests. The
@@ -182,6 +185,24 @@ def _graphql_response(query, variables, repo):
                 typename = "PullRequest" if num in pulls else "Issue"
                 rep[alias] = dict(node, __typename=typename)
         return {"repository": rep}
+
+    if "pullRequest(number:$number)" in query.replace(" ", ""):
+        # gitgraph's pr_meta(): head/base oids and the review threads of one PR (review mode)
+        num = str((variables or {}).get("number"))
+        node = pulls.get(num)
+        if node is None:
+            return {"repository": {"pullRequest": None}}
+        return {"repository": {"pullRequest": dict(
+            node, id=f"PR_kwDO_{repo}_{num}", headRefName="topic-%s" % num, baseRefName="main",
+            headRefOid="a" * 40, baseRefOid="b" * 40,
+            headRepository={"nameWithOwner": repo},
+            reviewThreads={"nodes": [
+                {"id": "RT_1", "isResolved": False, "isOutdated": False, "path": "src/extent.c",
+                 "line": 42, "diffSide": "RIGHT",
+                 "comments": {"nodes": [{"author": {"login": "bob"},
+                                          "body": "does this handle the empty list?",
+                                          "createdAt": node.get("createdAt"),
+                                          "url": node.get("url", "") + "#discussion_r1"}]}}]})}}
 
     m = re.search(r"n\d+:\s*(issue|pullRequest)\(number:", query)
     if m:

@@ -176,7 +176,7 @@ class TestCacheCli(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("items__test__repo__open.json", r.stdout)
         self.assertIn("items ", r.stdout)
-        self.assertIn("clear: gg cache clear all | items | ai | logs | owner/name", r.stdout)
+        self.assertIn("clear: gg cache clear all | items | ai | logs | review | owner/name", r.stdout)
 
     def test_clear_by_repo_name_removes_only_that_repo(self):
         with open(os.path.join(self.cache, "summaries.json"), "w") as f:

@@ -39,19 +39,20 @@ class ConfigCase(unittest.TestCase):
         with open(self.config_path) as f:
             return json.load(f)
 
+    def _line_of(self, key, out):
+        """One `gg config` line, found by its key — the column widths follow the longest key name."""
+        for line in out.splitlines():
+            if line.split("=", 1)[0].strip() == key:
+                return line
+        self.fail(f"{key} not listed in `gg config` output:\n{out}")
+
     def value_of(self, key, out):
         """The value column of one `gg config` line."""
-        for line in out.splitlines():
-            if line.startswith(key.ljust(12) + " = "):
-                return line.split("=", 1)[1].split("[")[0].strip()
-        self.fail(f"{key} not listed in `gg config` output:\n{out}")
+        return self._line_of(key, out).split("=", 1)[1].split("[")[0].strip()
 
     def source_of(self, key, out):
         """The [env] / [config] / [default] marker of one `gg config` line."""
-        for line in out.splitlines():
-            if line.startswith(key.ljust(12) + " = "):
-                return line.split("[", 1)[1].split("]")[0].strip()
-        self.fail(f"{key} not listed in `gg config` output:\n{out}")
+        return self._line_of(key, out).split("[", 1)[1].split("]")[0].strip()
 
 
 class TestSelfDocumenting(ConfigCase):
