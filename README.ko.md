@@ -128,7 +128,7 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Inbox · Comm
 | 5 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄(최대 두 줄)에 **이유**: 참조가 나온 문장을 요약기가 40자 이내 한 줄로 바꾼 것(예: `충돌 여부를 확인한 관련 PR`; 오기 전이거나 요약이 꺼져 있으면 `#N` 주변 짧은 인용), 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 본문을 받아온 뒤 코멘트와 같은 요약기로; 대기 중엔 `» 요약 중…`) | 그 item으로 이동; 코멘트 행이면 그 item으로 가고 커서는 그 코멘트에(`b`/Esc로 복귀) |
 | 4 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`, 최신이 위 | main에서 읽기 |
 | 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람, 최근 활동 순 | 그 사람 관점으로 Inbox 보기 |
-| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(URL이 첫 줄에 밑줄로; 본문+메타 또는 코멘트) — main에 포커스가 있는 동안은 그대로 유지; **answer** = 마지막 `a` 질문의 답. 둘 다 markdown 렌더링: 제목, 코드 블록·`code`, **굵게**, 링크, 인용, 글머리표 | – |
+| 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(URL이 첫 줄에 밑줄로; 본문+메타 또는 코멘트) — main에 포커스가 있는 동안은 그대로 유지; **answer** = 마지막 `a` 질문의 답. 둘 다 markdown 렌더링: 제목, 코드 블록·`code`, **굵게**, 링크, 인용, 글머리표, 표(열 맞춘 box 표, `H`/`L`로 가로 스크롤) | – |
 
 Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄이고 폭이 바뀌면(드래그·리사이즈·screen mode) 다시 맞춤; 포커스된 side panel이 더 높고(`expand_focused`, `expanded_weight`) main으로 포커스가 가도 그 크기를 유지해 다음 선택이 쉬움; `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`.
 

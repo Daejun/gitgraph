@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.10.4"
+VERSION = "0.11.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1728,6 +1728,67 @@ def style_spec(st):
 _MD_INLINE = re.compile(r"(`[^`]+`)|(\*\*[^*]+\*\*)|(\[[^\]]+\]\([^)]+\))|(https?://[^\s)]+)")
 
 
+def render_table(lines, max_col=48):
+    """Markdown table lines -> aligned box lines: '│ a │ b │' rows and a '├───┼───┤' rule under the header."""
+    rows = [[c.strip() for c in ln.strip().strip("|").split("|")] for ln in lines]
+    sep = next((i for i, r in enumerate(rows) if i > 0 and all(re.fullmatch(r":?-+:?", c) for c in r if c) and any(r)), None)
+    aligns = []
+    if sep is not None:
+        for c in rows[sep]:
+            aligns.append("c" if c.startswith(":") and c.endswith(":") else "r" if c.endswith(":") else "l")
+        header, body = rows[:sep], rows[sep + 1:]
+    else:
+        header, body = [], rows
+    ncol = max(len(r) for r in rows)
+    aligns += ["l"] * (ncol - len(aligns))
+    widths = [min(max_col, max([dw(r[i]) for r in header + body if i < len(r)] + [1])) for i in range(ncol)]
+
+    def fmt(r):
+        cells = []
+        for i in range(ncol):
+            c = trunc(r[i] if i < len(r) else "", widths[i])
+            padn = widths[i] - dw(c)
+            if aligns[i] == "r":
+                c = " " * padn + c
+            elif aligns[i] == "c":
+                c = " " * (padn // 2) + c + " " * (padn - padn // 2)
+            else:
+                c = c + " " * padn
+            cells.append(c)
+        return "│ " + " │ ".join(cells) + " │"
+
+    out = [fmt(h) for h in header]
+    if header:
+        out.append("├─" + "─┼─".join("─" * w for w in widths) + "─┤")
+    out += [fmt(b) for b in body]
+    return out
+
+
+def render_markdown(text, width):
+    """Wrap prose to width; tables become aligned box lines (not wrapped — scroll sideways with H/L)."""
+    out, block, in_code = [], [], False
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.strip().startswith("```"):
+            in_code = not in_code
+        if not in_code and ln.lstrip().startswith("|") and i + 1 < len(lines) and lines[i + 1].lstrip().startswith("|"):
+            j = i
+            while j < len(lines) and lines[j].lstrip().startswith("|"):
+                j += 1
+            out.extend(wrap("\n".join(block), width) if block else [])
+            block = []
+            out.extend(render_table(lines[i:j]))
+            i = j
+            continue
+        block.append(ln)
+        i += 1
+    if block:
+        out.extend(wrap("\n".join(block), width))
+    return out
+
+
 def md_segments(text, in_code=False):
     """(text, style) segments for one line of markdown: headings, code, bold, links, quotes, bullets."""
     if in_code:
@@ -1795,6 +1856,13 @@ def segments(row, g):
         return ([(lead, "")] if lead else []) + [(t.strip(), "url")]
     if row.kind in ("md", "md_code"):
         return md_segments(t, row.kind == "md_code")
+    if row.kind == "md_table":
+        if t.startswith("├"):
+            return [(t, "meta")]
+        segs, first = [], row.jump == "head"
+        for part in re.split(r"(│)", t):
+            segs.append((part, "meta" if part == "│" else ("md_bold" if first else "")))
+        return segs
     if row.kind == "mention":
         i = t.find("  ← ")
         head = segments(Row(t[:i] if i >= 0 else t, row.nid), g)
@@ -2879,13 +2947,22 @@ class Tui:
         if tab == "content":
             lines = self.content_lines(self.subject, max(p.rect[3], 40))
         else:
-            lines = wrap(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))
+            lines = render_markdown(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))
         p.scroll_only = True
-        rows, in_code = [], False
+        rows, in_code, prev_table = [], False, False
         for t in lines:
             if re.match(r"https?://\S+$", t):
                 rows.append(Row(t, kind="url"))
+                prev_table = False
                 continue
+            if not in_code and t.startswith(("│", "├")):
+                r = Row(t, kind="md_table")
+                if not prev_table:
+                    r.jump = "head"          # first row of a table: the header
+                rows.append(r)
+                prev_table = True
+                continue
+            prev_table = False
             fence = t.lstrip().startswith("```")
             rows.append(Row(t, kind="md_code" if (in_code or fence) else "md"))
             if fence:
@@ -2960,7 +3037,7 @@ class Tui:
                 out.append(f"({PENDING_TEXT.replace('요약', '번역') if TR_LANG.lower().startswith('korean') else 'translating…'})")
         if body.strip():
             out.append("")
-            out.extend(wrap(self.reflow(body), width))
+            out.extend(render_markdown(self.reflow(body), width))
         return out
 
     def translate_content(self):
