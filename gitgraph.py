@@ -9,6 +9,7 @@ Usage:
   gg update                               update this installation from GitHub
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
   gg todo                                 print the markdown of everything marked with m in the tui
+  gg check [-r owner/name]                diagnose: gh accounts for the host, access, open counts, GraphQL fields
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
 """
@@ -24,7 +25,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -174,9 +175,32 @@ def discover_repos(root, depth=2):
 
 
 def is_github_host(host):
-    """github.com, any github.* host (typical for Enterprise), or a host gh is logged in to."""
+    """github.com, any host with 'github' in its name (Enterprise), or a host gh is logged in to."""
     host = host.lower()
-    return host == DEFAULT_HOST or host.startswith("github.") or host in gh_hosts()
+    return host == DEFAULT_HOST or "github" in host or host in gh_hosts()
+
+
+_ssh_hosts = {}
+
+
+def resolve_ssh_alias(host):
+    """'gh-work' (an alias in ~/.ssh/config) -> its real HostName, via `ssh -G`; hosts with a dot are returned as is."""
+    if "." in host or host in _ssh_hosts:
+        return _ssh_hosts.get(host, host)
+    real = host
+    try:
+        r = subprocess.run(["ssh", "-G", host], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            if line.startswith("hostname "):
+                real = line.split(None, 1)[1].strip()
+                break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    _ssh_hosts[host] = real
+    return real
+
+
+SKIPPED_REMOTES = []   # (dir, remote name, url, reason) — shown when nothing usable was found
 
 
 def github_remotes(d):
@@ -192,9 +216,14 @@ def github_remotes(d):
             continue
         name, url = parts[0], parts[1]
         m = _REMOTE_RE.match(url)
-        if not m or not is_github_host(m.group("host")):
+        if not m:
+            SKIPPED_REMOTES.append((d, name, url, "URL not understood"))
             continue
-        repo = make_repo(m.group("host").lower(), m.group("owner"), m.group("name"))
+        host = resolve_ssh_alias(m.group("host").lower())
+        if not is_github_host(host):
+            SKIPPED_REMOTES.append((d, name, url, f"host {host!r} is not github.com / github.* / a gh-logged-in host"))
+            continue
+        repo = make_repo(host, m.group("owner"), m.group("name"))
         if repo in seen:
             continue
         seen.add(repo)
@@ -233,7 +262,11 @@ def resolve_repos(explicit=None, interactive=False):
         return ENV_REPOS
     cands = discover_repos(os.getcwd())
     if not cands:
-        raise ValueError(f"no GitHub repo found under {os.getcwd()} — pass -r owner/name or set GITGRAPH_REPOS")
+        home = os.path.expanduser("~")
+        seen = "\n".join(f"  {d.replace(home, '~')}: {name} {url} — {why}" for d, name, url, why in SKIPPED_REMOTES[:12])
+        raise ValueError(f"no GitHub repo found under {os.getcwd().replace(home, '~')} (this directory and 2 levels below)"
+                         + (f"\n  remotes seen but skipped:\n{seen}" if seen else "\n  no git remotes found here")
+                         + "\n  -> pass -r owner/name, set GITGRAPH_REPOS, or run inside the repo")
     if len(cands) == 1:
         return [cands[0][0]]
     if interactive:
@@ -452,6 +485,8 @@ def fetch_repo(repo, state):
             if not conn["pageInfo"]["hasNextPage"]:
                 break
             after = conn["pageInfo"]["endCursor"]
+    if not items:
+        log(f"{repo}: no {'open ' if state == 'open' else ''}issues or PRs came back — run `gg check -r {repo}` to see why")
     return items
 
 
@@ -3893,6 +3928,75 @@ def do_show(id_, repos=None, state="open", max_age_min=15, refresh=False, transl
 
 
 # --------------------------------------------------------------------------
+# gg check: why can't I see the issues/PRs of this repo?
+# --------------------------------------------------------------------------
+def check_cmd(repos):
+    ok = True
+    for repo in repos:
+        host, owner, name = split_repo(repo)
+        print(f"== {repo}  (host {host})")
+        accts = gh_accounts(host)
+        print(f"   gh accounts for {host}: {', '.join(accts) or 'NONE — run: gh auth login -h ' + host}")
+        if not accts:
+            ok = False
+            continue
+        good = 0
+        for acct in accts:
+            env = dict(os.environ)
+            tok = gh_token(acct, host)
+            if not tok:
+                print(f"   @{acct}: no token (gh auth refresh -h {host} -u {acct}?)")
+                continue
+            env["GH_TOKEN"] = env["GH_ENTERPRISE_TOKEN"] = tok
+            q = ('query($o:String!,$n:String!){ repository(owner:$o,name:$n){ nameWithOwner isPrivate hasIssuesEnabled '
+                 'issues(states:[OPEN]){totalCount} pullRequests(states:[OPEN]){totalCount} '
+                 'allIssues: issues{totalCount} allPRs: pullRequests{totalCount} } viewer{login} }')
+            body = json.dumps({"query": q, "variables": {"o": owner, "n": name}})
+            r = gh_api(["graphql", "--hostname", host, "--input", "-"], body, env)
+            try:
+                d = json.loads(r.stdout)
+            except json.JSONDecodeError:
+                d = {}
+            errs = d.get("errors") or []
+            rep_ = (d.get("data") or {}).get("repository")
+            who = ((d.get("data") or {}).get("viewer") or {}).get("login", "?")
+            if rep_:
+                print(f"   @{acct} (token user {who}): OK — {'private' if rep_['isPrivate'] else 'public'}, "
+                      f"open issues {rep_['issues']['totalCount']} / open PRs {rep_['pullRequests']['totalCount']} "
+                      f"(all-time {rep_['allIssues']['totalCount']} / {rep_['allPRs']['totalCount']}), "
+                      f"issues {'enabled' if rep_['hasIssuesEnabled'] else 'DISABLED'}")
+                good += 1
+                if rep_["issues"]["totalCount"] + rep_["pullRequests"]["totalCount"] == 0:
+                    print("      -> nothing is open; gg shows open items only (try --state all)")
+            else:
+                msg = "; ".join(e.get("message", "") for e in errs) or (r.stderr or "").strip()[:200] or "no data"
+                print(f"   @{acct} (token user {who}): no access — {msg}")
+        if not good:
+            print(f"   -> no account on {host} can read {owner}/{name}: log in with one that can (gh auth login -h {host})")
+            ok = False
+        # the fields gg's real query needs (older GitHub Enterprise may lack some)
+        env = dict(os.environ)
+        tok = gh_token(accts[0], host)
+        env["GH_TOKEN"] = env["GH_ENTERPRISE_TOKEN"] = tok or ""
+        q = ('query($o:String!,$n:String!){ repository(owner:$o,name:$n){ pullRequests(first:1){ nodes{ '
+             'closingIssuesReferences(first:1){totalCount} reviews(first:1){totalCount} '
+             'timelineItems(first:1, itemTypes:[CROSS_REFERENCED_EVENT]){totalCount} } } } }')
+        r = gh_api(["graphql", "--hostname", host, "--input", "-"], json.dumps({"query": q, "variables": {"o": owner, "n": name}}), env)
+        try:
+            errs = (json.loads(r.stdout) or {}).get("errors") or []
+        except json.JSONDecodeError:
+            errs = [{"message": (r.stderr or r.stdout or "").strip()[:200]}]
+        bad = [e.get("message", "") for e in errs if "NOT_FOUND" not in (e.get("type") or "")]
+        print("   GraphQL fields gg uses (closingIssuesReferences, reviews, timelineItems): "
+              + ("OK" if not bad else "PROBLEM — " + "; ".join(bad)[:300]))
+        if bad:
+            ok = False
+    print("\nresult:", "everything looks fine — if the tui still shows nothing, run with --refresh (cache) and check ~/.cache/gitgraph/tui.log"
+          if ok else "see the lines marked 'no access' / PROBLEM above")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------
 # todo: marks made in the tui (m) -> todo.json (source) + a markdown file for the next session
 # --------------------------------------------------------------------------
 TODO_JSON = os.path.expanduser("~/.config/gitgraph/todo.json")
@@ -4016,7 +4120,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="graph",
                     help="graph (default) | ROOT (777 / #777 / owner/repo#777 / @login) | tui [ROOT] | show ID | "
-                         "ask ID \"question\" | update | config [KEY [VALUE]] | todo")
+                         "ask ID \"question\" | update | config [KEY [VALUE]] | todo | check")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
@@ -4053,12 +4157,18 @@ def main(argv=None):
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo", "check") and ROOT_RE.match(a.cmd):
         a.root, a.cmd = a.cmd, "graph"   # `gg 777`
     if a.cmd == "update":
         return update()
     if a.cmd == "config":
         return config_cmd([x for x in (a.arg, a.question) if x is not None] + (a.extra or []))
+    if a.cmd == "check":
+        try:
+            return check_cmd(resolve_repos(a.repo, interactive=True))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
     if a.cmd == "todo":
         entries = load_todo()
         if not entries:

@@ -40,6 +40,7 @@ gg ask 4563 "why does it mention #3859?"   # one-shot question to claude, with t
 gg tui [768]              # interactive TUI; a number starts on that tree
 gg config [KEY [VALUE]]   # persistent settings
 gg todo                   # print the markdown of everything marked with m in the tui
+gg check [-r owner/name]  # diagnose: gh accounts for the host, access per account, open counts, GraphQL fields
 gg update                 # update this installation
 ```
 

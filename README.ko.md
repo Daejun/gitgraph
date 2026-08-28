@@ -40,6 +40,7 @@ gg ask 4563 "왜 #3859를 언급해?"   # 그 항목(본문+코멘트 전체)을
 gg tui [768]              # 대화형 화면; 숫자를 주면 그 tree에서 시작
 gg config [KEY [VALUE]]   # 설정 저장
 gg todo                   # tui에서 m으로 표시한 것들의 markdown 출력
+gg check [-r owner/name]  # 진단: host별 gh 계정, 계정별 접근 여부, open 수, GraphQL 필드
 gg update                 # 설치 갱신
 ```
 
