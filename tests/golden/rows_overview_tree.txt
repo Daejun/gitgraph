@@ -1,0 +1,21 @@
+repo: test/repo   (data fetched TIMESTAMP)
+legend: date first = when the issue/PR was opened; +Nd = days after that for a comment; [I]=issue (green) [PR]=pull request (blue), [draft]/[merged]/[closed] only when not open; o=comment; @=person; → refs = this one references that; ← cited-by = that one references this; → closes / ← closed-by = PR fixes issue; ⇢ = link to a node drawn elsewhere (#N:o+Nd = the comment on #N, N days after it opened)
+
+== [1] 7 items (5 open), 3 linked comments, people: @alice @carol — tree rooted at #3 (most linked: 3 items) ==
+2024-02-10 #3 [PR][draft] 修复挂载时崩溃的问题  @carol
+├─ → refs 2023-10-01 tools#301 [I] Internal: track vendor kernel backport  @grace
+├─ → refs 2023-11-20 lib#42 [I] allocator: double free in slab reclaim under memory pressure  @frank
+└─ → refs 2024-01-05 #1 [I] Crash when the extent list is empty  @bob
+   ├─ mentions @alice
+   └─ → refs 2024-03-01 #5 [PR] fix: rebuild extent list on mount  @alice  (1 comments, 1 linked)
+      ├─ → closes 2024-01-10 #4 [I][closed] Stale metadata after crash  @dave  (1 comments, 1 linked)
+      │  ├─ ← cited-by +14d 04-15 #6 o @alice [inline] "nit: consider reusing the constant from issue #4 instead of a magic number."
+      │  │  └─ on 2024-04-01 #6 [PR][merged] Add zone GC accounting docs  @carol  (2 comments, 1 linked)
+      │  └─ +0d 01-10 o @dave "cc @carol, have you seen this on your rig?"
+      │     └─ mentions @carol
+      └─ +1d 03-02 o @bob "LGTM @alice, but this still needs tests before merge."
+         └─ mentions @alice
+
+== [2] 2 items (1 open), 0 linked comments — tree rooted at #2 (most linked: 1 items) ==
+2024-01-20 #2 [I] 익스텐트 병합 시 충돌 발생  @alice
+└─ ← cited-by 2023-12-01 #7 [I][closed] 중복 이슈 (구버전)  @eve

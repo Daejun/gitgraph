@@ -162,7 +162,7 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 
 tmux 안이면 마우스 보고를 켜야 한다(`set -g mouse on`).
 
-Smoke test: `GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py` — pty에서 TUI를 돌리고 `tests/vt.py`로 화면을 그려 검사한다.
+테스트: `python3 tests/run.py`가 전부 돌린다 — 문법 검사, stdlib `unittest` 묶음, golden 렌더링, 그리고 pty에서 TUI를 돌려 `tests/vt.py`로 화면을 그려 검사하는 `tests/tui_smoke.py`. 전부 임시 `HOME`의 fixture repo를 쓰므로 `gh` 로그인·네트워크·AI CLI가 없어도 되고, 내 캐시는 건드리지 않는다. 한 묶음만: `python3 tests/run.py unit`, 테스트 하나만: `python3 -m unittest tests.test_parse.TestRefs.test_fence`.
 
 ## 로컬 데이터
 

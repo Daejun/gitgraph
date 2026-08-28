@@ -1,0 +1,5 @@
+@alice  (2 mentions)
+
+edges:
+  ← mentioned-by 2024-01-05 #1 [I] Crash when the extent list is empty  @bob
+  ← mentioned-by +1d 03-02 #5 o @bob "LGTM @alice, but this still needs tests before merge."

@@ -1,0 +1,9 @@
+2023-11-20 lib#42 [I] allocator: double free in slab reclaim under memory pressure  @frank
+  url: (stub - not fetched)
+
+edges:
+  ← cited-by 2024-02-10 #3 [PR][draft] 修复挂载时崩溃的问题  @carol
+      ↳ "Related to other/lib#42 which tracks the upstream fix for the same allocator bug."
+
+body:
+  Upstream tracking issue for the allocator double-free seen under memory pressure.

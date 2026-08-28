@@ -1,0 +1,16 @@
+2024-03-01 #5 [PR] fix: rebuild extent list on mount  @alice
+  url: https://github.com/test/repo/pull/5
+  labels: bug
+  updated: 2024-03-02
+
+edges:
+  → closes 2024-01-10 #4 [I][closed] Stale metadata after crash  @dave
+      ↳ "Rebuilds the extent list on mount instead of trusting the stale checkpoint from before the crash. Closes #4."
+  ← cited-by 2024-01-05 #1 [I] Crash when the extent list is empty  @bob
+      ↳ "This does not overwrite #5, but you may want to check; see PR #5 for the actual fix."
+
+comments (1 total, 1 loaded):
+  +1d 03-02 o @bob "LGTM @alice, but this still needs tests before merge."  → → mentions @alice
+
+body:
+  Rebuilds the extent list on mount instead of trusting the stale checkpoint from before the crash. Closes #4.

@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Fake `gh` for tests: tests/env.py::child_env() puts this directory first on PATH so that if
+gitgraph's pipeline ever takes an unexpected network path — a stub reference with no pre-populated
+stubs__*.json entry, repo discovery falling through, an incremental refresh triggered by a stale
+fetched_at — it fails fast and loudly instead of hanging on a real `gh auth login` prompt or an actual
+network call.
+
+Default behaviour ("fail", FAKE_GH_MODE unset or "fail"): print what it was called with to stderr and
+exit 42. Tests that expect the offline pipeline (fixture cache hit, huge --max-age) should never see this
+fire at all.
+
+FAKE_GH_MODE=script turns on scripted responses for the three gh invocations gitgraph.py makes
+(gh_accounts()/gh_token()/graphql() in gitgraph.py):
+
+  gh auth status                     -> printed from FAKE_GH_ACCOUNTS
+  gh auth token -h HOST -u USER      -> a deterministic token, logged so a later graphql call can be
+                                         traced back to which account made it
+  gh api graphql --hostname H --input -   -> answered from FAKE_GH_FIXTURE, or a scripted failure
+
+Env vars read in "script" mode:
+
+  FAKE_GH_ACCOUNTS      JSON {"host": ["login-a", "login-b", ...]} — the first login per host is the
+                         active one. Drives `gh auth status`'s output and `gh_accounts()`'s parsing of it.
+                         Default: {"github.com": ["alice"]}.
+
+  FAKE_GH_FIXTURE        Path to a JSON file (written by the test, not checked in) shaped:
+                            {"repos": {"owner/name": {"issues": {"1": <node>, ...},
+                                                        "pulls": {"5": <node>, ...}}}}
+                          <node> is a GraphQL issue/PR node dict (number, title, state, body, createdAt,
+                          updatedAt, url, author, labels, comments, timelineItems, isDraft,
+                          closingIssuesReferences, reviews — see gitgraph.py's ISSUE_FIELDS/PR_FIELDS).
+                          One node shape answers every query kind gitgraph.py sends (light listing,
+                          full listing, per-number aliased fetch, issueOrPullRequest stub lookup) since
+                          this fake does not project fields the way a real GraphQL server would — unused
+                          extra keys in the response are simply ignored by gitgraph.py's dict .get()s.
+                          A number missing from the fixture answers as "not found" for that query kind
+                          (an aliased key holding null, e.g. resolve_stubs' "missing" case; a dropped
+                          alias entirely for fetch_items).
+
+  FAKE_GH_DENY           JSON list of logins that get a NOT_FOUND GraphQL error for every repository
+                          query, regardless of which repo/kind — for multi-account-fallback tests. The
+                          denied/allowed account is identified from the GH_TOKEN env var graphql() sets
+                          (see gh_token()'s token format below), not from any gh argv.
+
+  FAKE_GH_TRANSIENT_N     If set (>0): the first N `gh api graphql` calls in this test (tracked via a
+                          counter file — see FAKE_GH_TRANSIENT_COUNTER) fail with a transient network
+                          error ("TLS handshake timeout", matching gitgraph.py's TRANSIENT_RE) on stderr,
+                          empty stdout, exit 1; call N+1 onward is answered normally. Each `gh_api()`
+                          retry is a brand new process, so the count has to be persisted in a file.
+
+  FAKE_GH_TRANSIENT_COUNTER   Path to that counter file. Defaults to FAKE_GH_FIXTURE + ".transient_count"
+                          when FAKE_GH_TRANSIENT_N is set but this is not (so most tests need not pass it
+                          explicitly, as long as each test uses its own fixture file).
+
+  FAKE_GH_LOG            Path to append one JSON line per invocation ({"argv", "env_token", "kind", ...})
+                          — tests read it back to assert retry counts and which account was tried when.
+
+gh_token(user, host)'s token format is "TOKEN::{host}::{user}" — deterministic and self-describing, so
+this script (which only ever sees the token again via the GH_TOKEN/GH_ENTERPRISE_TOKEN env vars graphql()
+sets, never the account name itself) can recover which account a given `gh api graphql` call is using.
+"""
+import json
+import os
+import re
+import sys
+
+MODE = os.environ.get("FAKE_GH_MODE", "fail")
+
+
+def log_call(rec):
+    path = os.environ.get("FAKE_GH_LOG")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        try:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def fail(args):
+    sys.stderr.write(
+        "tests/fakes/gh: gh was invoked (args=%r) — a test should never reach the real gh / network path; "
+        "fix the fixture or the GITGRAPH_* env instead of letting this run.\n" % (args,))
+    sys.exit(42)
+
+
+def token_for(host, user):
+    return f"TOKEN::{host}::{user}"
+
+
+def account_for_token(tok):
+    if not tok:
+        return None
+    m = re.match(r"TOKEN::(.*)::(.*)$", tok)
+    return m.group(2) if m else None
+
+
+def accounts_map():
+    raw = os.environ.get("FAKE_GH_ACCOUNTS")
+    return json.loads(raw) if raw else {"github.com": ["alice"]}
+
+
+def cmd_auth_status(args):
+    accts = accounts_map()
+    lines = []
+    for host, logins in accts.items():
+        for i, login in enumerate(logins):
+            lines.append(host)
+            lines.append(f"  ✓ Logged in to {host} account {login} (keyring)")
+            lines.append(f"  - Active account: {'true' if i == 0 else 'false'}")
+            lines.append("  - Git operations protocol: https")
+            lines.append(f"  - Token: {token_for(host, login)[:8]}************")
+            lines.append("")
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_auth_token(args):
+    # gh auth token -h HOST -u USER
+    host = args[args.index("-h") + 1] if "-h" in args else "github.com"
+    user = args[args.index("-u") + 1] if "-u" in args else ""
+    accts = accounts_map()
+    if user not in accts.get(host, []):
+        sys.stderr.write(f"no token found for {user} on {host}\n")
+        return 1
+    print(token_for(host, user))
+    return 0
+
+
+def _load_fixture():
+    path = os.environ["FAKE_GH_FIXTURE"]
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _repo_data(fixture, repo):
+    return (fixture.get("repos") or {}).get(repo) or {"issues": {}, "pulls": {}}
+
+
+def _extract_owner_name(query, variables):
+    if variables and variables.get("owner") and variables.get("name"):
+        return variables["owner"], variables["name"]
+    m = re.search(r'repository\(owner:"([^"]+)",\s*name:"([^"]+)"\)', query)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
+def _transient_should_fire():
+    n = os.environ.get("FAKE_GH_TRANSIENT_N")
+    if not n or int(n) <= 0:
+        return False
+    n = int(n)
+    counter_path = os.environ.get("FAKE_GH_TRANSIENT_COUNTER") or (os.environ["FAKE_GH_FIXTURE"] + ".transient_count")
+    count = 0
+    if os.path.exists(counter_path):
+        with open(counter_path) as f:
+            count = int((f.read().strip() or "0"))
+    fire = count < n
+    with open(counter_path, "w") as f:
+        f.write(str(count + 1))
+    return fire
+
+
+def _graphql_response(query, variables, repo):
+    fixture = _load_fixture()
+    data = _repo_data(fixture, repo)
+    issues, pulls = data.get("issues", {}), data.get("pulls", {})
+
+    if "issueOrPullRequest(number:" in query:
+        rep = {}
+        for alias, num in re.findall(r"(n\d+):\s*issueOrPullRequest\(number:(\d+)\)", query):
+            node = issues.get(num) or pulls.get(num)
+            if node is None:
+                rep[alias] = None
+            else:
+                typename = "PullRequest" if num in pulls else "Issue"
+                rep[alias] = dict(node, __typename=typename)
+        return {"repository": rep}
+
+    m = re.search(r"n\d+:\s*(issue|pullRequest)\(number:", query)
+    if m:
+        kind = m.group(1)
+        pool = pulls if kind == "pullRequest" else issues
+        rep = {}
+        for alias, num in re.findall(rf"(n\d+):\s*{kind}\(number:(\d+)\)", query):
+            node = pool.get(num)
+            if node is not None:
+                rep[alias] = node
+        return {"repository": rep}
+
+    is_pr_field = "pullRequests(first:" in query
+    pool = pulls if is_pr_field else issues
+    states = (variables or {}).get("states")
+    nodes = []
+    for node in pool.values():
+        if states and node.get("state") not in states:
+            continue
+        nodes.append(node)
+    conn = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}
+    key = "pullRequests" if is_pr_field else "issues"
+    return {"repository": {key: conn}}
+
+
+def cmd_api_graphql(args):
+    host = args[args.index("--hostname") + 1] if "--hostname" in args else "github.com"
+    body = json.loads(sys.stdin.read() or "{}")
+    query, variables = body.get("query", ""), body.get("variables") or {}
+    owner, name = _extract_owner_name(query, variables)
+    repo = f"{owner}/{name}" if owner and name else None
+
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GH_ENTERPRISE_TOKEN")
+    account = account_for_token(token)
+    log_call({"host": host, "repo": repo, "account": account, "query_head": query.strip()[:80]})
+
+    if _transient_should_fire():
+        sys.stderr.write("gh: TLS handshake timeout\n")
+        return 1
+
+    deny = json.loads(os.environ.get("FAKE_GH_DENY") or "[]")
+    if account and account in deny:
+        print(json.dumps({"errors": [{"type": "NOT_FOUND",
+                                       "message": f"Could not resolve to a Repository with the name '{repo}'."}],
+                          "data": {"repository": None}}))
+        return 1
+
+    if repo is None:
+        print(json.dumps({"errors": [{"type": "NOT_FOUND", "message": "could not determine repository"}],
+                          "data": {"repository": None}}))
+        return 1
+
+    # a real `gh api graphql` reply wraps the payload in {"data": ...}, which graphql() unwraps
+    print(json.dumps({"data": _graphql_response(query, variables, repo)}, ensure_ascii=False))
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if MODE != "script":
+        fail(argv)
+        return 42
+
+    if argv[:2] == ["auth", "status"]:
+        return cmd_auth_status(argv[2:])
+    if argv[:2] == ["auth", "token"]:
+        return cmd_auth_token(argv[2:])
+    if argv[:2] == ["api", "graphql"]:
+        return cmd_api_graphql(argv[2:])
+
+    sys.stderr.write(f"tests/fakes/gh: FAKE_GH_MODE=script has no handler for {argv!r}\n")
+    return 42
+
+
+if __name__ == "__main__":
+    sys.exit(main())

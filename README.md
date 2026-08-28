@@ -162,7 +162,7 @@ Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$
 
 Under tmux enable mouse reporting (`set -g mouse on`).
 
-Smoke test: `GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py` drives the TUI in a pseudo-terminal, renders it with `tests/vt.py` and checks the screen.
+Tests: `python3 tests/run.py` runs everything — a syntax check, the stdlib-`unittest` suites, the golden renderings and `tests/tui_smoke.py`, which drives the TUI in a pseudo-terminal and renders it with `tests/vt.py`. It all runs against a fixture repo in a throwaway `HOME`, so no `gh` login, no network and no AI CLI are needed, and your own cache is never touched. One suite: `python3 tests/run.py unit`; one test: `python3 -m unittest tests.test_parse.TestRefs.test_fence`.
 
 ## Local data
 

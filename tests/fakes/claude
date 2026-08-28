@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Deterministic stand-in for the `claude` CLI, for tests.
+
+gitgraph picks its AI backend from the basename of `claude_bin` (config key `claude_bin`, env
+GITGRAPH_CLAUDE), so this file must stay named `claude` to exercise the real Claude code path in
+_ai_call(): `claude -p --no-session-persistence --output-format json --model M PROMPT`, whose stdout is
+parsed as JSON with `result` + `usage` + `total_cost_usd`.
+
+What it answers:
+  * batch prompts (TR_PROMPT / SUM_PROMPT / WHY_PROMPT — they end with a JSON array payload and demand
+    "ONLY a JSON array") -> a JSON array of exactly the payload's length, each element derived from its
+    input so a test can tell which entry it belongs to:
+        strings (translation)        -> "TR:<original>"
+        {"kind","text",...} (summary)-> "SUM:<first 40 chars of text>"
+        {"ref","sentence"} (why)     -> "WHY:<ref>"
+  * anything else (TR_FULL_PROMPT full-text translation, ASK_PROMPT question) -> plain text:
+        full-text translation        -> "TRFULL:" + the body that followed the prompt header
+        question                     -> "ANSWER: <the question line>"
+
+Env vars (all optional):
+  FAKE_AI_FAIL=1     exit 1 with a plausible "not logged in" message on stderr  (-> AI_FAILURES)
+  FAKE_AI_BAD_LEN=1  return an array of the wrong length                        (-> claude_json raises)
+  FAKE_AI_IS_ERROR=1 return a well-formed JSON reply with is_error true
+  FAKE_AI_SLEEP=N    sleep N seconds first (pending markers: "» 요약 중…", "⟳ 번역 중…")
+  FAKE_AI_LOG=PATH   append one JSON line per call {argv, prompt} so tests can assert batch sizes,
+                     context contents and that a cached second call did NOT reach the CLI
+"""
+import json
+import os
+import sys
+import time
+
+
+def payload_of(prompt):
+    """The JSON array at the end of a batch prompt, or None for a plain-text prompt."""
+    tail = prompt.rsplit("\n\n", 1)[-1].strip()
+    if not tail.startswith("["):
+        return None
+    try:
+        v = json.loads(tail)
+    except ValueError:
+        return None
+    return v if isinstance(v, list) else None
+
+
+def answer_for(entry):
+    if isinstance(entry, dict):
+        if "ref" in entry:
+            return f"WHY:{entry['ref']}"
+        text = entry.get("text") or entry.get("body") or entry.get("title") or ""
+        return f"SUM:{str(text)[:40]}"
+    return f"TR:{entry}"
+
+
+def main():
+    argv = sys.argv[1:]
+    prompt = argv[-1] if argv else ""
+
+    log_path = os.environ.get("FAKE_AI_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"argv": argv[:-1], "prompt": prompt}, ensure_ascii=False) + "\n")
+
+    sleep = float(os.environ.get("FAKE_AI_SLEEP") or 0)
+    if sleep:
+        time.sleep(sleep)
+
+    if os.environ.get("FAKE_AI_FAIL"):
+        sys.stderr.write("Invalid API key · Please run /login\n")
+        return 1
+
+    arr = payload_of(prompt)
+    if arr is not None:
+        out = [answer_for(e) for e in arr]
+        if os.environ.get("FAKE_AI_BAD_LEN"):
+            out = out[:-1] if len(out) > 1 else out + ["extra"]
+        result = json.dumps(out, ensure_ascii=False)
+    elif "=== question ===" in prompt:
+        question = prompt.rsplit("=== question ===", 1)[-1].strip()
+        result = f"ANSWER: {question}"
+    else:
+        body = prompt.rsplit("\n\n", 1)[-1]
+        result = "TRFULL:" + body
+
+    reply = {
+        "type": "result",
+        "is_error": bool(os.environ.get("FAKE_AI_IS_ERROR")),
+        "result": result,
+        "usage": {"input_tokens": 11, "output_tokens": 7,
+                  "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5},
+        "total_cost_usd": 0.001,
+    }
+    sys.stdout.write(json.dumps(reply, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,29 +1,88 @@
 #!/usr/bin/env python3
-"""Drive `gg tui` in a pseudo-terminal, render its output with the small VT emulator in vt.py and check the screen.
+"""Drive the real `gg tui` in a pseudo-terminal against the fixture repo, render its output with the
+small VT emulator in vt.py, and check the screen.
 
-    GITGRAPH_REPOS=owner/name python3 tests/tui_smoke.py        # needs gh login and a fetched/cached repo
+    python3 tests/tui_smoke.py            # no gh login, no network, no AI CLI needed
+    python3 tests/run.py smoke            # same thing through the runner
+    GG_UPDATE_GOLDEN=1 python3 tests/tui_smoke.py    # rewrite tests/golden/tui_*.txt from this run
 
-Not a unit test: it exercises the real program end to end (no claude calls: --no-summary -t none).
+Everything happens inside a throwaway HOME built by tests/env.py: the fixture repo is already "fetched"
+into its cache, `gh` on PATH is the fail-loud fake, the AI CLI is tests/fakes/claude (deterministic) and
+xdg-open is a fake that records URLs instead of opening a browser. The user's real ~/.cache/gitgraph,
+~/.config/gitgraph and ~/gitgraph-todo.md are never read or written.
+
+Not a unit test: it exercises the real program end to end. One ok/FAIL line per check, exit 1 on any
+failure.
 """
+import json
 import os
 import pty
+import re
 import select
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import env as testenv  # noqa: E402
 from vt import Screen  # noqa: E402
 
 ROWS, COLS = 34, 140
+HERE = os.path.dirname(os.path.abspath(__file__))
+GOLDEN_DIR = os.path.join(HERE, "golden")
+GITGRAPH = os.path.join(os.path.dirname(HERE), "gitgraph.py")
+FAKE_CLAUDE = os.path.join(HERE, "fakes", "claude")
+UPDATE_GOLDEN = bool(os.environ.get("GG_UPDATE_GOLDEN"))
+
+# Everything in a rendered screen that changes between runs, blanked before comparing with a golden file.
+NOISE = [
+    (re.compile(r"\d\d:\d\d(:\d\d)?"), "TT:TT"),          # the clock in the Repo panel
+    (re.compile(r"\b\d+[smhd]\b"), "AGE"),                 # "3s", "12m", "2h", "5d" (ages, elapsed)
+    (re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"), " "),                    # progress spinner frame
+    (re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d"), "FETCHED"),  # "data fetched ..." timestamps
+]
+
+
+PROGRESS_WORDS = ("summarizing", "translating", "fetching", "starting", "resolving", "AI jobs", "batch")
+
+
+def normalise(text):
+    for rx, repl in NOISE:
+        text = rx.sub(repl, text)
+    out = []
+    for line in text.splitlines():
+        # the background-progress line changes with timing (which batch is running, how far it got)
+        out.append("PROGRESS" if any(w in line for w in PROGRESS_WORDS) else line.rstrip())
+    return "\n".join(out)
 
 
 class Session:
-    def __init__(self, args):
+    def __init__(self, args=(), home=None, rows=ROWS, cols=COLS, **envextra):
+        self.home = home or testenv.make_home()
+        self.rows, self.cols = rows, cols
+        # deliberately no LINES/COLUMNS: ncurses would honour them over the pty's real size and never
+        # see a resize (SIGWINCH -> KEY_RESIZE), which is one of the things this file checks
+        env = testenv.child_env(self.home, GITGRAPH_CLAUDE=FAKE_CLAUDE, GG_DEBUG="1", **envextra)
+        self.env = env
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.environ.update(TERM="xterm-256color", LINES=str(ROWS), COLUMNS=str(COLS), GG_DEBUG="1")
-            os.execvp(sys.executable, [sys.executable, os.path.join(os.path.dirname(__file__), "..", "gitgraph.py"), "tui", "--no-tour"] + args)
-        self.scr = Screen(ROWS, COLS)
+            os.execve(sys.executable, [sys.executable, GITGRAPH, "tui", "--no-tour",
+                                       "--max-age", str(testenv.FIXTURE_MAX_AGE_MIN)] + list(args), env)
+        self.set_size(rows, cols)      # before the child reaches curses init
+        self.scr = Screen(rows, cols)
+
+    # -- terminal plumbing ------------------------------------------------
+    def set_size(self, rows, cols):
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def resize(self, rows, cols):
+        """Resize the pty (the child gets SIGWINCH -> curses KEY_RESIZE) and start a matching screen."""
+        self.rows, self.cols = rows, cols
+        self.scr = Screen(rows, cols)
+        self.set_size(rows, cols)
+        self.drain(1.2)
 
     def drain(self, t):
         end = time.time() + t
@@ -35,10 +94,10 @@ class Session:
                 except OSError:
                     return
 
-    def wait_for(self, text, timeout=60):
+    def wait_for(self, text, timeout=30):
         end = time.time() + timeout
         while time.time() < end:
-            self.drain(0.5)
+            self.drain(0.4)
             if text in self.scr.text():
                 return True
         return False
@@ -47,14 +106,45 @@ class Session:
         os.write(self.fd, data if isinstance(data, bytes) else data.encode())
         self.drain(wait)
 
+    def keys(self, *seq, wait=0.5):
+        for k in seq:
+            self.key(k, wait)
+
     def mouse(self, code, x, y, press=True):
         os.write(self.fd, f"\x1b[<{code};{x + 1};{y + 1}{'M' if press else 'm'}".encode())
 
+    def click(self, x, y, wait=0.6):
+        self.mouse(0, x, y)
+        self.mouse(0, x, y, press=False)
+        self.drain(wait)
+
+    # -- reading the screen -----------------------------------------------
     def text(self):
         return self.scr.text()
 
     def line(self, i):
-        return self.scr.text().splitlines()[i]
+        lines = self.scr.text().splitlines()
+        return lines[i] if i < len(lines) else ""
+
+    def find_line(self, needle):
+        for i, l in enumerate(self.text().splitlines()):
+            if needle in l:
+                return i
+        return -1
+
+    def cache(self, name):
+        path = os.path.join(self.home, ".cache", "gitgraph", name)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def log(self):
+        path = os.path.join(self.home, ".cache", "gitgraph", "tui.log")
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
 
     def quit(self):
         self.key("q", 0.3)
@@ -62,91 +152,357 @@ class Session:
         pid, st = os.waitpid(self.pid, os.WNOHANG)
         return pid != 0 and st == 0
 
+    def kill(self):
+        try:
+            os.kill(self.pid, 9)
+            os.waitpid(self.pid, 0)
+        except OSError:
+            pass
 
-def main():
-    fails = []
 
-    def check(name, cond):
-        print(("ok   " if cond else "FAIL ") + name)
-        if not cond:
-            fails.append(name)
+FAILS = []
 
-    s = Session(["--no-summary", "-t", "none"])
+
+def check(name, cond, detail=""):
+    print(("ok   " if cond else "FAIL ") + name)
+    if not cond:
+        FAILS.append(name)
+        if detail:
+            print("     " + detail.replace("\n", "\n     ")[:1500])
+
+
+def check_golden(name, text):
+    """Compare a normalised screen against tests/golden/tui_<name>.txt (GG_UPDATE_GOLDEN=1 rewrites)."""
+    path = os.path.join(GOLDEN_DIR, f"tui_{name}.txt")
+    got = normalise(text)
+    if UPDATE_GOLDEN:
+        os.makedirs(GOLDEN_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(got + "\n")
+        print(f"ok   golden {name} (updated)")
+        return
+    if not os.path.exists(path):
+        check(f"golden {name}", False, f"missing {path}; run GG_UPDATE_GOLDEN=1 python3 tests/tui_smoke.py")
+        return
+    with open(path, encoding="utf-8") as f:
+        want = f.read().rstrip("\n")
+    if got == want:
+        print(f"ok   golden {name}")
+        return
+    diff = []
+    for i, (a, b) in enumerate(zip(want.splitlines(), got.splitlines())):
+        if a != b:
+            diff.append(f"line {i}\n  want: {a!r}\n  got : {b!r}")
+    check(f"golden {name}", False, "\n".join(diff[:6]) or "line count differs")
+
+
+def item_line(s):
+    """The first row of the Item panel — what Enter on an Inbox row changes."""
+    i = s.find_line("2 Item")
+    return s.line(i + 1) if i >= 0 else ""
+
+
+def current_item(s):
+    """The current item's node id, read from state.json — the identity Enter changes, without the
+    rendering noise (a background summary landing rewrites the Item panel's text on its own)."""
+    st = s.cache("state.json") or {}
+    return (st.get("item") or {}).get("id")
+
+
+# ---------------------------------------------------------------- the checks
+
+
+def panels_and_navigation(s):
     check("panels drawn", s.wait_for("6 People") and "0 Main" in s.line(0))
+    check("repo panel shows the fixture repo", "test/repo" in s.text(), s.line(2))
+    check_golden("start", s.text())
+
+    s.key("3")                                  # Inbox
     s.key("j")
-    s.key("\r", 2.0)
+    s.key("\r", 1.5)
     check("Enter sets the item", "#" in s.line(5))
     check("Item panel shows the item", "2 Item" in s.text() and "#" in s.line(5))
-    s.key("5")
+
+    s.key("5")                                  # Links
     s.key("j")
-    s.key("\r", 2.0)
+    s.key("\r", 1.5)
     item_after_link = s.line(5)
     check("Links notes", "↳" in s.text())
-    s.key("b", 2.0)
+    s.key("b", 1.5)
     check("Links Enter then back", item_after_link != s.line(5))
+    s.key("f", 1.0)
+    check("forward returns", item_after_link == s.line(5), f"{item_after_link!r} vs {s.line(5)!r}")
+
+    s.key("4")                                  # Comments
+    s.key("\r", 1.0)
+    check("Comments Enter shows the comment in main", "0 Main" in s.line(0))
+    s.key("6")                                  # People
+    s.key("\r", 1.0)
+    check("People Enter switches perspective", "6 People" in s.text())
+
     s.key("0")
     s.key("]", 1.0)
     check("main answer tab", "[answer]" in s.line(0))
+    s.key("[", 0.8)
+    check("back to content tab", "[content]" in s.line(0))
+
     s.key("+", 0.8)
     check("half screen: only main", "1 Repo" not in s.text())
+    s.key("+", 0.8)
+    check("full screen", "1 Repo" not in s.text())
+    s.key("_", 0.6)
     s.key("_", 0.8)
+    check("back to normal screen", "1 Repo" in s.text())
+
+
+def inbox_tabs(s):
     s.key("3")
-    s.key("]", 1.0)
-    check("home section tab", "3/10" in s.text())
-    s.key("?", 1.0)
-    check("key menu popup", "keys — Inbox panel" in s.text())
+    seen = []
+    for _ in range(len(["todo", "turn", "mention", "opened", "active",
+                        "waiting", "mine", "prs", "stale", "all"])):
+        title = s.line(s.find_line("3 Inbox"))
+        m = re.search(r"‹ (.+?) ›", title)
+        seen.append(m.group(1).strip() if m else title)
+        s.key("]", 0.5)
+    check("all 10 Inbox tabs cycle", len(set(seen)) == 10, f"saw {seen}")
+    check("tab counter is shown", re.search(r"\d+/10", s.text()) is not None)
+
+
+def search_and_marks(s):
+    s.key("3")
+    s.key("/", 0.5)
+    s.key("한글 검색\x1b", 0.8)       # wide characters in a prompt must not crash it
+    check("search prompt survives wide input", "Traceback" not in s.log())
+    s.key("/", 0.5)
+    s.key("#\r", 1.0)
+    check("search finds a row", "1 Repo" in s.text())
+    s.keys("n", "N", wait=0.4)
+    check("search next/prev", "Traceback" not in s.log())
+
+    s.key("m", 0.8)
+    check("mark prompt or menu", "my note" in s.text() or "is marked" in s.text())
+    s.key("regression note\r", 1.2)
+    todo = s.cache("../../.config/gitgraph/todo.json") if False else None
+    path = os.path.join(s.home, ".config", "gitgraph", "todo.json")
+    ok = os.path.exists(path)
+    entries = json.load(open(path, encoding="utf-8")) if ok else []
+    check("m writes todo.json in the temp HOME", ok and len(entries) == 1,
+          f"{path}: {entries}")
+    check("the note is stored", bool(entries) and "regression note" in json.dumps(entries, ensure_ascii=False))
+    s.key("3")
+    for _ in range(10):                      # walk to the todo tab (first Inbox section)
+        if "todo" in s.line(s.find_line("3 Inbox")):
+            break
+        s.key("[", 0.4)
+    check("the mark shows in the Inbox todo tab", "✎" in s.text() or "todo" in s.line(s.find_line("3 Inbox")),
+          s.line(s.find_line("3 Inbox")))
+    s.key("m", 0.8)
+    check("m on a marked row offers edit/done/remove", "is marked" in s.text() or "done" in s.text())
     s.key("\x1b", 0.5)
+
+
+def popups_and_menus(s):
+    s.key("?", 1.0)
+    check("key menu popup", "keys —" in s.text())
+    s.key("\x1b", 0.5)
+    check("Esc closes the key menu", "keys —" not in s.text())
     s.key("O", 1.0)
     check("options popup", "options" in s.text() and "comments:" in s.text())
     s.key("\x1b", 0.5)
-    s.key("/", 0.5)
-    s.key("한글 검색\x1b", 0.8)       # typed then cancelled: the prompt must accept wide characters without crashing
-    s.key("a", 0.5)
+    s.key("$", 1.0)
+    check("usage popup", "usage" in s.text() or "tokens" in s.text())
+    s.key("\x1b", 0.5)
+    s.key("d", 1.0)
+    check("details pager", "details:" in s.text())
+    s.key("\x1b", 0.5)
+    s.key("T", 0.8)
+    check("theme cycles", "Traceback" not in s.log())
+    s.key("T", 0.5)
+    s.key("T", 0.5)
+
+
+def ai_flows(s):
+    """With tests/fakes/claude: the ask popup and the i translation toggle."""
+    s.key("3")
+    s.key("a", 0.6)
     check("prompt popup", "ask about" in s.text())
     s.key("\x1b", 0.5)
-    s.key("a", 0.5)
-    s.key("x\r", 1.5)                # a real question would take a while; the answer tab must open without crashing
+    s.key("a", 0.6)
+    s.key("why?\r", 3.0)
     check("ask opens the answer tab", "[answer" in s.line(0))
+    check("the fake AI answer is shown", "ANSWER: why?" in s.text(), s.text()[:400])
     s.key("[", 0.5)
-    # drag the border from the current position 15 columns to the right
-    home_row = next(i for i, l in enumerate(s.text().splitlines()) if "3 Inbox" in l)
-    bx = next((i for i, ch in enumerate(s.line(home_row)) if ch == "╮"), None)   # Home's top border
-    if bx is not None:
-        s.mouse(0, bx, 10)
-        s.mouse(32, bx + 8, 10)
-        s.mouse(32, bx + 15, 10)
-        s.mouse(0, bx + 15, 10, press=False)
-        s.drain(0.8)
-        nbx = next((i for i, ch in enumerate(s.line(home_row)) if ch == "╮"), None)
-        check("border drag widens the side column", nbx is not None and nbx > bx + 5)
-    else:
-        check("border found", False)
-    s.key("3"); s.key("j", 0.4)
-    s.key("m", 0.6)
-    check("mark prompt or menu", "my note" in s.text() or "is marked" in s.text())
+    s.key("i", 2.5)
+    check("i toggles the translation", "Traceback" not in s.log())
+
+
+def hangul_ime(s):
+    """0.12.1: a shortcut typed in Hangul IME mode fires once, and the Enter/Space the IME sends to
+    commit the lone jamo right after it is ignored instead of acting as a second command."""
+    s.key("3")
+    s.key("ㅁ", 0.8)                     # 'a' in the 2-set layout: the ask popup
+    check("Hangul ㅁ opens the ask popup", "ask about" in s.text(), s.text()[:300])
     s.key("\x1b", 0.5)
-    s.key("\x1bOQ", 0.8)                 # F2: tour
-    check("tour popup", "tour 1/" in s.text())
-    s.key("\r", 0.5); s.key("\r", 0.5)
-    s.key("\x1b[D", 0.5)
-    check("tour prev", "tour 2/" in s.text())
-    s.key("\x1b", 0.5)
-    check("clean exit", s.quit())
-    log = open(os.path.expanduser("~/.cache/gitgraph/tui.log")).read()
-    check("no traceback", "Traceback" not in log)
-    try:   # the test question above gets saved like any other: drop it again
-        import json
-        qp = os.path.expanduser("~/.config/gitgraph/qa.json")
-        qa = json.load(open(qp))
-        for k in list(qa):
-            qa[k] = [e for e in qa[k] if e.get("q") != "x"]
-            if not qa[k]:
-                del qa[k]
-        json.dump(qa, open(qp, "w"), ensure_ascii=False, indent=1)
-    except (OSError, ValueError):
-        pass
-    print(f"\n{len(fails)} failure(s)" if fails else "\nall good")
-    return 1 if fails else 0
+    s.key("3", 0.4)
+    s.key("j", 0.6)                      # move the Inbox cursor off the current item
+    before = current_item(s)             # the current item only changes when Enter acts
+    # jamo + the IME's commit key in ONE write, the way a real IME sends them (within ime_until)
+    s.key("\u3153\r", 1.2)              # ㅓ = j (move down) followed by the committing Enter
+    check("Hangul ㅓ moves the cursor", "Traceback" not in s.log())
+    check("the IME commit Enter is swallowed", current_item(s) == before,
+          f"{before!r} -> {current_item(s)!r}")
+
+
+def mouse_and_border(s):
+    """0.11.2: only a drag that starts on the border columns resizes the side column."""
+    row = s.find_line("3 Inbox")
+    border_x = s.line(row).find("╮")
+    if border_x < 0:
+        check("border found", False, s.line(row))
+        return
+    # a drag that starts inside main selects text and must NOT move the border
+    s.mouse(0, border_x + 20, 10)
+    s.mouse(32, border_x + 30, 10)
+    s.mouse(0, border_x + 30, 10, press=False)
+    s.drain(0.8)
+    after_main_drag = s.line(row).find("╮")
+    check("a drag inside main does not resize", after_main_drag == border_x,
+          f"{border_x} -> {after_main_drag}")
+    # a drag that starts on the border does move it
+    s.mouse(0, border_x, 10)
+    s.mouse(32, border_x + 8, 10)
+    s.mouse(32, border_x + 15, 10)
+    s.mouse(0, border_x + 15, 10, press=False)
+    s.drain(0.8)
+    moved = s.line(row).find("╮")
+    check("border drag widens the side column", moved > border_x + 5, f"{border_x} -> {moved}")
+
+    # wheel scroll and click-to-focus
+    s.mouse(64, 5, 12)
+    s.drain(0.4)
+    check("wheel does not crash", "Traceback" not in s.log())
+    s.click(5, s.find_line("4 Comments") + 1)
+    check("click focuses another panel", "Traceback" not in s.log())
+
+
+def url_click(s):
+    """0.9.3: a URL opens only when the pointer is on its visible characters."""
+    log_path = os.path.join(s.home, "opened.txt")
+    s.key("3")
+    s.key("\r", 1.2)
+    s.key("0", 0.6)
+    row = s.find_line("https://")
+    if row < 0:
+        check("main shows the URL line", False, s.text()[:400])
+        return
+    line = s.line(row)
+    start = line.find("https://")
+    end = start + len(line[start:].split()[0])
+    s.click(end + 12, row)               # past the end of the URL text: nothing must open
+    opened_after_blank = os.path.exists(log_path)
+    s.click(start + 2, row)              # on the URL itself
+    time.sleep(0.5)
+    urls = open(log_path, encoding="utf-8").read().split() if os.path.exists(log_path) else []
+    check("clicking past the URL opens nothing", not opened_after_blank)
+    check("clicking the URL opens the browser", bool(urls) and urls[-1].startswith("http"), f"{urls}")
+
+
+def live_state(s):
+    """state.json for `gg mcp`, and cmd.json driving the running TUI (gg_open)."""
+    st = None
+    for _ in range(20):
+        st = s.cache("state.json")
+        if st:
+            break
+        s.drain(0.3)
+    check("state.json is written", bool(st))
+    if not st:
+        return
+    check("state.json names the repo and the current item",
+          testenv.FIXTURE_REPO in (st.get("repos") or []) and st.get("item"), json.dumps(st)[:300])
+    # drive the TUI through cmd.json the way `gg mcp`'s gg_open does: {"op": "open", "id": <node id>}
+    items = (s.cache("items__test__repo__open.json") or {}).get("items", [])
+    current = str(st["item"]["label"])
+    target = next((it["number"] for it in items if f"#{it['number']}" != current), None)
+    if target is None:
+        check("cmd.json moves the TUI (gg_open)", False, "no other item in the fixture")
+        return
+    cmd_path = os.path.join(s.home, ".cache", "gitgraph", "cmd.json")
+    with open(cmd_path, "w", encoding="utf-8") as f:
+        json.dump({"op": "open", "id": f"{testenv.FIXTURE_REPO}#{target}", "req": "smoke-1"}, f)
+    moved = False
+    for _ in range(20):
+        s.drain(0.4)
+        st2 = s.cache("state.json") or {}
+        if st2.get("item") and f"#{target}" in st2["item"]["label"]:
+            moved = True
+            break
+    check("cmd.json moves the TUI (gg_open)", moved)
+
+
+def portrait_and_theme():
+    """A narrow terminal stacks the panels; --theme basic must not use dim/256 colours."""
+    s = Session(["--theme", "basic", "--no-summary", "-t", "none"], cols=83, rows=30)
+    try:
+        ok = s.wait_for("Main", 30)
+        check("basic theme, 83 columns starts", ok, s.text()[:400])
+        check("portrait mode stacks the panels", "0 Main" in s.text() and s.text().count("╭") > 0)
+        check_golden("portrait83", s.text())
+        s.resize(30, 140)
+        s.key("3", 0.8)                  # a keypress after SIGWINCH forces the full repaint
+        check("resize back to landscape redraws", s.wait_for("6 People", 20), s.text()[:400])
+        check("no traceback after resize", "Traceback" not in s.log())
+    finally:
+        s.kill()
+
+
+def ai_failure_popup():
+    """0.16.0: when the AI CLI fails, the TUI offers to switch / keep / turn off."""
+    s = Session(FAKE_AI_FAIL="1")
+    try:
+        s.wait_for("6 People", 30)
+        s.key("3")
+        s.key("a", 0.6)
+        s.key("boom\r", 4.0)
+        txt = s.text()
+        check("AI failure is surfaced", "AI" in txt or "claude" in txt or "failed" in txt.lower(),
+              txt[:400])
+        check("no traceback from a failing AI CLI", "Traceback" not in s.log())
+    finally:
+        s.kill()
+
+
+def main():
+    home = testenv.make_home()
+    print(f"# temp HOME: {home}")
+    assert home != os.path.expanduser("~"), "refusing to run against the real HOME"
+    os.environ["FAKE_OPEN_LOG"] = os.path.join(home, "opened.txt")
+    s = Session(["--no-summary", "-t", "none"], home=home,
+                FAKE_OPEN_LOG=os.path.join(home, "opened.txt"))
+    try:
+        panels_and_navigation(s)
+        inbox_tabs(s)
+        popups_and_menus(s)
+        search_and_marks(s)
+        ai_flows(s)
+        hangul_ime(s)
+        mouse_and_border(s)
+        url_click(s)
+        live_state(s)
+        check("clean exit", s.quit())
+        log = s.log()
+        check("no traceback", "Traceback" not in log,
+              "\n".join(l for l in log.splitlines() if "Error" in l or "Traceback" in l)[:800])
+        check("no error line in tui.log", "[gitgraph] error" not in log.lower(),
+              "\n".join(l for l in log.splitlines() if "error" in l.lower())[:800])
+    finally:
+        s.kill()
+
+    portrait_and_theme()
+    ai_failure_popup()
+
+    print(f"\n{len(FAILS)} failure(s): " + ", ".join(FAILS) if FAILS else "\nall good")
+    return 1 if FAILS else 0
 
 
 if __name__ == "__main__":
