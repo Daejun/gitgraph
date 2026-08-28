@@ -127,7 +127,10 @@ def main():
     s.key("\x1b", 0.5)
     s.key("\x1bOQ", 0.8)                 # F2: tour
     check("tour popup", "tour 1/" in s.text())
-    s.key("\r", 0.5); s.key("\r", 0.5); s.key("\x1b", 0.5)
+    s.key("\r", 0.5); s.key("\r", 0.5)
+    s.key("\x1b[D", 0.5)
+    check("tour prev", "tour 2/" in s.text())
+    s.key("\x1b", 0.5)
     check("clean exit", s.quit())
     log = open(os.path.expanduser("~/.cache/gitgraph/tui.log")).read()
     check("no traceback", "Traceback" not in log)

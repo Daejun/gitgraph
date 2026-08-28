@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -3593,10 +3593,10 @@ class Tui:
                          "(gg_open, gg_mark). Register once: claude mcp add -s user gg -- gg mcp."),
     ]
 
-    def popup_step(self, title, lines, last=False):
-        """One tutorial step: Enter/Space/Right = next, Esc/q = stop. Returns True to continue."""
+    def popup_step(self, title, lines, first=False, last=False):
+        """One tutorial step. Returns "next", "prev" or "stop"."""
         c = self.curses
-        hint = "⏎ next   Esc stop the tour" if not last else "⏎ finish"
+        hint = ("  ".join(x for x in ["⏎/→ next" if not last else "⏎ finish", "←/p prev" if not first else "", "Esc stop"] if x))
         while True:
             y, x, hh, ww = self.popup_frame(title, len(lines) + 3, max(dw(l) for l in lines + [hint]) + 2)
             for i, l in enumerate(lines[:hh - 1]):
@@ -3605,24 +3605,34 @@ class Tui:
             self.scr.refresh()
             self.scr.timeout(-1)
             k = self.read_key()
-            if k in (10, 13, c.KEY_ENTER, ord(" "), c.KEY_RIGHT, ord("l")):
-                return True
+            if k in (10, 13, c.KEY_ENTER, ord(" "), c.KEY_RIGHT, ord("l"), ord("n"), ord("j")):
+                return "next"
+            if k in (c.KEY_LEFT, ord("h"), ord("p"), ord("k"), c.KEY_BACKSPACE, 127) and not first:
+                return "prev"
             if k in (27, ord("q")):
-                return False
-            if k == c.KEY_MOUSE and self.mouse_ev and self.mouse_ev[3] and (self.mouse_ev[0] & ~28) == 0:
-                return True
+                return "stop"
+            if k == c.KEY_MOUSE and self.mouse_ev and self.mouse_ev[3]:
+                b = self.mouse_ev[0] & ~28
+                if b == 0:
+                    return "next"
+                if b in (2, 128) and not first:
+                    return "prev"
 
     def tutorial(self):
         if self.item is None:
             r = next((r for r in self.panels["home"].rows if r.nid), None)
             if r:
                 self.set_item(r.nid)
-        for i, (panel, title, text) in enumerate(self.TOUR):
+        i = 0
+        while 0 <= i < len(self.TOUR):
+            panel, title, text = self.TOUR[i]
             if panel:
                 self.focus = panel
                 self.update_subject()
-            if not self.popup_step(f"tour {i + 1}/{len(self.TOUR)} — {title}", wrap(text, 72), last=i == len(self.TOUR) - 1):
+            r = self.popup_step(f"tour {i + 1}/{len(self.TOUR)} — {title}", wrap(text, 72), first=i == 0, last=i == len(self.TOUR) - 1)
+            if r == "stop":
                 break
+            i += 1 if r == "next" else -1
         CONFIG["tutorial_done"] = True
         save_config()
         self.msg = "tour finished — F2 shows it again, ? lists the keys"
@@ -3866,8 +3876,11 @@ class Tui:
         p = self.panels[key]
         ridx = p.top + (y - p.rect[0])
         if 0 <= y - p.rect[0] < p.rect[2] and ridx < len(p.rows) and p.rows[ridx].kind == "url":
-            url = p.rows[ridx].text.strip()
-            if url.startswith("http"):
+            text = p.rows[ridx].text
+            url = text.strip()
+            c0 = dw(text[:len(text) - len(text.lstrip())]) - p.hs      # column where the URL starts
+            on_url = c0 <= (x - p.rect[1]) < c0 + dw(url)
+            if url.startswith("http") and on_url:
                 try:
                     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     self.msg = f"opened {url}"
@@ -4581,7 +4594,13 @@ def mcp_serve():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
                                                           "capabilities": {"tools": {}},
-                                                          "serverInfo": {"name": "gg", "version": VERSION}}})
+                                                          "serverInfo": {"name": "gg", "version": VERSION},
+                                                          "instructions": (
+                                                              "gg is the user's GitHub issue/PR browser (tui). When the user refers to "
+                                                              "'what I am looking at', 'this issue/PR/comment', 'in gg', or asks what to work "
+                                                              "on next: call gg_state first, then gg_context for the full thread before "
+                                                              "answering. gg_todo lists their marks (next work). gg_open changes what gg "
+                                                              "shows; gg_mark adds a mark with a note — do these only when asked.")}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}})
         elif method == "tools/call":
