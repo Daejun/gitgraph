@@ -29,7 +29,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.12.1"
+VERSION = "0.13.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1632,7 +1632,7 @@ def comment_label(g, n, width, show_item=True):
         tag = "[inline] "
     pre = f"{g.label_num(g.nodes[n.parent])} " if show_item and n.parent in g.nodes else ""
     rel = rel_days(n, g)
-    rel = f"{rel} " if rel else ""
+    rel = f"{rel} {short_date(n.created)[5:]} " if rel else (f"{short_date(n.created)[5:]} " if n.created else "")
     if n.summary:
         s = f"{rel}{pre}o @{n.author} {tag}» {trunc(n.summary, width)}"
     elif n.summary_pending:
@@ -1841,7 +1841,7 @@ _PRE_TREE = re.compile(r"^[│ ]*[├└]─ ")
 _PRE_LOG = re.compile(r"^[|*o@ \\/_]+  ")
 _COMMENT_HEAD = re.compile(r"^(?:\S+ )?o @\S+(?: \[[^\]]*\])? ")
 _ITEM_HEAD = re.compile(r"^\S+ \[[^\]]*\](?:\[[^\]]*\])? ")
-_DATE_HEAD = re.compile(r"^(?:\d{4}-\d\d-\d\d|\+\d+d) ")
+_DATE_HEAD = re.compile(r"^(?:\d{4}-\d\d-\d\d|\+\d+d(?: \d\d-\d\d)?|\d\d-\d\d) ")
 
 
 def segments(row, g):
@@ -2446,10 +2446,12 @@ HELP = """gg tui — lazygit style layout
                   Item / Comments: read it in main      Links: go to that item      People: view as that person
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
   i               translate the main content (issue/PR body or comment) in full; press again for the original
+                  (also the [i 번역] button in Main's title bar)
   C               open Claude Code in a tmux pane (or full screen) that can see what gg shows: it uses the
                   `gg mcp` server (register once: claude mcp add -s user gg -- gg mcp) — tools gg_state, gg_context,
                   gg_todo, gg_show, gg_graph, gg_open, gg_mark
   m               mark the selected issue/PR or comment for my next work and write a note; marked rows show ✎,
+                  (on the answer tab: saves the answer text into the mark's note)
                   Home has a "todo" section, and ~/gitgraph-todo.md (gg config todo_file) is rewritten for the
                   next session (also `gg todo`). m again on a marked row: edit the note / mark done / remove
   Esc / b         back (previous item and perspective)     f  forward
@@ -2852,7 +2854,7 @@ class Tui:
             if src is not None and src.kind == "comment":
                 what = (("» " + trunc(src.summary, w)) if src.summary else
                         ("\"" + (trunc(src.tr_excerpt, w) if src.tr_excerpt else excerpt(src.body, w)) + "\""))
-                r.text += f"  ← @{src.author} {rel_days(src, g)} {what}"
+                r.text += f"  ← @{src.author} {rel_days(src, g)} {short_date(src.created)[5:]} {what}"
                 r.kind, r.jump = "mention", src.id
             return r
 
@@ -2903,7 +2905,7 @@ class Tui:
             if e.get("comment"):
                 text += f"  ← @{e['comment_author']} {e['comment_when']}"
             if e.get("note"):
-                text += f"  · {e['note']}"
+                text += f"  · {trunc(e['note'].splitlines()[0], w)}"
             r = Row(text, e["item"] if n else None, e.get("comment") if e.get("comment") in g.nodes else None,
                     "mention" if e.get("comment") in g.nodes else "")
             rows.append(r)
@@ -3526,7 +3528,8 @@ class Tui:
         return self.popup_prompt(label) or ""
 
     def mark(self):
-        """m: mark the selection for my next work, with a note; on a marked row: edit / done / remove."""
+        """m: mark the selection for my next work, with a note; on a marked row: edit / done / remove.
+        On the answer tab: save the answer text itself into the mark's note."""
         nid = self.subject or self.item
         n = self.g.nodes.get(nid) if nid else None
         if not n or n.kind not in ("item", "comment"):
@@ -3534,6 +3537,16 @@ class Tui:
             return
         label = self.g.label_num(n) if n.kind == "item" else f"comment by @{n.author} on {self.g.label_num(self.g.nodes[n.parent])}"
         e = self.marked(nid)
+        if self.focus == "main" and self.MAIN_TABS[self.panels["main"].tab] == "answer" and self.answer \
+                and "(waiting for the answer" not in self.answer:
+            if e is None:
+                e = todo_entry(self.g, nid, "")
+                self.todo.append(e)
+            e["note"] = (e.get("note", "") + "\n\n" if e.get("note") else "") + self.answer.strip()
+            path = save_todo(self.todo)
+            self.msg = f"answer saved into the mark for {label} → {path.replace(os.path.expanduser('~'), '~')}"
+            self.refresh_all()
+            return
         if e is None:
             note = self.popup_prompt(f"mark {label} — my note (Enter = none, Esc = cancel): ")
             if note is None:
@@ -3542,10 +3555,10 @@ class Tui:
             path = save_todo(self.todo)
             self.msg = f"marked {label} → {path.replace(os.path.expanduser('~'), '~')}"
         else:
-            choice = self.popup_menu(f"{label} is marked: {e.get('note') or '(no note)'}",
+            choice = self.popup_menu(f"{label} is marked: {trunc((e.get('note') or '(no note)').splitlines()[0], 60)}",
                                      [("edit the note", "edit"), ("mark done", "done"), ("remove the mark", "remove"), ("cancel", None)])
             if choice == "edit":
-                e["note"] = self.popup_prompt("note: ", e.get("note") or "")
+                e["note"] = self.popup_prompt("note: ", (e.get("note") or "").splitlines()[0] if e.get("note") else "")
             elif choice == "done":
                 e["done"] = True
             elif choice == "remove":
@@ -3846,7 +3859,12 @@ class Tui:
                 what = (self.g.label_num(sub) if sub and sub.kind == "item" else
                         (f"comment on {self.g.label_num(self.g.nodes[sub.parent])}" if sub and sub.kind == "comment" else
                          (self.subject or "")))
-                title += f"  · {what}"
+                title += f"  · {what}  "
+                btn = "[i 원문]" if self.show_tr else "[i 번역]"
+                if not TR_LANG.lower().startswith("korean"):
+                    btn = "[i original]" if self.show_tr else "[i translate]"
+                zones.append((dw(title), dw(title) + dw(btn), ("translate", 0)))
+                title += btn
         self.title_zones[key] = [(x - 1 + 2 + a, x - 1 + 2 + b, act) for a, b, act in zones]   # screen columns
         if hh == 0:                                  # collapsed to a title bar
             self.put(y, x, clip(f"{tl}{hz}{title}{hz}", 0, ww) + hz * max(0, ww - dw(title) - 3) + tr, attr)
@@ -4216,7 +4234,10 @@ class Tui:
             for x0, x1, act in self.title_zones.get(key, []):
                 if x0 <= x < x1:
                     self.focus = key
-                    self.switch_tab(key, act, relative=(key == "home"))
+                    if act[0] == "translate":
+                        self.translate_content()
+                    else:
+                        self.switch_tab(key, act, relative=(key == "home"))
                     return
             self.focus = key
             return
@@ -4680,7 +4701,9 @@ def render_todo_md(entries):
             if e.get("comment_url"):
                 lines.append(f"  - comment by @{e['comment_author']} {e['comment_when']}: {e['comment_text']} — {e['comment_url']}")
             if e.get("note"):
-                lines.append(f"  - note: {e['note']}")
+                note_lines = e["note"].splitlines()
+                lines.append(f"  - note: {note_lines[0]}")
+                lines.extend("    " + x for x in note_lines[1:])
         lines.append("")
     return "\n".join(lines)
 

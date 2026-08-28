@@ -72,7 +72,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 
 ```
 2026-08-13 #750 [PR] title  @author        # date = when the issue/PR was opened; [PR] blue, [I] green
-  +5d o @author » summary                  # comment: +N days after opening; » = one-line summary
+  +5d 08-18 o @author » summary            # comment: +N days after opening, and its date; » = one-line summary
 ```
 
 `[draft]` / `[merged]` / `[closed]` appear only when an item is not simply open. Every `@login` gets a colour of its own (256-colour palette, assigned in order of first appearance). Colours are on when stdout is a terminal (`--color`).
@@ -141,8 +141,8 @@ Layout: side column `side_width` (0.4) of the screen; titles are truncated to wh
 | `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | move · page · top/bottom · scroll sideways |
 | `K` `J` | scroll the main panel from anywhere |
 | Enter | see the table above |
-| `i` | translate the main content (issue/PR body or comment) in full into `lang`; again = original (cached in `translations_full.json`) |
-| `m` | mark the selected issue/PR or comment for my next work and write a note; marked rows show `✎`, Inbox gets a **todo** section (second tab, after my turn), and the markdown file `todo_file` (default `~/gitgraph-todo.md`; `gg todo` prints it) is rewritten so the next session — or Claude — can pick the work up. `m` again on a marked row: edit the note / mark done / remove. Source of truth: `~/.config/gitgraph/todo.json` |
+| `i` | translate the main content (issue/PR body or comment) in full into `lang`; again = original (cached in `translations_full.json`). Also the `[i 번역]` button in Main's title bar |
+| `m` | mark the selected issue/PR or comment for my next work and write a note; marked rows show `✎`, Inbox gets a **todo** section (second tab, after my turn), and the markdown file `todo_file` (default `~/gitgraph-todo.md`; `gg todo` prints it) is rewritten so the next session — or Claude — can pick the work up. `m` again on a marked row: edit the note / mark done / remove. On the answer tab `m` saves the answer text into the mark's note. Source of truth: `~/.config/gitgraph/todo.json` |
 | `y` | copy the URL of the selection to the clipboard |
 | `a` · `d` · `o` | ask claude about the selection (answer tab) · details pager · open in the browser (the URL is also the first, underlined line of the content) |
 | Esc / `b` · `f` | back (previous item and perspective) · forward |

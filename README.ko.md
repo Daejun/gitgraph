@@ -72,7 +72,7 @@ gg update                 # 설치 갱신
 
 ```
 2026-08-13 #750 [PR] 제목  @author           # 날짜 = issue/PR이 열린 날; [PR] 파랑, [I] 초록
-  +5d o @author » 요약                        # 코멘트: 열린 날 기준 +N일; » = 한 줄 요약
+  +5d 08-18 o @author » 요약                  # 코멘트: 열린 날 기준 +N일과 실제 날짜; » = 한 줄 요약
 ```
 
 open이 아닐 때만 `[draft]` / `[merged]` / `[closed]`가 붙는다. `@login`은 사람마다 고유 색(256색, 처음 등장 순서로 배정). 색은 stdout이 터미널일 때 켜진다(`--color`).
@@ -141,8 +141,8 @@ Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄�
 | `↑`/`k` `↓`/`j` · PgUp/PgDn `,` `.` · `g`/`G` `<`/`>` · `H`/`L` | 이동 · 페이지 · 처음/끝 · 가로 스크롤 |
 | `K` `J` | 어디서든 main panel 스크롤 |
 | Enter | 위 표 참조 |
-| `i` | main content(issue/PR 본문 또는 코멘트)를 `lang`으로 전문 번역; 다시 누르면 원문(`translations_full.json` 캐시) |
-| `m` | 선택한 issue/PR 또는 코멘트를 다음 작업으로 표시하고 메모를 적음; 표시된 행에 `✎`, Inbox의 **todo** 섹션(첫 탭; 시작은 여전히 my turn), 그리고 markdown 파일 `todo_file`(기본 `~/gitgraph-todo.md`; `gg todo`로 출력)이 다시 써져서 다음 세션이나 Claude가 그 문서를 보고 일을 이어갈 수 있음. 표시된 행에서 다시 `m`: 메모 수정 / 완료 / 삭제. 원본은 `~/.config/gitgraph/todo.json` |
+| `i` | main content(issue/PR 본문 또는 코멘트)를 `lang`으로 전문 번역; 다시 누르면 원문(`translations_full.json` 캐시). Main 제목줄의 `[i 번역]` 버튼도 같음 |
+| `m` | 선택한 issue/PR 또는 코멘트를 다음 작업으로 표시하고 메모를 적음; 표시된 행에 `✎`, Inbox의 **todo** 섹션(첫 탭; 시작은 여전히 my turn), 그리고 markdown 파일 `todo_file`(기본 `~/gitgraph-todo.md`; `gg todo`로 출력)이 다시 써져서 다음 세션이나 Claude가 그 문서를 보고 일을 이어갈 수 있음. 표시된 행에서 다시 `m`: 메모 수정 / 완료 / 삭제. answer 탭에서 `m`은 답 내용을 그 마킹의 메모로 저장. 원본은 `~/.config/gitgraph/todo.json` |
 | `y` | 선택 항목의 URL을 클립보드로 |
 | `a` · `d` · `o` | 선택에 대해 claude에게 질문(answer 탭) · 상세 pager · 브라우저로 열기(URL은 content 첫 줄에 밑줄로도 표시) |
 | Esc / `b` · `f` | 뒤로(이전 item·관점) · 앞으로 |
