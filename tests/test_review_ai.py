@@ -659,5 +659,117 @@ class TestIncremental(RunReviewCase):
         self.assertEqual(gg.review_chunks(rv, ["fs/f2fs/gc.c"]), [["fs/f2fs/gc.c"]])
         self.assertEqual(gg.review_chunks(rv, []), [])
 
+
+class TestReviewCommand(unittest.TestCase):
+    """review_cmd swaps gg's protocol for a domain skill — per repo, and claude only."""
+
+    def setUp(self):
+        self._old = (dict(gg.CONFIG), gg.ai_backend)
+        gg.ai_backend = lambda *a: "claude"
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        gg.CONFIG.clear()
+        gg.CONFIG.update(self._old[0])
+        gg.ai_backend = self._old[1]
+
+    def set(self, spec):
+        gg.CONFIG["review_cmd"] = spec
+
+    def test_empty_means_the_builtin_protocol(self):
+        self.assertEqual(gg.parse_review_cmd(""), ([], ""))
+        self.set("")
+        self.assertEqual(gg.review_cmd_for("any/repo"), "")
+
+    def test_a_bare_command_applies_everywhere(self):
+        self.set("/kreview")
+        self.assertEqual(gg.review_cmd_for("a/b"), "/kreview")
+        self.assertEqual(gg.review_cmd_for("ghe.example.com/c/d"), "/kreview")
+
+    def test_per_repo_rules_win_over_the_default(self):
+        self.set("torvalds/linux=/kreview, other/*=/review-pr, /code-review")
+        self.assertEqual(gg.review_cmd_for("torvalds/linux"), "/kreview")
+        self.assertEqual(gg.review_cmd_for("other/thing"), "/review-pr")
+        self.assertEqual(gg.review_cmd_for("someone/else"), "/code-review")
+
+    def test_an_enterprise_repo_matches_its_owner_name_too(self):
+        self.set("team/proj=/kreview")
+        self.assertEqual(gg.review_cmd_for("ghe.example.com/team/proj"), "/kreview")
+
+    def test_no_default_means_the_builtin_for_everything_unmatched(self):
+        self.set("torvalds/*=/kreview")
+        self.assertEqual(gg.review_cmd_for("torvalds/linux"), "/kreview")
+        self.assertEqual(gg.review_cmd_for("me/mine"), "")
+
+    def test_only_claude_has_slash_commands(self):
+        self.set("/kreview")
+        gg.ai_backend = lambda *a: "gemini"
+        self.assertEqual(gg.review_cmd_for("a/b"), "")
+
+    def test_the_prompt_hands_the_skill_the_range_and_still_appends_the_contract(self):
+        rv = review()
+        rv.merge_base, rv.head_oid = "base123", "head456"
+        p = gg.review_prompt(rv, ["fs/f2fs/data.c"], cmd="/kreview")
+        self.assertTrue(p.startswith("/kreview base123..head456"))
+        self.assertIn("GG_REVIEW>>>", p)
+        self.assertIn("b/fs/f2fs/data.c", p)
+        self.assertNotIn("STEP 2 — split the change up.", p)   # the skill brings its own method
+
+
+class TestReviewCommandRun(RunReviewCase):
+    def setUp(self):
+        super().setUp()
+        self._old_backend, self._old_cfg = gg.ai_backend, dict(gg.CONFIG)
+        gg.ai_backend = lambda *a: "claude"
+        gg.CONFIG["review_cmd"] = "/kreview"
+        self.addCleanup(self._restore_cmd)
+
+    def _restore_cmd(self):
+        gg.ai_backend = self._old_backend
+        gg.CONFIG.clear()
+        gg.CONFIG.update(self._old_cfg)
+
+    def test_the_command_is_used_and_recorded(self):
+        self.answer(block(GOOD), VERDICT % ("CONFIRMED", "r"))
+        rv = review()
+        gg.run_review(rv)
+        self.assertTrue(self.calls[0]["prompt"].startswith("/kreview "))
+        self.assertEqual(rv.engine, "claude:/kreview")
+
+    def test_a_borrowed_skill_may_write_its_report_inside_the_worktree(self):
+        self.answer(block(GOOD), VERDICT % ("CONFIRMED", "r"))
+        gg.run_review(review())
+        self.assertIn("Write", self.calls[0]["tools"])
+
+    def test_the_builtin_protocol_stays_read_only(self):
+        gg.CONFIG["review_cmd"] = ""
+        self.answer(block(GOOD), VERDICT % ("CONFIRMED", "r"))
+        gg.run_review(review())
+        self.assertNotIn("Write", self.calls[0]["tools"])
+
+    def test_a_skill_that_ignores_the_contract_falls_back_once(self):
+        self.answer("I wrote review-inline.txt, have a look.", block(GOOD), VERDICT % ("CONFIRMED", "r"))
+        rv = review()
+        gg.run_review(rv)
+        self.assertEqual([f.title for f in rv.findings], ["lock leak"])
+        self.assertIn("fell back from /kreview", rv.engine)
+        self.assertTrue(self.calls[0]["prompt"].startswith("/kreview "))
+        self.assertFalse(self.calls[1]["prompt"].startswith("/kreview "))
+
+    def test_when_both_fail_it_says_so_instead_of_reporting_nothing(self):
+        self.answer("no json anywhere")
+        rv = review()
+        gg.run_review(rv)
+        self.assertEqual(rv.status, "failed")
+        self.assertIn("/kreview did not answer in the agreed form", rv.error)
+
+    def test_the_check_pass_always_uses_gg_own_discipline(self):
+        self.answer(block(GOOD), VERDICT % ("FALSE", "no"))
+        gg.run_review(review())
+        verify = [c for c in self.calls if c["phase"] == "verify"]
+        self.assertTrue(verify)
+        self.assertFalse(verify[0]["prompt"].startswith("/kreview"))
+        self.assertIn("STEP 2 — argue as the author.", verify[0]["prompt"])
+
 if __name__ == "__main__":
     unittest.main()

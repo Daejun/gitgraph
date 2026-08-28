@@ -70,6 +70,7 @@ gg update                 # 설치 갱신
 | `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | 캐시를 채울 때(첫 실행·갱신) 동시에 도는 `gh` 쿼리 수. GitHub 왕복 한 번이 무엇을 묻든 ~0.4s라 첫 실행 속도를 좌우한다. open 항목이 수백 개인 repo에서는 12로 올리면 더 빨라진다 |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (아래 참조) |
 | `review_signature` | `GITGRAPH_REVIEW_SIGNATURE` | (빈 값) | 리뷰 모드: 게시하는 코멘트마다 붙일 꼬리말. 기본은 없음 — 사용자 자신의 계정으로 나가는 글이다 |
+| `review_cmd` | `GITGRAPH_REVIEW_CMD` | (빈 값) | 리뷰 모드: gg 자신의 프로토콜 대신 쓸 슬래시 커맨드(claude 전용). 값 하나면 전역, `repo-glob=cmd` 쌍을 콤마로 나열하면 저장소별, glob 없는 항목이 기본값 |
 | `review_verify` · `review_verify_model` | `GITGRAPH_REVIEW_VERIFY` · `GITGRAPH_REVIEW_VERIFY_MODEL` | `on` · `sonnet` | 리뷰 모드: 지적마다 반증을 시도하는 단계와 그 모델 |
 | `review_model` · `review_timeout` · `review_max_bytes` | `GITGRAPH_REVIEW_MODEL` · `GITGRAPH_REVIEW_TIMEOUT` · `GITGRAPH_REVIEW_MAX_BYTES` | `sonnet` · `900` · `400000` | 리뷰 모드: 리뷰를 돌릴 모델(claude 전용), 한 번의 호출 상한(초), 이보다 큰 diff는 파일 단위로 쪼개 병렬로 돈다 |
 | `review_files_width` · `review_findings_width` | `GITGRAPH_REVIEW_FILES_WIDTH` · `GITGRAPH_REVIEW_FINDINGS_WIDTH` | `0.22` · `0.30` | 리뷰 모드: Files·Findings 열의 폭 |
@@ -226,6 +227,8 @@ gg review 779 --refresh   # 이 head에 캐시된 것을 무시하고 다시 읽
 `R`이 리뷰를 돌린다. gg는 프롬프트가 아니라 절차를 안고 있다 — 커널 리뷰 프롬프트 모음에서 뽑아낸 규율이다. hunk를 판단하기 전에 그 hunk가 든 함수 전체를 읽고(worktree가 그래서 있다), diff를 CHANGE-N 단위로 — 루프 하나, 락 하나, 할당 하나, 바뀐 반환값 하나 — 쪼갠 뒤 하나씩 본다. 먼저 바뀐 코드가 설명이 말하는 용례로 실행되기는 하는지 따지고, 저자가 틀렸다고 가정한 뒤 옳다는 증거를 요구하며, `file:line -> file:line`으로 짚지 못하는 지적은 버린다. 응답은 고정 필드로만 받고, gg는 저장하기 전에 모든 지적을 diff가 실제로 건드린 줄에 못 박는다(GitHub은 그 밖의 줄을 거부한다). `review_max_bytes`를 넘는 diff는 파일 단위로 쪼개 병렬로 돈다.
 
 그다음 모든 지적을 **그것을 반증하려 드는 별도 호출**로 한 번 더 건다. 커널 프롬프트 모음은 같은 세션에서 스스로를 검토하라고 시키는데, 호출을 쪼개는 것이 핵심이다 — 새 문맥은 그 지적을 만들어 낸 추론에 끌려가지 않는다. 그 호출은 먼저 해당 줄의 코드를 열어 읽고(리뷰어는 줄 번호를 곧잘 지어낸다), 저자 편에서 반론을 세운 뒤(정말 잘못된 데이터가 도달하는 경로가 있나, 호출자가 이미 그 락을 쥐고 있지 않나, 소유권이 넘어가지 않았나, 주변 코드가 이미 그렇게 쓰여 있지 않나), 마지막에 코드로 스스로에게 답한다. 결과는 `✓` CONFIRMED, `?` PLAUSIBLE, 또는 기각이다. 기각된 것은 내용으로 기억되어 같은 PR을 나중에 다시 리뷰해도 되살아나지 않는다. `review_verify off`면 이 단계를 건너뛰고 전부 PLAUSIBLE로 남는다.
+
+`review_cmd`는 그 첫 단계를 사용자의 슬래시 커맨드로 갈아끼운다 — `/kreview`, sashiko의 `/review-pr`, `/code-review` 등을 전역으로, 또는 저장소별로(`torvalds/linux=/kreview, other/*=/review-pr, /code-review`). 그 커맨드에는 range(`<merge-base>..<head>`)와 diff가 넘어가고, gg의 출력 계약은 그대로 뒤에 붙는다 — 남의 스킬이 낸 지적도 같은 패널에 그려지고 같은 줄에 게시될 수 있는 이유다. `claude -p`는 사용자의 MCP 서버와 설정을 물려받으므로, 커널 트리에서 semcode를 기대하는 스킬은 그대로 semcode를 쓴다. 스킬은 답하기 전에 보고서를 파일로 쓰는 일이 많아서 `review_cmd` 실행은 버리는 worktree 안에 쓸 수 있게 해 뒀다. gg 자신의 프로토콜은 읽기 전용이다. 커맨드가 설치돼 있지 않거나 계약을 무시하면 gg가 자기 프로토콜로 한 번 다시 돌리고 그 사실을 알린다. 검증 단계는 위임하지 않는다 — 반증은 gg 자신의 규율이다.
 
 style·design 의견은 커널 프롬프트와 같은 규율을 받는다. PR당 최대 3건, 그리고 확정된 결함이 열려 있는 동안에는 통째로 감춘다(`review_subjective`).
 

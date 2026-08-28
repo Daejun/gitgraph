@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.26.0"
+VERSION = "0.27.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -59,6 +59,9 @@ CONFIG_KEYS = {
     "border": ("GITGRAPH_BORDER", "rounded", "tui: rounded | single | double | bold | hidden"),
     "worktree_keep_days": ("GITGRAPH_WORKTREE_KEEP_DAYS", "7", "review: drop a PR worktree unused for this many days"),
     "worktree_max": ("GITGRAPH_WORKTREE_MAX", "5", "review: how many PR worktrees to keep (oldest go first)"),
+    "review_cmd": ("GITGRAPH_REVIEW_CMD", "",
+                   "review: a slash command to review with instead of gg's own protocol (claude only), e.g. "
+                   "/kreview. Per repo: \"torvalds/linux=/kreview, other/*=/review-pr, /code-review\""),
     "review_model": ("GITGRAPH_REVIEW_MODEL", "sonnet", "review: model for the review pass (claude only)"),
     "review_timeout": ("GITGRAPH_REVIEW_TIMEOUT", "900", "review: seconds one AI review call may take"),
     "review_verify": ("GITGRAPH_REVIEW_VERIFY", "on",
@@ -2671,6 +2674,9 @@ REVIEW_MODEL = cfg("review_model")
 REVIEW_TIMEOUT = int(cfg("review_timeout") or 900)
 REVIEW_MAX_BYTES = int(cfg("review_max_bytes") or 400000)
 REVIEW_TOOLS = ("Read", "Grep", "Glob", "Bash(git *)")
+# A borrowed skill often writes its report to a file before answering (/kreview writes review-inline.txt),
+# so it gets to write — inside a throwaway 0700 worktree. gg's own protocol stays read-only.
+REVIEW_CMD_TOOLS = REVIEW_TOOLS + ("Write", "Edit")
 
 REVIEW_PROMPT = """You are reviewing one pull request. You are standing in a git worktree with its head
 checked out, so you can open any file in the tree — not only the lines in the diff.
@@ -2863,7 +2869,46 @@ def trunc_lines(text, n):
     return "\n".join(lines[:n]) + (f"\n… ({len(lines) - n} more lines)" if len(lines) > n else "")
 
 
-def review_prompt(rv, paths, body=""):
+def parse_review_cmd(spec):
+    """`review_cmd` -> ([(repo glob, command)], default command or "").
+
+    "" -> the built-in protocol everywhere. "/kreview" -> that command everywhere.
+    "torvalds/linux=/kreview, vivo-samsung/*=/kreview, /code-review" -> per repo, first match wins,
+    the entry with no glob is the default.
+    """
+    rules, default = [], ""
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        glob, sep, cmd = part.partition("=")
+        if sep:
+            rules.append((glob.strip(), cmd.strip()))
+        else:
+            default = default or part
+    return rules, default
+
+
+def review_cmd_for(repo):
+    """The slash command to review `repo` with, or "" for the built-in protocol. Only claude has
+    slash commands; every other backend gets the built-in one whatever the setting says."""
+    if ai_backend() != "claude":
+        return ""
+    import fnmatch
+    rules, default = parse_review_cmd(cfg("review_cmd"))
+    for glob, cmd in rules:
+        if repo == glob or fnmatch.fnmatch(repo, glob) or fnmatch.fnmatch(repo, "*/" + glob):
+            return cmd
+    return default
+
+
+def review_prompt(rv, paths, body="", cmd=""):
+    """The built-in protocol, or `cmd` handed the range and the diff. The contract is appended either
+    way — that is what keeps a borrowed skill's findings drawable in the same panel."""
+    if cmd:
+        return (f"{cmd} {rv.merge_base}..{(rv.head_oid or 'HEAD')}\n\n"
+                f"That range is this pull request, checked out in the worktree you are standing in.\n\n"
+                + pr_header(rv, paths, body) + "\n" + REVIEW_CONTRACT)
     std = ", ".join(standards_files(rv.worktree)) or "the surrounding code (no conventions file found)"
     return REVIEW_PROMPT.format(pr=pr_header(rv, paths, body), standards=std) + REVIEW_CONTRACT
 
@@ -2882,12 +2927,19 @@ def run_review(rv, body="", on_step=None, verify=None, plan=None):
         return rv
     chunks = review_chunks(rv, plan["redo"] if plan else None)
     rv.status, rv.error, rv.t0 = "running", None, time.time()
-    rv.engine, rv.model = f"builtin:{ai_backend()}", REVIEW_MODEL
+    cmd = review_cmd_for(rv.repo)
+    rv.engine, rv.model = (f"claude:{cmd}" if cmd else f"builtin:{ai_backend()}"), REVIEW_MODEL
+    fell_back = False
     carried = list(plan["carry"]) if plan else []
     changes = list(plan["changes"]) if plan else []
     findings, reach, errors = list(carried), (plan or {}).get("reachability"), []
 
     def one(paths):
+        return claude_call(review_prompt(rv, paths, body, cmd), REVIEW_MODEL, "review",
+                           timeout=REVIEW_TIMEOUT, cwd=rv.worktree,
+                           tools=REVIEW_CMD_TOOLS if cmd else REVIEW_TOOLS)
+
+    def one_builtin(paths):
         return claude_call(review_prompt(rv, paths, body), REVIEW_MODEL, "review",
                            timeout=REVIEW_TIMEOUT, cwd=rv.worktree, tools=REVIEW_TOOLS)
 
@@ -2906,8 +2958,22 @@ def run_review(rv, body="", on_step=None, verify=None, plan=None):
             try:
                 r, ch, fi = parse_review_reply(out)
             except ValueError as e:
-                errors.append(f"{', '.join(paths)}: {e}")
-                continue
+                if cmd:
+                    # the command may not be installed, or may simply have ignored the contract —
+                    # either way one retry with gg's own protocol is worth more than an empty review
+                    retry = _safe((one_builtin, paths))
+                    try:
+                        if isinstance(retry, Exception):
+                            raise ValueError(str(retry))
+                        r, ch, fi = parse_review_reply(retry)
+                        fell_back = True
+                    except ValueError as e2:
+                        errors.append(f"{', '.join(paths)}: {cmd} did not answer in the agreed form "
+                                      f"({e}), and the built-in protocol failed too ({e2})")
+                        continue
+                else:
+                    errors.append(f"{', '.join(paths)}: {e}")
+                    continue
             reach = reach or r
             changes += ch
             findings += fi
@@ -2916,6 +2982,8 @@ def run_review(rv, body="", on_step=None, verify=None, plan=None):
         return rv
     for i, c in enumerate(changes, 1):          # one numbering across chunks and carried-over parts
         c.cid = f"CHANGE-{i}"
+    if fell_back:
+        rv.engine = f"builtin:{ai_backend()} (fell back from {cmd})"
     rv.reachability, rv.changes = reach, changes
     rv.findings = dedupe_findings(findings)
     rv.status = "done"
@@ -4299,9 +4367,12 @@ def findings_rows(rv, tab, width, checked=frozenset()):
 
 def changes_rows(rv, width):
     """What the review broke the diff into before judging it (review-core.md TASK 1B)."""
-    if not rv.changes:
+    if not rv.changes and not rv.engine:
         return [Row("no change analysis yet", kind="head")]
     rows, seen = [], None
+    if rv.engine:
+        rows.append(Row(trunc(f"reviewed by {rv.engine}"
+                              + (f" {rv.model}" if rv.model else ""), width * 3), kind="head"))
     if rv.reachability:
         v = rv.reachability.get("verdict", "?")
         rows.append(Row(f"reachability: {v}", kind="head"))
