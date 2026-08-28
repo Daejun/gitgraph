@@ -55,6 +55,9 @@ Env vars read in "script" mode:
                           when FAKE_GH_TRANSIENT_N is set but this is not (so most tests need not pass it
                           explicitly, as long as each test uses its own fixture file).
 
+  FAKE_GH_HEAD_FILE      Path to a file holding the PR's head sha, re-read on every call, so a test can
+                          move the head the way a push would. Default: "aaaa…".
+
   FAKE_GH_LOG            Path to append one JSON line per invocation ({"argv", "env_token", "kind", ...})
                           — tests read it back to assert retry counts and which account was tried when.
 
@@ -135,6 +138,19 @@ def cmd_auth_token(args):
     return 0
 
 
+def _head_oid():
+    """The PR's head sha. FAKE_GH_HEAD_FILE lets a test move it the way a push would — without it the
+    metadata keeps reporting one head while git says another, and nothing that keys off the head (the
+    findings cache, an incremental re-review) can be exercised at all."""
+    path = os.environ.get("FAKE_GH_HEAD_FILE")
+    if path and os.path.exists(path):
+        with open(path) as f:
+            got = f.read().strip()
+        if got:
+            return got
+    return "a" * 40
+
+
 def _load_fixture():
     path = os.environ["FAKE_GH_FIXTURE"]
     with open(path, encoding="utf-8") as f:
@@ -194,7 +210,7 @@ def _graphql_response(query, variables, repo):
             return {"repository": {"pullRequest": None}}
         return {"repository": {"pullRequest": dict(
             node, id=f"PR_kwDO_{repo}_{num}", headRefName="topic-%s" % num, baseRefName="main",
-            headRefOid="a" * 40, baseRefOid="b" * 40,
+            headRefOid=_head_oid(), baseRefOid="b" * 40,
             headRepository={"nameWithOwner": repo},
             reviewThreads={"nodes": [
                 {"id": "RT_1", "isResolved": False, "isOutdated": False, "path": "src/extent.c",

@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.25.0"
+VERSION = "0.26.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2260,6 +2260,8 @@ class Review:
         self.model = kw.get("model")
         self.verify = kw.get("verify", False)
         self.status = kw.get("status", "idle")
+        self.stale_from = kw.get("stale_from")   # head this review was actually made at, if not ours
+        self.stale_files = kw.get("stale_files") or []
         self.error = kw.get("error")
         self.created = kw.get("created")
         self.t0 = kw.get("t0")
@@ -2417,8 +2419,13 @@ def review_worktree(repo, number, base_ref, head_oid=None):
     remote = clone_remote_for(clone, repo)
     head_ref, base_local = pr_ref(repo, number), pr_ref(repo, number, base=True)
     progress("review", 0, None, f"fetching #{number} from {remote}")
+    was = git_out(clone, "rev-parse", "--verify", "-q", head_ref, check=False).strip()
     git_out(clone, "fetch", "--no-tags", remote,
             f"+refs/pull/{number}/head:{head_ref}", f"+refs/heads/{base_ref}:{base_local}")
+    if was and was != git_out(clone, "rev-parse", head_ref).strip():
+        # keep the head we reviewed last time reachable: unreferenced, git is free to prune it, and
+        # then `git diff <old head> <new head>` — the whole basis of an incremental re-review — is gone
+        git_out(clone, "update-ref", pr_ref(repo, number) + "-prev", was, check=False)
     merge_base = git_out(clone, "merge-base", base_local, head_ref).strip()
     oid = git_out(clone, "rev-parse", head_ref).strip()
     wt = worktree_path(repo, number)
@@ -2546,11 +2553,16 @@ def save_review(rv):
     d = load_reviews(rv.repo)
     e = d.setdefault(str(rv.number), {})
     e.setdefault("reviews", {})
+    e["reviews"] = e["reviews"] or {}
     e.setdefault("posted", {})
     e.setdefault("ignored", {})
     e.setdefault("dropped", {})
     if rv.head_oid:
-        e["reviews"] = {rv.head_oid: rv.to_json()}     # only the current head's detail is worth keeping
+        keep = dict(e["reviews"])
+        keep[rv.head_oid] = rv.to_json()
+        # the current head plus the one before it: enough for an incremental re-review, bounded
+        e["reviews"] = dict(sorted(keep.items(), key=lambda kv: -(kv[1].get("created") or 0)
+                                   )[:REVIEW_HEADS_KEPT])
     for f in rv.findings:
         if f.state == "posted":
             e["posted"][f.digest] = {"head_oid": rv.head_oid, "at": f.posted_at or time.time(),
@@ -2631,6 +2643,14 @@ def review_load(repo, number, refresh=False, meta=None):
         rv.engine, rv.model = cached.get("engine"), cached.get("model")
         rv.verify, rv.created = cached.get("verify", False), cached.get("created")
         anchor_findings(rv)
+    elif not refresh:
+        plan = incremental_plan(rv)      # the head moved: keep the part the new commits did not touch
+        if plan:
+            rv.changes, rv.findings = plan["changes"], plan["carry"]
+            rv.reachability = plan["reachability"]
+            rv.stale_from, rv.stale_files = plan["prev_oid"], plan["redo"]
+            rv.engine = "carried"
+            anchor_findings(rv)
     apply_history(rv)
     return rv
 
@@ -2800,12 +2820,15 @@ def diff_text(rv, paths=None):
     return "\n".join(out)
 
 
-def review_chunks(rv):
+def review_chunks(rv, only=None):
     """[[path, …]] — one chunk when the diff is small, else file groups under REVIEW_MAX_BYTES."""
-    sizes = [(f.path, len(diff_text(rv, {f.path}))) for f in rv.files]
+    files = [f for f in rv.files if only is None or f.path in set(only)]
+    sizes = [(f.path, len(diff_text(rv, {f.path}))) for f in files]
     total = sum(s for _, s in sizes)
+    if not sizes:
+        return []
     if total <= REVIEW_MAX_BYTES or len(sizes) < 2:
-        return [[f.path for f in rv.files]]
+        return [[p for p, _ in sizes]]
     chunks, cur, cur_size = [], [], 0
     for path, size in sizes:
         if cur and cur_size + size > REVIEW_MAX_BYTES:
@@ -2845,19 +2868,24 @@ def review_prompt(rv, paths, body=""):
     return REVIEW_PROMPT.format(pr=pr_header(rv, paths, body), standards=std) + REVIEW_CONTRACT
 
 
-def run_review(rv, body="", on_step=None, verify=None):
+def run_review(rv, body="", on_step=None, verify=None, plan=None):
     """Pass 1: categorise, gate on reachability, look for defects; then pass 2 checks each finding in a
-    call of its own unless it is turned off. Fills rv in place."""
+    call of its own unless it is turned off. Fills rv in place.
+
+    `plan` (from incremental_plan) restricts pass 1 to the files new commits touched and carries the
+    rest of the previous review forward with its verdicts intact."""
     if not rv.files:
         rv.status, rv.error = "failed", "nothing to review: the diff is empty"
         return rv
     if not ai_available():
         rv.status, rv.error = "failed", f"{CLAUDE_BIN} is not installed (gg ai picks another)"
         return rv
-    chunks = review_chunks(rv)
+    chunks = review_chunks(rv, plan["redo"] if plan else None)
     rv.status, rv.error, rv.t0 = "running", None, time.time()
     rv.engine, rv.model = f"builtin:{ai_backend()}", REVIEW_MODEL
-    changes, findings, reach, errors = [], [], None, []
+    carried = list(plan["carry"]) if plan else []
+    changes = list(plan["changes"]) if plan else []
+    findings, reach, errors = list(carried), (plan or {}).get("reachability"), []
 
     def one(paths):
         return claude_call(review_prompt(rv, paths, body), REVIEW_MODEL, "review",
@@ -2886,7 +2914,7 @@ def run_review(rv, body="", on_step=None, verify=None):
     if errors and not findings:
         rv.status, rv.error = "failed", "; ".join(errors)[:500]
         return rv
-    for i, c in enumerate(changes, 1):          # one numbering across chunks
+    for i, c in enumerate(changes, 1):          # one numbering across chunks and carried-over parts
         c.cid = f"CHANGE-{i}"
     rv.reachability, rv.changes = reach, changes
     rv.findings = dedupe_findings(findings)
@@ -2896,7 +2924,7 @@ def run_review(rv, body="", on_step=None, verify=None):
     apply_history(rv)
     save_review(rv)
     if REVIEW_VERIFY if verify is None else verify:
-        run_verify(rv, on_step=on_step)
+        run_verify(rv, on_step=on_step)         # a carried finding already has its verdict and is skipped
     else:
         cap_subjective(rv)
         save_review(rv)
@@ -3070,6 +3098,62 @@ def cap_subjective(rv):
 
 
 
+
+# ---------------------------------------------------------------- re-reviewing after new commits
+# A push does not invalidate a review, only the part of it that the new commits touched. Keeping the
+# previous head's findings and re-reading just the files that moved is the difference between a
+# 7-minute review per push and a 7-minute review once.
+REVIEW_HEADS_KEPT = 2
+
+
+def previous_head(repo, number, head_oid):
+    """(oid, stored review) of the last review of this PR at another head, or (None, None)."""
+    reviews = ((load_reviews(repo).get(str(number)) or {}).get("reviews") or {})
+    best = None
+    for oid, r in reviews.items():
+        if oid == head_oid or not r.get("findings") and not r.get("changes"):
+            continue
+        if best is None or (r.get("created") or 0) > (reviews[best].get("created") or 0):
+            best = oid
+    return (best, reviews[best]) if best else (None, None)
+
+
+def head_moved_files(clone, prev_oid, head_ref):
+    """Paths the new commits touched, or None when the old head is no longer readable."""
+    out = git_out(clone, "diff", "--name-only", prev_oid, head_ref, check=False)
+    if not out.strip():
+        r = subprocess.run(["git", "-C", clone, "cat-file", "-e", prev_oid + "^{commit}"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            return None                  # the previous head was pruned: nothing to compare against
+    return {p for p in out.splitlines() if p.strip()}
+
+
+def incremental_plan(rv):
+    """What a re-review after new commits actually has to look at.
+
+    Returns None when there is nothing to carry (no earlier review, a rebase, or the old head is gone)
+    — the caller then reviews everything, which is always correct, only slower.
+    """
+    prev_oid, prev = previous_head(rv.repo, rv.number, rv.head_oid)
+    if not prev_oid or not rv.clone:
+        return None
+    if prev.get("merge_base") != rv.merge_base:
+        return None                      # rebased: every line number moved, start again
+    moved = head_moved_files(rv.clone, prev_oid, pr_ref(rv.repo, rv.number))
+    if moved is None:
+        return None
+    here = {f.path for f in rv.files}
+    redo = sorted(moved & here)
+    carry = [Finding.from_json(d) for d in (prev.get("findings") or [])
+             if d.get("path") in here and d.get("path") not in moved]
+    if not carry:
+        return None                      # nothing survives, so this is just a full review
+    changes = [Change.from_json(c) for c in (prev.get("changes") or [])
+               if c.get("path") in here and c.get("path") not in moved]
+    return {"prev_oid": prev_oid, "redo": redo, "carry": carry, "changes": changes,
+            "reachability": prev.get("reachability") if not redo else None}
+
 # ---------------------------------------------------------------- posting
 # One addPullRequestReview with every chosen finding as an inline thread: a single review, a single
 # notification, and no REST plumbing. GitHub takes a comment only on a line the diff touches, which is
@@ -3219,10 +3303,15 @@ def do_review(target, repos, refresh=False, as_json=False, no_ai=False, verify=T
              "review": (repo, number)})
         return 0
     rv = review_load(repo, number, refresh=refresh)
-    if not no_ai and not rv.error and not rv.findings and not rv.engine and ai_available():
+    never_reviewed = not rv.findings and not rv.engine
+    if not no_ai and not rv.error and ai_available() and (never_reviewed or rv.stale_from):
+        plan = incremental_plan(rv)
         log(f"reviewing {repo}#{number} with {CLAUDE_BIN} {REVIEW_MODEL} "
-            f"({len(rv.files)} files, {len(review_chunks(rv))} call(s))…")
-        run_review(rv, rv.body, verify=verify)
+            + (f"({len(plan['redo'])} of {len(rv.files)} files changed since {plan['prev_oid'][:7]}, "
+               f"{len(plan['carry'])} finding(s) kept, " if plan else f"({len(rv.files)} files, ")
+            + f"{len(review_chunks(rv, plan['redo'] if plan else None))} call(s))…")
+        rv.stale_from, rv.stale_files = None, []
+        run_review(rv, rv.body, verify=verify, plan=plan)
         if USAGE["calls"]:
             log(usage_line())          # do_review returns before main()'s own usage line
     if as_json:
@@ -4091,6 +4180,9 @@ def review_files_rows(rv, width, sel=None):
         head.append(f"⋯ {rv.status}")
     elif rv.error:
         head.append(rv.error)
+    elif rv.stale_from:
+        head.append(f"reviewed at {rv.stale_from[:7]} · {len(rv.stale_files)} file"
+                    f"{'s' if len(rv.stale_files) != 1 else ''} changed since — R")
     rows = [Row(trunc(t, width), kind="head") for t in head]
     rows.append(Row(""))
     worst = {}
@@ -4862,13 +4954,21 @@ class Tui:
         if not ai_available():
             self.msg = f"{CLAUDE_BIN} is not installed — gg ai picks another AI CLI"
             return
-        n = len(review_chunks(rv))
-        if not self.confirm(f"Review {rv.repo}#{rv.number} with {CLAUDE_BIN} {REVIEW_MODEL}? "
-                            f"({len(rv.files)} files, {n} call{'s' if n != 1 else ''})"):
+        plan = incremental_plan(rv)
+        n = len(review_chunks(rv, plan["redo"] if plan else None))
+        # the numbers that decide this belong on the choices: a popup title is clipped at the border
+        what = (f"{len(plan['redo'])} of {len(rv.files)} files changed since {plan['prev_oid'][:7]}, "
+                f"{len(plan['carry'])} finding(s) kept"
+                if plan else f"all {len(rv.files)} file{'s' if len(rv.files) != 1 else ''}")
+        if self.popup_menu(
+                f"Review {rv.repo}#{rv.number}? {n} call{'s' if n != 1 else ''} to "
+                f"{os.path.basename(CLAUDE_BIN)} {REVIEW_MODEL}",
+                [(f"yes — {what}", True), ("no", False)], cur=1) is not True:
             return
         rv.status, rv.error, self._told_review = "running", None, False
+        rv.stale_from, rv.stale_files = None, []
         self.refresh_review(keep=False)
-        self.run_bg(lambda: run_review(rv, rv.body), "review")
+        self.run_bg(lambda: run_review(rv, rv.body, plan=plan), "review")
 
     def review_finding(self):
         r = self.panels["rfind"].current()

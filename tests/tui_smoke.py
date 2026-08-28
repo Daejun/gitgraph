@@ -720,12 +720,18 @@ def fake_clone(home):
         return r.stdout.strip()
 
     subprocess.run(["git", "init", "-q", "-b", "main", work], check=True, capture_output=True, env=env)
-    for text in ("static int f2fs_write_page(void)\n{\n\treturn 0;\n}\n",
-                 "static int f2fs_write_page(void)\n{\n\tspin_lock(&lock);\n\treturn -ENOMEM;\n}\n"):
-        with open(os.path.join(work, "data.c"), "w") as fh:
-            fh.write(text)
+
+    def commit(files, msg):
+        for name, text in files.items():
+            with open(os.path.join(work, name), "w") as fh:
+                fh.write(text)
         git(work, "add", "-A")
-        git(work, "commit", "-qm", "change")
+        git(work, "commit", "-qm", msg)
+
+    commit({"data.c": "static int f2fs_write_page(void)\n{\n\treturn 0;\n}\n",
+            "gc.c": "static void gc_thread(void)\n{\n}\n"}, "base")
+    commit({"data.c": "static int f2fs_write_page(void)\n{\n\tspin_lock(&lock);\n\treturn -ENOMEM;\n}\n",
+            "gc.c": "static void gc_thread(void)\n{\n\twait_event(q, done);\n}\n"}, "the PR")
     base, head = git(work, "rev-parse", "HEAD~1"), git(work, "rev-parse", "HEAD")
     subprocess.run(["git", "clone", "-q", "--bare", work, origin], check=True, capture_output=True, env=env)
     git(origin, "update-ref", "refs/heads/main", base)
@@ -733,16 +739,31 @@ def fake_clone(home):
     subprocess.run(["git", "clone", "-q", origin, clone], check=True, capture_output=True, env=env)
     git(clone, "remote", "set-url", "origin", "https://github.com/test/repo.git")
     git(clone, "config", f"url.{origin}.insteadOf", "https://github.com/test/repo.git")
-    return root
+
+    head_file = os.path.join(home, "pr5-head.txt")
+    with open(head_file, "w") as fh:
+        fh.write(head)
+
+    def advance():
+        """A new commit on the PR touching gc.c only — data.c's findings should survive it. The head
+        file moves with it, so the fake gh reports the new sha the way GitHub would."""
+        commit({"gc.c": "static void gc_thread(void)\n{\n\twait_event_timeout(q, done, HZ);\n}\n"},
+               "address review")
+        git(origin, "fetch", "-q", work, "HEAD:refs/pull/5/head", "--force")
+        with open(head_file, "w") as fh:
+            fh.write(git(work, "rev-parse", "HEAD"))
+
+    return root, advance, head_file
 
 
 def review_with_a_clone():
     """0.23.0: with a checkout present, v builds a worktree and draws the real diff, and R runs the
     review through the (fake) AI CLI and anchors its findings onto changed lines."""
     home = testenv.make_home()
-    root = fake_clone(home)
+    root, advance, head_file = fake_clone(home)
     gh_log = os.path.join(home, "gh-calls.log")
-    s = Session(["--no-summary", "-t", "none", "5"], home=home, cwd=root, FAKE_GH_LOG=gh_log)
+    s = Session(["--no-summary", "-t", "none", "5"], home=home, cwd=root, FAKE_GH_LOG=gh_log,
+                FAKE_GH_HEAD_FILE=head_file)
     try:
         s.wait_for("6 People", 30)
         s.settle()
@@ -753,11 +774,12 @@ def review_with_a_clone():
         check("the removed and added lines are both there",
               "- \treturn 0;" in txt.replace("\t", "\t") or "return 0;" in txt, txt[:700])
         st = (s.cache("state.json") or {}).get("review") or {}
-        check("state.json lists the changed file", st.get("files") == ["data.c"], str(st)[:300])
+        check("state.json lists the changed files", st.get("files") == ["data.c", "gc.c"], str(st)[:300])
         check("no review has been run on its own", "no review yet" in txt, txt[:700])
 
         s.key("R", 1.0)                       # confirm popup: it costs money, so it always asks
-        check("R asks before spending anything", "Review test/repo#5" in s.text(), s.text()[:500])
+        check("R asks before spending anything, and says how much",
+              "Review test/repo#5?" in s.text() and "yes — all 2 files" in s.text(), s.text()[:600])
         s.key("k", 0.4)                       # the popup starts on "no": spending is never one keypress
         s.key("\r", 12.0)
         s.settle()
@@ -782,11 +804,25 @@ def review_with_a_clone():
         check("P shows what would be posted", "about to post to test/repo#5" in txt
               and "fake finding" in txt, txt[:900])
         s.key("\x1b", 0.6)
-        check("then it asks", "Post 1 comment(s)" in s.text(), s.text()[:400])
+        check("then it asks", "comment(s) to test/repo#5" in s.text(), s.text()[:400])
         s.key("\r", 1.2)                      # the popup starts on "no"
         check("no means nothing was sent", "not posted" in s.text(), s.text()[:300])
         calls = open(gh_log).read() if os.path.exists(gh_log) else ""
         check("saying no sends nothing at all", "addPullRequestReview" not in calls, calls[-400:])
+
+        advance()                             # the author pushes a commit touching gc.c only
+        s.key("r", 20.0)
+        s.settle()
+        txt = s.text()
+        check("a moved head is reported, not silently re-reviewed",
+              "reviewed at" in txt and "1 fil" in txt, txt[:700])
+        check("the finding on the untouched file survived the push",
+              "fake finding 1 in data.c" in txt, txt[:900])
+        s.key("R", 1.5)
+        check("R offers to redo only what moved",
+              "1 of 2 files changed since" in s.text() and "1 finding(s) kept" in s.text(),
+              s.text()[:700])
+        s.key("\x1b", 0.8)                     # not now
 
         s.key("x", 1.0)                       # ignore it
         check("x ignores a finding", "ignored" in s.text(), s.text()[:300])

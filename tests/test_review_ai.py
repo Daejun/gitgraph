@@ -569,5 +569,95 @@ class TestPosting(RunReviewCase):
         self.assertIn("pull request id", err)
         self.assertEqual(self.sent, [])
 
+
+class TestIncremental(RunReviewCase):
+    """A push invalidates the part of a review the new commits touched, not the whole of it."""
+
+    def stored(self, head, files=("fs/f2fs/data.c", "fs/f2fs/gc.c"), merge_base="mb", created=1):
+        rv = review()
+        rv.head_oid, rv.merge_base, rv.created = head, merge_base, created
+        rv.changes = [gg.Change(f"CHANGE-{i}", "locking", p, "fn", "s") for i, p in enumerate(files, 1)]
+        rv.findings = [gg.Finding(severity="bug", path=p, line=221 if "data" in p else 88,
+                                  side="RIGHT", title=f"finding in {p}", verdict="CONFIRMED",
+                                  verdict_reason="checked") for p in files]
+        rv.reachability = {"verdict": "confirmed", "reason": "r"}
+        gg.save_review(rv)
+        return rv
+
+    def now(self, head="new", merge_base="mb", moved="fs/f2fs/gc.c", prev_alive=True):
+        rv = review()
+        rv.head_oid, rv.merge_base, rv.clone = head, merge_base, "/nonexistent-clone"
+        self._old_moved = gg.head_moved_files
+        gg.head_moved_files = lambda clone, prev, ref: ({moved} if moved else set()) if prev_alive else None
+        self.addCleanup(lambda: setattr(gg, "head_moved_files", self._old_moved))
+        return rv
+
+    def test_only_the_files_the_new_commits_touched_are_redone(self):
+        self.stored("old")
+        rv = self.now()
+        plan = gg.incremental_plan(rv)
+        self.assertEqual(plan["prev_oid"], "old")
+        self.assertEqual(plan["redo"], ["fs/f2fs/gc.c"])
+        self.assertEqual([f.path for f in plan["carry"]], ["fs/f2fs/data.c"])
+        self.assertEqual([c.path for c in plan["changes"]], ["fs/f2fs/data.c"])
+
+    def test_a_carried_finding_keeps_its_verdict(self):
+        self.stored("old")
+        plan = gg.incremental_plan(self.now())
+        self.assertEqual(plan["carry"][0].verdict, "CONFIRMED")
+        self.assertEqual(plan["carry"][0].verdict_reason, "checked")
+
+    def test_a_rebase_starts_again(self):
+        self.stored("old", merge_base="mb")
+        self.assertIsNone(gg.incremental_plan(self.now(merge_base="a different base")))
+
+    def test_a_pruned_previous_head_starts_again(self):
+        self.stored("old")
+        self.assertIsNone(gg.incremental_plan(self.now(prev_alive=False)))
+
+    def test_no_earlier_review_means_no_plan(self):
+        self.assertIsNone(gg.incremental_plan(self.now()))
+
+    def test_when_every_file_moved_there_is_nothing_to_carry(self):
+        self.stored("old")
+        rv = self.now()
+        gg.head_moved_files = lambda clone, prev, ref: {"fs/f2fs/data.c", "fs/f2fs/gc.c"}
+        self.assertIsNone(gg.incremental_plan(rv))
+
+    def test_two_heads_are_kept_and_no_more(self):
+        for i, head in enumerate(("h1", "h2", "h3"), 1):
+            self.stored(head, created=i)
+        stored = (gg.load_reviews("test/repo")["12"]["reviews"])
+        self.assertEqual(sorted(stored), ["h2", "h3"])
+
+    def test_the_review_only_calls_the_cli_for_the_changed_files(self):
+        self.stored("old")
+        rv = self.now()
+        rv.merge_base = "mb"
+        plan = gg.incremental_plan(rv)
+        self.answer(block('{"findings": [{"severity": "bug", "path": "fs/f2fs/gc.c", "line": 88,'
+                          ' "side": "RIGHT", "title": "new one", "evidence": "e"}]}'),
+                    VERDICT % ("CONFIRMED", "r"))
+        gg.run_review(rv, plan=plan)
+        self.assertEqual(len(self.calls), 2)          # one review call, one check of the new finding
+        self.assertIn("b/fs/f2fs/gc.c", self.calls[0]["prompt"])
+        self.assertNotIn("b/fs/f2fs/data.c", self.calls[0]["prompt"])
+        titles = sorted(f.title for f in rv.findings)
+        self.assertEqual(titles, ["finding in fs/f2fs/data.c", "new one"])
+
+    def test_a_carried_finding_is_not_checked_again(self):
+        self.stored("old")
+        rv = self.now()
+        plan = gg.incremental_plan(rv)
+        self.answer(block('{"findings": []}'))
+        gg.run_review(rv, plan=plan)
+        self.assertEqual(len(self.calls), 1)          # nothing new to check
+        self.assertEqual(rv.findings[0].verdict, "CONFIRMED")
+
+    def test_chunks_can_be_narrowed_to_a_subset(self):
+        rv = review()
+        self.assertEqual(gg.review_chunks(rv, ["fs/f2fs/gc.c"]), [["fs/f2fs/gc.c"]])
+        self.assertEqual(gg.review_chunks(rv, []), [])
+
 if __name__ == "__main__":
     unittest.main()

@@ -502,6 +502,27 @@ class TestWorktree(ReviewTempCase):
         self.assertIn("no local clone of other/nowhere", str(cm.exception))
 
 
+class TestHygiene(ReviewTempCase):
+    """cache_hygiene() runs at every start-up and deletes things; a worktree is a directory tree of a
+    private repo, so what it does to one is pinned here rather than left to the generic file loop."""
+
+    def test_it_drops_a_stale_worktree_and_leaves_a_fresh_one(self):
+        fresh = os.path.join(gg.worktrees_dir(), "test__repo", "pr-1")
+        stale = os.path.join(gg.worktrees_dir(), "test__repo", "pr-2")
+        for d in (fresh, stale):
+            os.makedirs(d)
+        t = time.time() - (gg.WORKTREE_KEEP_DAYS + 1) * 86400
+        os.utime(stale, (t, t))
+        gg.cache_hygiene()
+        self.assertTrue(os.path.isdir(fresh))
+        self.assertFalse(os.path.isdir(stale))
+
+    def test_it_does_not_try_to_chmod_a_directory_as_a_file(self):
+        os.makedirs(os.path.join(gg.worktrees_dir(), "test__repo", "pr-1"))
+        gg.cache_hygiene()                                   # would raise before directories were skipped
+        self.assertEqual(oct(os.stat(gg.CACHE_DIR).st_mode)[-3:], "700")
+
+
 class TestCloneRemote(ReviewTempCase):
     def test_the_remote_pointing_at_the_repo_wins_over_origin(self):
         clone = os.path.join(self.tmp, "fork")
