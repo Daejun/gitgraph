@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.19.2"
+VERSION = "0.20.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -702,11 +702,11 @@ def list_open(repo):
     return out
 
 
-def fetch_items(repo, is_pr, numbers, note="changed items", spread=False):
-    return fetch_groups(repo, [(is_pr, numbers)], note, spread)
+def fetch_items(repo, is_pr, numbers, note="changed items", spread=False, on_batch=None):
+    return fetch_groups(repo, [(is_pr, numbers)], note, spread, on_batch)
 
 
-def fetch_groups(repo, groups, note="items", spread=False):
+def fetch_groups(repo, groups, note="items", spread=False, on_batch=None):
     """Full records (bodies, comments, cross references) of the given issue or PR numbers: one query per
     batch of numbers, FETCH_PARALLEL queries in flight (each batch is an independent query, so this is
     where a cold start gets its speed — pagination cannot be parallelised, batches can).
@@ -734,6 +734,8 @@ def fetch_groups(repo, groups, note="items", spread=False):
         out = [_norm_item(repo, rep_[f"n{n}"], is_pr) for n in batch if rep_.get(f"n{n}")]
         done[0] += len(batch)
         progress("fetch", done[0], total, f"{repo}: {note}")
+        if on_batch:
+            on_batch(out)      # from a worker thread: the caller may draw what has arrived
         return out
 
     if len(batches) <= 1 or FETCH_PARALLEL <= 1:
@@ -742,7 +744,7 @@ def fetch_groups(repo, groups, note="items", spread=False):
         return [it for part in pool.map(fetch, batches) for it in part]   # in order; raises on failure
 
 
-def refresh_items(repo, cached):
+def refresh_items(repo, cached, on_batch=None):
     """Incremental update of the open items of a repo: only items whose updatedAt moved (or new ones) are fetched
     again; items that are no longer open are dropped. Returns (items, n_changed, n_dropped)."""
     listing = list_open(repo)
@@ -755,14 +757,14 @@ def refresh_items(repo, cached):
     for is_pr in (False, True):
         nums = sorted(n for p, n in changed if p == is_pr)
         if nums:
-            for it in fetch_items(repo, is_pr, nums):
+            for it in fetch_items(repo, is_pr, nums, on_batch=on_batch):
                 fresh[(it["is_pr"], it["number"])] = it
     items = [fresh.get(k) or by_key[k] for k in listing if k in fresh or k in by_key]
     items.sort(key=lambda it: it["created"], reverse=True)
     return items, len(changed), len(dropped)
 
 
-def fetch_repo(repo, state):
+def fetch_repo(repo, state, on_batch=None):
     """Every issue/PR of a repo, for a cold cache. For the usual state="open" this lists the open
     numbers first (one cheap query per 100) and then pulls the records in parallel batches; a full
     `--state all` build still pages through the heavy connection query."""
@@ -770,7 +772,7 @@ def fetch_repo(repo, state):
         listing = list_open(repo)
         groups = [(is_pr, sorted((n for p, n in listing if p == is_pr), reverse=True))
                   for is_pr in (False, True)]
-        items = fetch_groups(repo, [g for g in groups if g[1]], "items", spread=True)
+        items = fetch_groups(repo, [g for g in groups if g[1]], "items", spread=True, on_batch=on_batch)
         items.sort(key=lambda it: it["created"], reverse=True)
         if not items:
             log(f"{repo}: no open issues or PRs came back — run `gg check -r {repo}` to see why")
@@ -804,7 +806,7 @@ def _cache_path(kind, repo, state=""):
     return os.path.join(CACHE_DIR, f"{kind}__{repo.replace('/', '__')}{'__' + state if state else ''}.json")
 
 
-def load_items(repo, state, max_age_min, refresh=False):
+def load_items(repo, state, max_age_min, refresh=False, on_batch=None):
     """Cached items of a repo. Within max_age they are used as they are; after that (state=open) only what changed on
     GitHub is fetched again; --refresh forces a full fetch."""
     p = _cache_path("items", repo, state)
@@ -817,14 +819,14 @@ def load_items(repo, state, max_age_min, refresh=False):
         cached = d["items"]
     if cached is not None and state == "open":
         try:
-            items, _, _ = refresh_items(repo, cached)
+            items, _, _ = refresh_items(repo, cached, on_batch=on_batch)
             with open(p, "w") as f:
                 json.dump({"fetched_at": time.time(), "repo": repo, "state": state, "items": items}, f)
             secure(p)
             return items, time.time()
         except GhError as e:
             log(f"{repo}: incremental refresh failed ({e}); fetching everything")
-    items = fetch_repo(repo, state)
+    items = fetch_repo(repo, state, on_batch=on_batch)
     with open(p, "w") as f:
         json.dump({"fetched_at": time.time(), "repo": repo, "state": state, "items": items}, f)
     secure(p)
@@ -1679,15 +1681,25 @@ class Graph:
         return f"{n.repo.split('/')[-1]}#{n.number}"
 
 
-def build_graph(repos, state, max_age_min, refresh=False):
-    g = Graph(repos[0])
+def build_graph(repos, state, max_age_min, refresh=False, on_batch=None):
+    """Fetch (or read from the cache) every repo and assemble the graph. `on_batch(items)` is called
+    from the fetch threads as each batch of items lands, so a caller can draw what is there already."""
     fetched_at = None
     all_items = []
     for repo in repos:
-        items, fa = load_items(repo, state, max_age_min, refresh)
+        items, fa = load_items(repo, state, max_age_min, refresh, on_batch=on_batch)
         fetched_at = min(fetched_at, fa) if fetched_at else fa
         all_items.extend(items)
+    g = assemble_graph(repos[0], all_items, max_age_min)
+    g.fetched_at = fetched_at
+    return g
 
+
+def assemble_graph(primary_repo, all_items, max_age_min=None, resolve=True):
+    """Items -> Graph: parse references and mentions, add the timeline cross references, and (unless
+    `resolve` is off — a partly fetched repo has nothing to look up yet) fill in the referenced items
+    that were not fetched. Pure except for the stub lookups, so it can run on a partial item list."""
+    g = Graph(primary_repo)
     for it in all_items:
         nid = g.item_id(it["repo"], it["number"])
         g.nodes[nid] = Node("item", nid, repo=it["repo"], number=it["number"], is_pr=it["is_pr"],
@@ -1733,7 +1745,7 @@ def build_graph(repos, state, max_age_min, refresh=False):
                 g.add_edge(s.id, iid, "ref")
     # resolve stubs
     by_repo = defaultdict(list)
-    for n in g.nodes.values():
+    for n in g.nodes.values() if resolve else ():
         if n.kind == "item" and n.stub and (n.title is None or n.state is None):
             by_repo[n.repo].append(n.number)
     if by_repo:      # one query per referenced repo, all at once (they are independent)
@@ -1752,7 +1764,6 @@ def build_graph(repos, state, max_age_min, refresh=False):
             n.draft, n.created, n.author = v["draft"], v["created"], v["author"]
             n.body = v.get("body") or n.body
     g.finalize()
-    g.fetched_at = fetched_at
     return g
 
 
@@ -3005,19 +3016,42 @@ class Tui:
         scr.refresh()
 
     def load(self, refresh):
-        self.g, self.enriched = None, set()
+        """Fill the screen as soon as there is something to show: on a cold cache the items arrive in
+        batches, so the first batch is drawn as a graph of its own (references to what has not arrived
+        yet stay unresolved) and the complete graph is swapped in by the main loop when the fetch ends.
+        A warm cache skips all of that — build_graph returns without a single batch."""
+        import threading
+        self.g, self.enriched, self.partial = None, set(), False
+        self._full_g, self._partial_items = None, None
+        lock, collected = threading.Lock(), []
+
+        def on_batch(items):
+            with lock:
+                collected.extend(items)
+                self._partial_items = list(collected)
 
         def work():
-            self.g = build_graph(self.o["repos"], self.o["state"], self.o["max_age_min"], refresh)
+            g = build_graph(self.o["repos"], self.o["state"], self.o["max_age_min"], refresh,
+                            on_batch=on_batch)
+            self._full_g = g
+            if self.partial:                   # a skeleton is on screen: the main loop swaps this in
+                self._refresh_note = "loaded"
+                self._new_g = g
 
         th = self.run_bg(work, "fetch")
         self.scr.timeout(100)
-        while th.is_alive():
+        while th.is_alive() and self._full_g is None:
+            if self._partial_items:
+                self.g = assemble_graph(self.o["repos"][0], self._partial_items, resolve=False)
+                self.partial = True
+                break
             self.draw_loading("fetching from GitHub" if refresh else "loading")
             if self.scr.getch() == ord("q"):
                 raise SystemExit
         self.scr.timeout(-1)
         self.scr.clear()
+        if self._full_g is not None:           # it finished while we were about to draw a skeleton
+            self.g, self.partial, self._new_g = self._full_g, False, None
         if self.g is None:
             raise SystemExit(f"gg: cannot load the graph: {self.bg_error}")
         self.rebuild_graph()
@@ -3040,8 +3074,8 @@ class Tui:
                 save_config()
         if self.o.get("start_tour"):
             self.tutorial()
-        if not refresh:
-            self.refresh_bg()      # always look for what changed on start-up; only changed items are fetched
+        if not refresh and self._partial_items is None:
+            self.refresh_bg()      # the cache answered: still ask GitHub what changed (only that is fetched)
 
     def refresh_bg(self, full=False):
         """r: fetch what changed on GitHub in the background and swap the graph in when done (R: everything)."""
@@ -3099,7 +3133,8 @@ class Tui:
         n_items = sum(1 for n in g.nodes.values() if n.kind == "item" and not n.stub)
         fa = datetime.fromtimestamp(g.fetched_at).strftime("%H:%M") if g.fetched_at else "?"
         me = ",".join("@" + m for m in self.me) or "-"
-        return [Row(f"{g.primary}  {n_items} open  {fa}  me={me}", kind="head"),
+        loading = "  ⋯ still loading" if getattr(self, "partial", False) else ""
+        return [Row(f"{g.primary}  {n_items} open{loading}  {fa}  me={me}", kind="head"),
                 Row(f"{THEME} c={self.o['comments']} t={self.o['translate']} s={'on' if self.o['summary'] else 'off'} "
                     f"h={self.o['hops']} | {usage_line().replace('tokens ', '')}", kind="head")]
 
@@ -4818,7 +4853,7 @@ class Tui:
                 if not self.jobs:
                     self.progress = None
                 if getattr(self, "_new_g", None) is not None:      # a background refresh finished: swap the graph in
-                    self.g, self._new_g = self._new_g, None
+                    self.g, self._new_g, self.partial = self._new_g, None, False
                     self.enriched = set()
                     self.rebuild_graph()
                     self.msg = getattr(self, "_refresh_note", "refreshed")

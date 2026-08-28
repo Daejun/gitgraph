@@ -319,5 +319,51 @@ class TestPickRootAndItemDegree(unittest.TestCase):
         self.assertEqual(root, qid(7))
 
 
+class TestAssembleGraphPartial(unittest.TestCase):
+    """assemble_graph() is the half of build_graph() that needs no network, so the TUI can draw a repo
+    that is still being fetched: the items that have arrived become a graph of their own, and the ones
+    they reference stay unresolved stubs until the rest lands."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gg = testenv.load_module()
+        cls.full = testenv.fixture_graph(cls.gg)
+        cls.items = testenv.fixture_items()
+
+    def test_a_partial_item_list_builds_a_usable_graph(self):
+        half = self.items[:2]
+        g = self.gg.assemble_graph(testenv.FIXTURE_REPO, half, resolve=False)
+        got = {n.id for n in g.nodes.values() if n.kind == "item" and not n.stub}
+        self.assertEqual(got, {f"{testenv.FIXTURE_REPO}#{it['number']}" for it in half})
+
+    def test_a_reference_by_number_alone_stays_unresolved(self):
+        # a timeline cross reference carries the other item's title with it, so those stubs do have one;
+        # a plain "#N" in a body does not, and without the network it must stay that way
+        g = self.gg.assemble_graph(testenv.FIXTURE_REPO, self.items, resolve=False)
+        unresolved = [n for n in g.nodes.values() if n.kind == "item" and n.stub and n.title is None]
+        self.assertTrue(unresolved, "the fixture references items it does not contain")
+        for n in unresolved:                       # the full build fills exactly these in
+            self.assertIsNotNone(self.full.nodes[n.id].title, n.id)
+
+    def test_no_gh_process_is_spawned_when_resolve_is_off(self):
+        def guard(*a, **kw):
+            self.fail("assemble_graph(resolve=False) must not shell out")
+        with mock.patch.object(self.gg.subprocess, "run", side_effect=guard):
+            self.gg.assemble_graph(testenv.FIXTURE_REPO, self.items, resolve=False)
+
+    def test_the_whole_item_list_gives_the_same_graph_as_build_graph(self):
+        g = self.gg.assemble_graph(testenv.FIXTURE_REPO, self.items, resolve=False)
+        # same nodes and edges as the fully built graph, minus what only stub resolution fills in
+        self.assertEqual({n for n in g.nodes}, {n for n in self.full.nodes})
+        self.assertEqual(g.edges, self.full.edges)
+
+    def test_comments_and_their_references_come_with_their_item(self):
+        g = self.gg.assemble_graph(testenv.FIXTURE_REPO, self.items, resolve=False)
+        comments = [n for n in g.nodes.values() if n.kind == "comment"]
+        self.assertTrue(comments)
+        for c in comments:
+            self.assertIn(c.parent, g.nodes)
+
+
 if __name__ == "__main__":
     unittest.main()

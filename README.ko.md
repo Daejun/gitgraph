@@ -134,7 +134,7 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Inbox · Comm
 | 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람, 최근 활동 순 | 그 사람 관점으로 Inbox 보기 |
 | 0 Main | 탭(`[` `]`): **content** = 포커스된 side panel의 커서 줄 전문(URL이 첫 줄에 밑줄로; 본문+메타 또는 코멘트) — main에 포커스가 있는 동안은 그대로 유지; **answer** = 마지막 `a` 질문의 답. 둘 다 markdown 렌더링: 제목, 코드 블록·`code`, **굵게**, 링크, 인용, 글머리표, 표(열 맞춘 box 표, `H`/`L`로 가로 스크롤) | – |
 
-Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄이고 폭이 바뀌면(드래그·리사이즈·screen mode) 다시 맞춤; 포커스된 side panel이 더 높고(`expand_focused`, `expanded_weight`) main으로 포커스가 가도 그 크기를 유지해 다음 선택이 쉬움; `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`.
+Layout: side column 폭 `side_width`(0.4); 제목은 폭에 맞춰 `…`로 줄이고 폭이 바뀌면(드래그·리사이즈·screen mode) 다시 맞춤; 포커스된 side panel이 더 높고(`expand_focused`, `expanded_weight`) main으로 포커스가 가도 그 크기를 유지해 다음 선택이 쉬움; `+`/`_`로 screen mode normal → half(포커스 panel이 column 전체) → full(그 panel만); 84열 이하 좁은 터미널은 포커스된 side panel을 위, main을 아래에 쌓음; 테두리 `border`(rounded · single · double · bold · hidden). 번역·요약은 보이는 줄부터 백그라운드로(`batch`개씩), 대기 중인 요약은 `» 요약 중…`. repo를 처음 받을 때는 항목이 배치로 도착하고 첫 배치가 오는 즉시 화면을 그린다 — 나머지가 들어올 때까지 Repo panel에 `⋯ still loading`이 뜨고, 그동안에도 움직일 수 있다.
 
 | 키 | 동작 |
 |---|---|

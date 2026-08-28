@@ -382,6 +382,46 @@ class TestRefreshItems(FetchCase):
         self.assertEqual(items[0]["title"], "old title", "kept verbatim from the cache")
 
 
+class TestBatchCallback(FetchCase):
+    """on_batch lets the TUI draw a repo that is still being fetched (each batch as it lands)."""
+
+    def setUp(self):
+        super().setUp()
+        issues = {str(n): node(n, f"issue {n}") for n in range(1, 26)}
+        self.write_fixture({"test/repo": {"issues": issues, "pulls": {"99": node(99, "a pr", is_pr=True)}}})
+
+    def test_every_item_arrives_through_the_callback_exactly_once(self):
+        seen = []
+        items = gg.fetch_repo("test/repo", "open", on_batch=lambda part: seen.append(part))
+        self.assertGreater(len(seen), 1, "26 items should not be one batch")
+        flat = [it["number"] for part in seen for it in part]
+        self.assertEqual(sorted(flat), sorted(it["number"] for it in items))
+        self.assertEqual(len(flat), len(set(flat)), "no item may be reported twice")
+
+    def test_the_first_batch_arrives_before_the_fetch_returns(self):
+        during = []
+
+        def on_batch(part):
+            during.append(len(during) == 0 and bool(part))
+        gg.fetch_repo("test/repo", "open", on_batch=on_batch)
+        self.assertTrue(during[0])
+
+    def test_a_partial_list_already_builds_a_graph(self):
+        first = []
+        gg.fetch_repo("test/repo", "open", on_batch=lambda part: first or first.extend(part))
+        g = gg.assemble_graph("test/repo", first, resolve=False)
+        self.assertEqual(len([n for n in g.nodes.values() if n.kind == "item" and not n.stub]), len(first))
+
+    def test_the_incremental_refresh_reports_batches_too(self):
+        seen = []
+        cached = [dict(it, updated="2020-01-01T00:00:00Z") for it in gg.fetch_repo("test/repo", "open")]
+        gg.refresh_items("test/repo", cached, on_batch=lambda part: seen.append(len(part)))
+        self.assertTrue(seen and sum(seen) == len(cached))
+
+    def test_no_callback_is_fine(self):
+        self.assertTrue(gg.fetch_repo("test/repo", "open"))
+
+
 class TestLoadItems(FetchCase):
     def setUp(self):
         super().setUp()

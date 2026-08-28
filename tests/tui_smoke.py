@@ -59,7 +59,8 @@ class Session:
     def __init__(self, args=(), home=None, rows=ROWS, cols=COLS, **envextra):
         self.home = home or testenv.make_home()
         envextra.setdefault("FAKE_GH_MODE", "script")
-        envextra.setdefault("FAKE_GH_FIXTURE", gh_fixture(self.home))
+        if "FAKE_GH_FIXTURE" not in envextra:      # (not setdefault: it would build one either way)
+            envextra["FAKE_GH_FIXTURE"] = gh_fixture(self.home)
         self.rows, self.cols = rows, cols
         # deliberately no LINES/COLUMNS: ncurses would honour them over the pty's real size and never
         # see a resize (SIGWINCH -> KEY_RESIZE), which is one of the things this file checks
@@ -174,21 +175,56 @@ class Session:
             pass
 
 
-def gh_fixture(home):
-    """Write a FAKE_GH_FIXTURE for tests/fakes/gh from the items already cached in `home`.
+def _graphql_node(it):
+    """A cached item dict turned back into the GraphQL node shape gg's fetch parses (_norm_item)."""
+    node = {
+        # state OPEN whatever the fixture says: these items are what its items__*__open.json holds, so
+        # the listing has to keep reporting all of them (a real open cache never holds a closed item)
+        "number": it["number"], "title": it["title"], "state": "OPEN", "body": it.get("body", ""),
+        "createdAt": it["created"], "updatedAt": it["updated"], "url": it.get("url", ""),
+        "author": {"login": it.get("author") or "ghost"},
+        "labels": {"nodes": [{"name": n} for n in it.get("labels", [])]},
+        "comments": {"totalCount": it.get("comments_total", len(it.get("comments", []))), "nodes": [
+            {"databaseId": int(re.sub(r"\D", "", c["id"]) or 0), "url": c.get("url", ""),
+             "author": {"login": c.get("author") or "ghost"}, "body": c.get("body", ""),
+             "createdAt": c["created"]}
+            for c in it.get("comments", []) if c.get("kind") == "comment"]},
+        "timelineItems": {"nodes": [
+            {"createdAt": x.get("when"), "source": {
+                "__typename": "PullRequest" if x.get("is_pr") else "Issue", "number": x["number"],
+                "title": x.get("title"), "state": x.get("state"), "isDraft": x.get("draft", False),
+                "createdAt": x.get("created"), "author": {"login": x.get("author") or "ghost"},
+                "repository": {"nameWithOwner": x["repo"]}}}
+            for x in it.get("crossrefs", [])]},
+    }
+    if it["is_pr"]:
+        node["isDraft"] = it.get("draft", False)
+        node["reviews"] = {"nodes": [
+            {"databaseId": int(re.sub(r"\D", "", c["id"]) or 0), "url": c.get("url", ""),
+             "author": {"login": c.get("author") or "ghost"}, "body": c.get("body", ""),
+             "state": c.get("review_state"), "createdAt": c["created"], "comments": {"nodes": []}}
+            for c in it.get("comments", []) if c.get("kind") in ("review", "review_comment")]}
+        node["closingIssuesReferences"] = {"nodes": [
+            {"number": c["number"], "repository": {"nameWithOwner": c["repo"]}} for c in it.get("closes", [])]}
+    return node
+
+
+def gh_fixture(home, items=None):
+    """Write a FAKE_GH_FIXTURE for tests/fakes/gh from the items cached in `home` (or the ones given).
 
     Since 0.18.0 the TUI always asks GitHub what changed when it opens, so the fake gh has to answer
-    instead of refusing: every cached item is listed as OPEN with its cached updatedAt, which makes
-    list_open() report "0 changed, 0 dropped" and the refresh stop there — the real incremental path,
-    with no item re-fetched and the fixture data left exactly as it was.
+    instead of refusing. The nodes are complete, not just number+updatedAt, so a *cold* cache can be
+    fetched through the same fake: list_open() then the batched record fetch, which is what the
+    cold-start check exercises. With the cache intact list_open() reports "0 changed" and stops there.
     """
-    cache = os.path.join(home, ".cache", "gitgraph", f"items__{testenv.FIXTURE_REPO.replace('/', '__')}__open.json")
-    with open(cache, encoding="utf-8") as f:
-        items = json.load(f)["items"]
+    if items is None:
+        cache = os.path.join(home, ".cache", "gitgraph",
+                             f"items__{testenv.FIXTURE_REPO.replace('/', '__')}__open.json")
+        with open(cache, encoding="utf-8") as f:
+            items = json.load(f)["items"]
     issues, pulls = {}, {}
     for it in items:
-        (pulls if it["is_pr"] else issues)[str(it["number"])] = {
-            "number": it["number"], "updatedAt": it["updated"], "state": "OPEN"}
+        (pulls if it["is_pr"] else issues)[str(it["number"])] = _graphql_node(it)
     path = os.path.join(home, "gh-fixture.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"repos": {testenv.FIXTURE_REPO: {"issues": issues, "pulls": pulls}}}, f)
@@ -559,6 +595,30 @@ def live_state(s):
     check("cmd.json moves the TUI (gg_open)", moved)
 
 
+def cold_start_paints_early():
+    """A cold cache is fetched in batches and drawn as they land (the Repo panel says "still loading"
+    until the full graph is swapped in), instead of holding a loading box until everything is there."""
+    home = testenv.make_home()
+    fixture = gh_fixture(home)                          # built from the cache, before it is thrown away
+    cache = os.path.join(home, ".cache", "gitgraph")
+    for name in os.listdir(cache):                      # force the cold path: nothing cached
+        if name.startswith("items__"):
+            os.remove(os.path.join(cache, name))
+    s = Session(["--no-summary", "-t", "none"], home=home, FAKE_GH_FIXTURE=fixture)
+    try:
+        check("a cold start reaches a usable screen", s.wait_for("6 People", 40), s.text()[:400])
+        check("the items are there", "#" in s.text())
+        s.settle()
+        check("the loading marker is gone once it is complete", "still loading" not in s.text(),
+              s.line(s.find_line("1 Repo") + 1))
+        st = s.cache("state.json") or {}
+        check("the graph is complete afterwards", bool(st.get("repos")), json.dumps(st)[:200])
+        check("no traceback on the cold path", "Traceback" not in s.log(),
+              "\n".join(l for l in s.log().splitlines() if "Error" in l)[:400])
+    finally:
+        s.kill()
+
+
 def cross_repo_mark():
     """A mark on an item this graph does not hold (another repo, a closed item) must still be editable
     and deletable from the Inbox todo section. Reported bug: its row carries no node id, so Del acted
@@ -666,6 +726,7 @@ def main():
     finally:
         s.kill()
 
+    cold_start_paints_early()
     cross_repo_mark()
     portrait_and_theme()
     ai_failure_popup()

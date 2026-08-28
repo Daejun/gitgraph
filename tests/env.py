@@ -150,6 +150,11 @@ def load_module():
     return _module
 
 
+def fixture_items():
+    """The fixture repo's items as load_items() would return them (for assemble_graph tests)."""
+    return _load_fixture()["items"]
+
+
 def fixture_graph(gg, **opts):
     """Build and return the Graph for the fixture repo via the real build_graph(), with max_age set so
     high nothing is ever refetched. `gg` is the module from load_module() (its HOME must already have

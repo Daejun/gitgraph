@@ -108,7 +108,10 @@ several jobs finish at once. Every failure is appended to `AI_FAILURES`, which t
 resize (clearing every frame flickers on PuTTY), and popups repaint just their own box. All slow work
 runs in daemon threads via `run_bg()` and is reaped in the main loop; `enrich()` starts up to
 `AI_PARALLEL` small AI jobs at a time for the nodes in the *visible* rows first, so summaries never
-starve behind a long translation. `docs/PLAN-lazygit-layout.md` (Korean) is the design doc for this
+starve behind a long translation. A cold cache is drawn while it is still arriving: `Tui.load()` feeds
+each fetched batch through `assemble_graph(..., resolve=False)` (the network-free half of
+`build_graph`) and the finished graph is swapped in by the same `_new_g` path a background refresh
+uses. `docs/PLAN-lazygit-layout.md` (Korean) is the design doc for this
 layout and its lazygit↔`gg config` mapping.
 
 **Live state + MCP** — the TUI writes `~/.cache/gitgraph/state.json` every frame and polls `cmd.json`,
