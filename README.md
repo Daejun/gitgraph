@@ -164,8 +164,8 @@ Everything gg keeps is under `~/.cache/gitgraph/` (mode 0700, files 0600 — it 
 
 | file | what | lifetime |
 |---|---|---|
-| `items__<repo>__open.json` | issues/PRs of one repo with bodies and comments, as fetched | refreshed after `--max-age` minutes (15); deleted at start-up when unused for 30 days |
-| `stubs__<repo>.json` | titles/bodies of referenced items (closed, other repos) | same |
+| `items__<repo>__open.json` | issues/PRs of one repo with bodies and comments, as fetched | after `--max-age` minutes (15) gg asks GitHub only for the numbers + updatedAt of the open items and re-fetches just what changed (closed ones are dropped); `--refresh` fetches everything; deleted at start-up when unused for 30 days |
+| `stubs__<repo>.json` | titles/bodies of referenced items (closed, other repos) | kept a day |
 | `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI results keyed by text hash | capped (oldest dropped beyond 20k entries) |
 | `tui.log` | tui stderr / progress | cut back beyond 1 MB |
 | `state.json`, `cmd*.json` | what the tui shows (for `gg mcp`) | overwritten |

@@ -164,8 +164,8 @@ gg가 보관하는 것은 모두 `~/.cache/gitgraph/`(디렉터리 0700, 파일 
 
 | 파일 | 내용 | 수명 |
 |---|---|---|
-| `items__<repo>__open.json` | repo 하나의 issue/PR 원본(본문·코멘트) | `--max-age`분(15) 지나면 재조회; 30일 안 쓰면 시작 시 삭제 |
-| `stubs__<repo>.json` | 참조된 항목(닫힌 것·다른 repo)의 제목/본문 | 같음 |
+| `items__<repo>__open.json` | repo 하나의 issue/PR 원본(본문·코멘트) | `--max-age`분(15) 지나면 open 항목의 번호·updatedAt만 가볍게 받아 **바뀐 것만** 다시 받고 닫힌 것은 뺌; `--refresh`는 전체 재조회; 30일 안 쓰면 시작 시 삭제 |
+| `stubs__<repo>.json` | 참조된 항목(닫힌 것·다른 repo)의 제목/본문 | 하루 보관 |
 | `translations.json`, `translations_full.json`, `summaries.json`, `whys.json` | AI 결과(텍스트 해시 기준) | 상한(2만 건 넘으면 오래된 것부터 삭제) |
 | `tui.log` | tui stderr/진행 로그 | 1 MB 넘으면 잘라냄 |
 | `state.json`, `cmd*.json` | tui가 보는 것(`gg mcp`용) | 덮어씀 |

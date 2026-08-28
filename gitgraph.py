@@ -28,7 +28,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.9.4"
+VERSION = "0.10.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -509,6 +509,77 @@ def _norm_item(repo, n, is_pr):
             "crossrefs": crossrefs, "closes": closes}
 
 
+Q_LIST = """
+query($owner:String!,$name:String!,$after:String,$states:[IssueState!]) {
+  repository(owner:$owner,name:$name){ issues(first:100, after:$after, states:$states){
+    pageInfo{hasNextPage endCursor} nodes{ number updatedAt } } } }
+"""
+Q_LIST_PR = """
+query($owner:String!,$name:String!,$after:String,$states:[PullRequestState!]) {
+  repository(owner:$owner,name:$name){ pullRequests(first:100, after:$after, states:$states){
+    pageInfo{hasNextPage endCursor} nodes{ number updatedAt } } } }
+"""
+ITEM_BATCH = 10
+
+
+def list_open(repo):
+    """{(is_pr, number): updatedAt} for every open issue and PR — a light query (no bodies)."""
+    host, owner, name = split_repo(repo)
+    out = {}
+    for q, is_pr in ((Q_LIST, False), (Q_LIST_PR, True)):
+        after = None
+        while True:
+            d = graphql(q, {"owner": owner, "name": name, "after": after, "states": ["OPEN"]}, host)
+            conn = (d.get("repository") or {}).get("pullRequests" if is_pr else "issues")
+            if conn is None:
+                raise GhError(f"{repo}: repository not found on {host}")
+            for n in conn["nodes"]:
+                out[(is_pr, n["number"])] = n["updatedAt"]
+            if not conn["pageInfo"]["hasNextPage"]:
+                break
+            after = conn["pageInfo"]["endCursor"]
+    return out
+
+
+def fetch_items(repo, is_pr, numbers):
+    """Full records (bodies, comments, cross references) of the given issue or PR numbers, ITEM_BATCH per query."""
+    host, owner, name = split_repo(repo)
+    fields = PR_FIELDS if is_pr else ISSUE_FIELDS
+    kind = "pullRequest" if is_pr else "issue"
+    items = []
+    for i in range(0, len(numbers), ITEM_BATCH):
+        batch = numbers[i:i + ITEM_BATCH]
+        aliases = " ".join(f"n{n}: {kind}(number:{n}){{ {fields} }}" for n in batch)
+        d = graphql(f'query {{ repository(owner:"{owner}", name:"{name}") {{ {aliases} }} }}', host=host)
+        rep_ = d.get("repository") or {}
+        for n in batch:
+            node = rep_.get(f"n{n}")
+            if node:
+                items.append(_norm_item(repo, node, is_pr))
+        progress("fetch", len(items), len(numbers), f"{repo}: changed items")
+    return items
+
+
+def refresh_items(repo, cached):
+    """Incremental update of the open items of a repo: only items whose updatedAt moved (or new ones) are fetched
+    again; items that are no longer open are dropped. Returns (items, n_changed, n_dropped)."""
+    listing = list_open(repo)
+    by_key = {(it["is_pr"], it["number"]): it for it in cached}
+    changed = [k for k, u in listing.items() if k not in by_key or (by_key[k].get("updated") or "") < u]
+    dropped = [k for k in by_key if k not in listing]
+    log(f"{repo}: {len(listing)} open, {len(changed)} changed, {len(dropped)} closed since the last fetch")
+    progress("fetch", 0, len(changed) or None, f"{repo}: {len(changed)} changed")
+    fresh = {}
+    for is_pr in (False, True):
+        nums = sorted(n for p, n in changed if p == is_pr)
+        if nums:
+            for it in fetch_items(repo, is_pr, nums):
+                fresh[(it["is_pr"], it["number"])] = it
+    items = [fresh.get(k) or by_key[k] for k in listing if k in fresh or k in by_key]
+    items.sort(key=lambda it: it["created"], reverse=True)
+    return items, len(changed), len(dropped)
+
+
 def fetch_repo(repo, state):
     host, owner, name = split_repo(repo)
     items = []
@@ -540,12 +611,25 @@ def _cache_path(kind, repo, state=""):
 
 
 def load_items(repo, state, max_age_min, refresh=False):
+    """Cached items of a repo. Within max_age they are used as they are; after that (state=open) only what changed on
+    GitHub is fetched again; --refresh forces a full fetch."""
     p = _cache_path("items", repo, state)
+    cached = None
     if not refresh and os.path.exists(p):
         with open(p) as f:
             d = json.load(f)
         if time.time() - d["fetched_at"] < max_age_min * 60:
             return d["items"], d["fetched_at"]
+        cached = d["items"]
+    if cached is not None and state == "open":
+        try:
+            items, _, _ = refresh_items(repo, cached)
+            with open(p, "w") as f:
+                json.dump({"fetched_at": time.time(), "repo": repo, "state": state, "items": items}, f)
+            secure(p)
+            return items, time.time()
+        except GhError as e:
+            log(f"{repo}: incremental refresh failed ({e}); fetching everything")
     items = fetch_repo(repo, state)
     with open(p, "w") as f:
         json.dump({"fetched_at": time.time(), "repo": repo, "state": state, "items": items}, f)
@@ -1367,7 +1451,7 @@ def build_graph(repos, state, max_age_min, refresh=False):
         if n.kind == "item" and n.stub and (n.title is None or n.state is None):
             by_repo[n.repo].append(n.number)
     for repo, nums in by_repo.items():
-        info = resolve_stubs(repo, sorted(set(nums)), max_age_min)
+        info = resolve_stubs(repo, sorted(set(nums)), max(max_age_min, 24 * 60))   # referenced items: a day
         for num, v in info.items():
             n = g.nodes[g.item_id(repo, num)]
             if v.get("missing"):
