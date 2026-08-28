@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.18.0"
+VERSION = "0.18.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -3356,6 +3356,25 @@ class Tui:
     def restore(self, st):
         self.item, self.subject, self.me, self.panels["main"].tab, self.panels["home"].tab, self.collapsed = st
         self.refresh_all()
+        self.sync_cursors()
+
+    def sync_cursors(self):
+        """Put every side list's cursor on the current item, so the highlight matches what is on screen.
+        refresh_all() keeps each panel's own cursor, which is right while you browse but wrong after
+        b / f or a jump: the row you came from would stay highlighted. The Comments panel follows the
+        selected comment instead, when the selection is one of this item's comments (the snapshot's
+        subject can be another item entirely — that is what main was previewing, not what is current)."""
+        if not self.item:
+            return
+        n = self.g.nodes.get(self.subject) if self.subject else None
+        comment = self.subject if n is not None and n.kind == "comment" and n.parent == self.item else None
+        for key in ("home", "links", "item", "comments"):
+            p = self.panels.get(key)
+            if not p or not p.rows:
+                continue
+            if key == "comments" and comment and p.goto_nid(comment):
+                continue
+            p.goto_nid(self.item)
 
     def set_item(self, nid, push=True):
         if not nid or nid not in self.g.nodes or self.g.nodes[nid].kind == "person":
@@ -3366,6 +3385,7 @@ class Tui:
         self.item, self.subject, self.collapsed = nid, nid, set()
         self.panels["main"].top = 0
         self.refresh_all()
+        self.sync_cursors()
 
     def back(self):
         if not self.hist:
@@ -4344,7 +4364,7 @@ class Tui:
         if 0xC2 <= k <= 0xF4:                      # a UTF-8 character: Hangul typed in IME mode?
             n = 1 if k < 0xE0 else 2 if k < 0xF0 else 3
             bs = bytes([k])
-            self.scr.nodelay(True)
+            self.scr.timeout(60)      # the rest of the character may land in a later read (IME, ssh, tmux)
             try:
                 for _ in range(n):
                     b = self.scr.getch()
@@ -4352,7 +4372,7 @@ class Tui:
                         break
                     bs += bytes([b])
             finally:
-                self.scr.nodelay(False)
+                self.scr.nodelay(False)   # the main loop sets its own timeout before the next getch
             ch = bs.decode("utf-8", "replace")
             keys = hangul_keys(ch)
             if keys:

@@ -199,5 +199,69 @@ class TestFindAndKeep(unittest.TestCase):
         self.assertEqual(p.cur, 0, "settle() clamps a stale index back into range")
 
 
+class TestSyncCursors(unittest.TestCase):
+    """Tui.sync_cursors(): after b / f or a jump, every side list highlights the current item.
+
+    Regression: back() restored the item but left the Inbox cursor on the row it came from, so the
+    Item panel and the highlight disagreed. The snapshot's `subject` is what main was previewing (it
+    can be a different item), so the highlight follows the *item*; only the Comments panel follows the
+    selection, and only when that selection is one of this item's comments.
+    """
+
+    def build(self, item, subject, rows_by_panel, comment_parent=None):
+        t = gg.Tui.__new__(gg.Tui)
+        t.item, t.subject = item, subject
+        t.panels = {}
+        for key, rs in rows_by_panel.items():
+            pan = gg.Panel(key, key)
+            pan.rows = rs
+            pan.rect = (0, 0, 10, 40)
+            t.panels[key] = pan
+        g = gg.Graph("test/repo")
+        if subject and comment_parent:
+            g.nodes[subject] = gg.Node("comment", subject, parent=comment_parent)
+        t.g = g
+        return t
+
+    def test_every_list_moves_onto_the_current_item(self):
+        rs = rows(("#1 one", "r#1", ""), ("#2 two", "r#2", ""), ("#3 three", "r#3", ""))
+        t = self.build("r#3", "r#1", {"home": list(rs), "links": list(rs), "item": list(rs),
+                                      "comments": list(rs)})
+        for p in t.panels.values():
+            p.cur = 0
+        gg.Tui.sync_cursors(t)
+        for key, p in t.panels.items():
+            self.assertEqual(p.cur, 2, f"{key} still highlights {p.rows[p.cur].text!r}")
+
+    def test_a_panel_without_that_row_keeps_its_cursor(self):
+        t = self.build("r#9", None, {"home": rows(("#1", "r#1", ""), ("#2", "r#2", ""))})
+        t.panels["home"].cur = 1
+        gg.Tui.sync_cursors(t)
+        self.assertEqual(t.panels["home"].cur, 1)
+
+    def test_comments_follow_the_selected_comment_of_this_item(self):
+        item_rows = rows(("#1", "r#1", ""), ("#2", "r#2", ""))
+        crows = rows(("+0d c1", "r#2/c1", ""), ("+1d c2", "r#2/c2", ""))
+        t = self.build("r#2", "r#2/c2", {"home": item_rows, "comments": crows},
+                       comment_parent="r#2")
+        gg.Tui.sync_cursors(t)
+        self.assertEqual(t.panels["comments"].cur, 1, "the selected comment stays highlighted")
+        self.assertEqual(t.panels["home"].cur, 1, "the Inbox still follows the item")
+
+    def test_a_subject_from_another_item_does_not_drag_the_highlight(self):
+        # exactly the reported bug: the snapshot restored item #1 while subject was still #2
+        rs = rows(("#1", "r#1", ""), ("#2", "r#2", ""))
+        t = self.build("r#1", "r#2", {"home": list(rs)})
+        t.panels["home"].cur = 1
+        gg.Tui.sync_cursors(t)
+        self.assertEqual(t.panels["home"].cur, 0)
+
+    def test_no_current_item_is_a_no_op(self):
+        t = self.build(None, None, {"home": rows(("#1", "r#1", ""))})
+        t.panels["home"].cur = 0
+        gg.Tui.sync_cursors(t)      # must not raise
+        self.assertEqual(t.panels["home"].cur, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

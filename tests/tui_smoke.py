@@ -291,6 +291,45 @@ def panels_and_navigation(s):
     check("back to normal screen", "1 Repo" in s.text())
 
 
+def history_highlight(s):
+    """b / f change which item is current — the side list's highlight has to move with it.
+    Reported bug: after back, the Item panel showed #A while the Inbox still highlighted #B."""
+    def item_and_row():
+        st = s.cache("state.json") or {}
+        return (st.get("item") or {}).get("id"), st.get("cursor_row") or ""
+
+    def follows(where):
+        nid, row = item_and_row()
+        num = (nid or "").split("#")[-1]
+        check(f"the highlight follows the item {where}", bool(num) and f"#{num} " in row,
+              f"item={nid} cursor_row={row[:70]!r}")
+
+    s.key("3")
+    for _ in range(10):                  # the "all" section always lists every fixture item
+        if "all" in s.line(s.find_line("3 Inbox")):
+            break
+        s.key("]", 0.5)
+    s.key("\r", 1.2)
+    first = (s.cache("state.json") or {}).get("item", {}).get("id")
+    s.key("j", 0.5)
+    s.key("j", 0.5)
+    s.key("\r", 1.2)
+    second = (s.cache("state.json") or {}).get("item", {}).get("id")
+    check("two different items were opened", first and second and first != second, f"{first} {second}")
+    s.key("b", 1.5)
+    check("back returns to the first item", (s.cache("state.json") or {}).get("item", {}).get("id") == first)
+    follows("after back")
+    s.key("f", 1.5)
+    check("forward returns to the second item", (s.cache("state.json") or {}).get("item", {}).get("id") == second)
+    follows("after forward")
+    s.key("5")                           # the same, arriving from the Links panel
+    s.key("j", 0.5)
+    s.key("\r", 1.5)
+    follows("after a jump from Links")
+    s.key("b", 1.5)
+    follows("after back from Links")
+
+
 def inbox_tabs(s):
     s.key("3")
     seen = []
@@ -402,6 +441,19 @@ def hangul_ime(s):
     check("Hangul ㅓ moves the cursor", "Traceback" not in s.log())
     check("the IME commit Enter is swallowed", current_item(s) == before,
           f"{before!r} -> {current_item(s)!r}")
+
+    # Reported bug: m did not work in Hangul mode. A real IME over ssh/tmux can deliver the three
+    # UTF-8 bytes of ㅡ in separate reads; gg used to give up on the continuation bytes and drop the
+    # keystroke. Send them one at a time, with a gap, the way that happens in practice.
+    s.key("\x1b", 0.4)
+    s.key("3", 0.4)
+    for byte in (b"\xe3", b"\x85", b"\xa1"):        # ㅡ = U+3161 = the "m" key in the 2-set layout
+        os.write(s.fd, byte)
+        time.sleep(0.03)
+    s.drain(1.5)
+    check("a Hangul shortcut split across reads still fires (ㅡ = m)",
+          "my note" in s.text() or "is marked" in s.text(), s.text()[-400:])
+    s.key("\x1b", 0.5)
 
 
 def mouse_and_border(s):
@@ -550,6 +602,7 @@ def main():
                 FAKE_GH_LOG=os.path.join(home, "gh-calls.log"))
     try:
         panels_and_navigation(s)
+        history_highlight(s)
         inbox_tabs(s)
         popups_and_menus(s)
         search_and_marks(s)
