@@ -8,6 +8,7 @@ Usage:
   gg tui [777]                            lazygit-style TUI: side panels (Repo/Home/Links/Comments/People) + main
   gg update                               update this installation from GitHub
   gg config [KEY [VALUE]]                 show / set persistent settings (~/.config/gitgraph/config.json)
+  gg todo                                 print the markdown of everything marked with m in the tui
 
 Only dependency: the `gh` CLI (authenticated). No pip packages.
 """
@@ -23,7 +24,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.6.5"
+VERSION = "0.7.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -41,6 +42,7 @@ CONFIG_KEYS = {
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
+    "todo_file": ("GITGRAPH_TODO", "~/gitgraph-todo.md", "markdown written from the marks made with m in the tui (for the next session)"),
     "side_width": ("GITGRAPH_SIDE_WIDTH", "0.4", "tui: fraction of the width for the side column"),
     "expand_focused": ("GITGRAPH_EXPAND_FOCUSED", "true", "tui: give the focused side panel more height (accordion)"),
     "expanded_weight": ("GITGRAPH_EXPANDED_WEIGHT", "2", "tui: how much taller the focused side panel is"),
@@ -1495,7 +1497,7 @@ THEMES = {
         "out": (4, 4, False, False), "in": (5, 5, False, False), "closes": (4, 4, True, False), "closedby": (5, 5, True, False),
         "issue": (2, 2, True, False), "pr": (12, 4, True, False), "draft": (12, 4, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
-        "url": (39, 6, True, False), "fold": (3, 3, True, False), "sum": (180, 3, False, False),
+        "url": (39, 6, True, False), "fold": (3, 3, True, False), "md_h": (214, 3, True, False), "md_code": (250, 7, False, False), "md_quote": (None, None, False, True), "md_bold": (None, None, True, False), "sum": (180, 3, False, False),
         "people": ([39, 208, 42, 205, 226, 51, 141, 203, 118, 214, 81, 171, 190, 99, 209, 45], [1, 2, 3, 4, 5, 6]),
     },
     "light": {  # light background: darker tones, grey instead of dim
@@ -1504,7 +1506,7 @@ THEMES = {
         "out": (4, 4, False, False), "in": (5, 5, False, False), "closes": (4, 4, True, False), "closedby": (5, 5, True, False),
         "issue": (22, 2, True, False), "pr": (4, 4, True, False), "draft": (4, 4, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (30, 6, False, False),
-        "url": (4, 4, True, False), "fold": (130, 3, True, False), "sum": (94, 3, False, False),
+        "url": (4, 4, True, False), "fold": (130, 3, True, False), "md_h": (130, 3, True, False), "md_code": (240, 0, False, False), "md_quote": (8, 8, False, False), "md_bold": (None, None, True, False), "sum": (94, 3, False, False),
         "people": ([18, 88, 22, 90, 130, 24, 54, 94, 28, 124, 30, 91, 52, 58, 23, 89], [1, 2, 3, 4, 5, 6]),
     },
     "basic": {  # 8 colours only, no dim, no dark blue: PuTTY and other plain terminals
@@ -1513,7 +1515,7 @@ THEMES = {
         "out": (6, 6, False, False), "in": (5, 5, False, False), "closes": (6, 6, True, False), "closedby": (5, 5, True, False),
         "issue": (2, 2, True, False), "pr": (3, 3, True, False), "draft": (3, 3, False, False),
         "merged": (5, 5, True, False), "closed": (1, 1, True, False), "comment": (6, 6, False, False),
-        "url": (6, 6, True, False), "fold": (7, 7, True, False), "sum": (7, 7, False, False),
+        "url": (6, 6, True, False), "fold": (7, 7, True, False), "md_h": (3, 3, True, False), "md_code": (7, 7, False, False), "md_quote": (8, 8, False, False), "md_bold": (None, None, True, False), "sum": (7, 7, False, False),
         "people": ([2, 3, 5, 6, 1, 7], [2, 3, 5, 6, 1, 7]),
     },
 }
@@ -1546,6 +1548,48 @@ def style_spec(st):
     return (fg256 if term_256() else fg8), bold, dim
 
 
+_MD_INLINE = re.compile(r"(`[^`]+`)|(\*\*[^*]+\*\*)|(\[[^\]]+\]\([^)]+\))|(https?://[^\s)]+)")
+
+
+def md_segments(text, in_code=False):
+    """(text, style) segments for one line of markdown: headings, code, bold, links, quotes, bullets."""
+    if in_code:
+        return [(text, "md_code")]
+    st = text.lstrip()
+    if st.startswith("```"):
+        return [(text, "md_code")]
+    if re.match(r"#{1,6} ", st):
+        return [(text, "md_h")]
+    if st.startswith(">"):
+        return [(text, "md_quote")]
+    m = re.match(r"^(\s*)([-*+]|\d+[.)]) (.*)$", text)
+    if m and not text.startswith("    "):
+        bullet = "• " if m.group(2) in "-*+" else m.group(2) + " "
+        segs = [(m.group(1) + bullet, "fold")]
+        text = m.group(3)
+    else:
+        segs = []
+    pos = 0
+    for mm in _MD_INLINE.finditer(text):
+        if mm.start() > pos:
+            segs.append((text[pos:mm.start()], ""))
+        tok = mm.group(0)
+        if mm.group(1):
+            segs.append((tok, "md_code"))
+        elif mm.group(2):
+            segs.append((tok[2:-2], "md_bold"))
+        elif mm.group(3):
+            lm = re.match(r"\[([^\]]+)\]\(([^)]+)\)", tok)
+            segs.append((lm.group(1), "url"))
+            segs.append((f" ({lm.group(2)})", "meta"))
+        else:
+            segs.append((tok, "url"))
+        pos = mm.end()
+    if pos < len(text):
+        segs.append((text[pos:], ""))
+    return segs or [(text, "")]
+
+
 def ansi_style(st):
     fg, bold, dim = style_spec(st)
     codes = (["1"] if bold else []) + (["2"] if dim else []) + (["4"] if st == "url" else [])
@@ -1571,6 +1615,8 @@ def segments(row, g):
         return [(t, "sum" if t.lstrip().startswith("↳ »") else "meta")]
     if row.kind == "url":
         return [(t, "url")]
+    if row.kind in ("md", "md_code"):
+        return md_segments(t, row.kind == "md_code")
     if row.kind == "mention":
         i = t.find("  ← ")
         head = segments(Row(t[:i] if i >= 0 else t, row.nid), g)
@@ -1580,6 +1626,9 @@ def segments(row, g):
     if m:
         segs.append((m.group(0), "pre"))
         t = t[m.end():]
+    if t.startswith("✎ "):
+        segs.append(("✎ ", "fold"))
+        t = t[2:]
     if t[:2] in ("▾ ", "▸ ", "· "):
         segs.append((t[:2], "fold" if t[0] == "▸" else "pre"))
         t = t[2:]
@@ -2104,6 +2153,9 @@ HELP = """gg tui — lazygit style layout
                   Item / Comments: read it in main      Links: go to that item      People: view as that person
   a               ask claude about the selection (answer tab in main)     d  details pager     o  open in browser
   i               translate the main content (issue/PR body or comment) in full; press again for the original
+  m               mark the selected issue/PR or comment for my next work and write a note; marked rows show ✎,
+                  Home has a "todo" section, and ~/gitgraph-todo.md (gg config todo_file) is rewritten for the
+                  next session (also `gg todo`). m again on a marked row: edit the note / mark done / remove
   Esc / b         back (previous item and perspective)     f  forward
   u               view Home as another person       r  refetch from GitHub
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
@@ -2220,7 +2272,7 @@ class Panel:
 
 class Tui:
     SIDE = ["repo", "item", "home", "links", "comments", "people"]
-    HOME_TABS = [("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
+    HOME_TABS = [("todo", "todo"), ("turn", "my turn"), ("mention", "mentions"), ("opened", "opened"), ("active", "active"),
                  ("waiting", "waiting"), ("mine", "mine"), ("prs", "PRs by others"), ("stale", "stale"), ("all", "all")]
     MAIN_TABS = ["content", "answer"]
     COMMENTS_CYCLE = ["linked", "all", "none"]
@@ -2233,6 +2285,7 @@ class Tui:
         self.o.setdefault("summary", True)
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
+        self.todo = load_todo()
         self.show_tr = False   # main content: show the full-text translation (i toggles; runs claude on demand)
         self.last_side = "home"   # the side list panel that stays expanded while main is focused
         self.tr_thread, self.tr_pending = None, None
@@ -2402,7 +2455,7 @@ class Tui:
                 f"{n.comments_total} comments" if n.comments_total else "", f"{n_links} links" if n_links else ""]
         summ = ("» " + n.summary) if n.summary else ("» " + PENDING_TEXT if n.summary_pending else
                                                      (excerpt(n.body, 200) if (n.body or "").strip() else "(no body)"))
-        return [Row(item_label(g, n, w), n.id),
+        return [Row(self.mark_prefix(n.id) + item_label(g, n, w), n.id),
                 Row("  " + " · ".join(x for x in meta if x), n.id, kind="note"),
                 Row("  " + summ, n.id, kind="note"),
                 Row("  " + (n.url or ""), n.id, kind="url")]
@@ -2449,7 +2502,7 @@ class Tui:
                         trunc(n.tr_title or n.title, w)
             else:
                 label = item_label(g, n, w)
-            r = Row(label + (f"  ⇢ {deg}" if deg else ""), n.id)
+            r = Row(self.mark_prefix(n.id) + label + (f"  ⇢ {deg}" if deg else ""), n.id)
             if src is not None and src.kind == "comment":
                 what = (("» " + trunc(src.summary, w)) if src.summary else
                         ("\"" + (trunc(src.tr_excerpt, w) if src.tr_excerpt else excerpt(src.body, w)) + "\""))
@@ -2486,9 +2539,38 @@ class Tui:
             "all": [item_row(n) for n in newest(items)],
         }
 
+    def marked(self, nid):
+        return next((e for e in self.todo if not e.get("done") and (e.get("comment") == nid or (not e.get("comment") and e["item"] == nid))), None)
+
+    def mark_prefix(self, nid):
+        return "✎ " if self.marked(nid) else ""
+
+    def todo_rows(self):
+        g, w = self.g, self.o["width"]
+        rows = []
+        for e in sorted(self.todo, key=lambda e: e["created"], reverse=True):
+            if e.get("done"):
+                continue
+            n = g.nodes.get(e["item"])
+            head = item_label(g, n, w, with_meta=False) if n else f"{e['item_num']} {trunc(e['title'], w)}"
+            text = f"✎ {head}"
+            if e.get("note"):
+                text += f"  · {e['note']}"
+            if e.get("comment"):
+                text += f"  ← @{e['comment_author']} {e['comment_when']} {trunc(e['comment_text'], w)}"
+            r = Row(text, e["item"] if n else None, e.get("comment") if e.get("comment") in g.nodes else None,
+                    "mention" if e.get("comment") in g.nodes else "")
+            rows.append(r)
+        return rows or [Row("(nothing marked — press m on an item or a comment)", kind="head")]
+
     def home_rows(self):
+        if self.HOME_TABS[self.panels["home"].tab][0] == "todo":
+            self.home_counts = getattr(self, "home_counts", {})
+            self.home_counts["todo"] = sum(1 for e in self.todo if not e.get("done"))
+            return self.todo_rows()
         secs = self.home_sections()
         self.home_counts = {k: len(v) for k, v in secs.items()}
+        self.home_counts["todo"] = sum(1 for e in self.todo if not e.get("done"))
         key = self.HOME_TABS[self.panels["home"].tab][0]
         return secs[key] or [Row("(nothing here)", kind="head")]
 
@@ -2549,7 +2631,7 @@ class Tui:
             return [Row("(no current item)", kind="head")]
         g, w = self.g, self.o["width"]
         cs = list(reversed(g.comments_of(self.item)))     # newest on top
-        rows = [Row(comment_label(g, c, w, show_item=False), c.id) for c in cs]
+        rows = [Row(self.mark_prefix(c.id) + comment_label(g, c, w, show_item=False), c.id) for c in cs]
         return rows or [Row("(no comments)", kind="head")]
 
     def people_rows(self):
@@ -2586,12 +2668,20 @@ class Tui:
         p = self.panels["main"]
         tab = self.MAIN_TABS[p.tab]
         if tab == "content":
-            p.scroll_only = True
-            p.rows = [Row(t, kind="url" if re.match(r"https?://\S+$", t) else "")
-                      for t in self.content_lines(self.subject, max(p.rect[3], 40))]
+            lines = self.content_lines(self.subject, max(p.rect[3], 40))
         else:
-            p.scroll_only = True
-            p.rows = [Row(t) for t in wrap(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))]
+            lines = wrap(self.answer or "(no answer yet — press a)", max(p.rect[3], 40))
+        p.scroll_only = True
+        rows, in_code = [], False
+        for t in lines:
+            if re.match(r"https?://\S+$", t):
+                rows.append(Row(t, kind="url"))
+                continue
+            fence = t.lstrip().startswith("```")
+            rows.append(Row(t, kind="md_code" if (in_code or fence) else "md"))
+            if fence:
+                in_code = not in_code
+        p.rows = rows
 
     def content_lines(self, nid, width):
         n = self.g.nodes.get(nid) if nid else None
@@ -3021,7 +3111,7 @@ class Tui:
                     if ch in ("\n", "\r"):
                         return text.strip()
                     if ch == "\x1b":
-                        return ""
+                        return None
                     if ch in ("\x7f", "\b"):
                         if buf:
                             buf.pop()
@@ -3038,7 +3128,37 @@ class Tui:
             c.curs_set(0)
 
     def prompt_line(self, label, maxlen=400):
-        return self.popup_prompt(label)
+        return self.popup_prompt(label) or ""
+
+    def mark(self):
+        """m: mark the selection for my next work, with a note; on a marked row: edit / done / remove."""
+        nid = self.subject or self.item
+        n = self.g.nodes.get(nid) if nid else None
+        if not n or n.kind not in ("item", "comment"):
+            self.msg = "select an issue, PR or comment first"
+            return
+        label = self.g.label_num(n) if n.kind == "item" else f"comment by @{n.author} on {self.g.label_num(self.g.nodes[n.parent])}"
+        e = self.marked(nid)
+        if e is None:
+            note = self.popup_prompt(f"mark {label} — my note (Enter = none, Esc = cancel): ")
+            if note is None:
+                return
+            self.todo.append(todo_entry(self.g, nid, note))
+            path = save_todo(self.todo)
+            self.msg = f"marked {label} → {path.replace(os.path.expanduser('~'), '~')}"
+        else:
+            choice = self.popup_menu(f"{label} is marked: {e.get('note') or '(no note)'}",
+                                     [("edit the note", "edit"), ("mark done", "done"), ("remove the mark", "remove"), ("cancel", None)])
+            if choice == "edit":
+                e["note"] = self.popup_prompt("note: ", e.get("note") or "")
+            elif choice == "done":
+                e["done"] = True
+            elif choice == "remove":
+                self.todo.remove(e)
+            else:
+                return
+            self.msg = f"todo updated → {save_todo(self.todo).replace(os.path.expanduser('~'), '~')}"
+        self.refresh_all()
 
     def confirm(self, question):
         return self.popup_menu(question, [("yes", True), ("no", False)], cur=1) is True
@@ -3309,13 +3429,13 @@ class Tui:
             self.put(by + 1 + pos, bx + bw - 1, "┃" if self.border != BORDERS["hidden"] else "|", attr | c.A_BOLD)
 
     HINTS = {
-        "home": "⏎ open item  [ ] section  / search  a ask  o browser  u view-as",
+        "home": "⏎ open item  m mark  [ ] section  / search  a ask  o browser  u view-as",
         "links": "⏎ go to item  / search  a ask  o browser",
-        "comments": "⏎ read in main  / search  a ask  o browser",
+        "comments": "⏎ read in main  m mark  / search  a ask  o browser",
         "people": "⏎ view as this person  a ask  o browser",
         "main": "[ ] content / answer  i translate  a ask  K J scroll  o browser",
         "repo": "r refetch  c t s p h toggles  T theme  $ tokens",
-        "item": "⏎ read in main  i translate  a ask  o browser  d details",
+        "item": "⏎ read in main  m mark  i translate  a ask  o browser  d details",
     }
 
     def draw(self):
@@ -3520,6 +3640,7 @@ class Tui:
         ("*", "+ _", "screen mode normal / half / full", ord("+")),
         ("*", "a", "ask claude about the selection", ord("a")),
         ("*", "i", "translate the main content in full (toggle original / translation)", ord("i")),
+        ("*", "m", "mark for my next work (with a note) / edit, done, remove", ord("m")),
         ("*", "d", "details", ord("d")), ("*", "o", "open in the browser", ord("o")),
         ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Home as another person", ord("u")),
         ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
@@ -3588,15 +3709,18 @@ class Tui:
         # ---- panels ----
         if ord("1") <= k <= ord("6"):
             self.focus = self.SIDE[k - ord("1")]
+            self.update_subject()
             return True
         if k == ord("0"):
             self.focus = "main"
             return True
         if k == 9:
             self.cycle_focus(1)
+            self.update_subject()
             return True
         if k == c.KEY_BTAB:
             self.cycle_focus(-1)
+            self.update_subject()
             return True
         if k in (ord("["), ord("]")) and p.tabs:
             p.tab = (p.tab + (1 if k == ord("]") else -1)) % len(p.tabs)
@@ -3655,6 +3779,8 @@ class Tui:
             self.forward()
         elif k == ord("a"):
             self.ask()
+        elif k == ord("m"):
+            self.mark()
         elif k == ord("i"):
             self.translate_content()
         elif k == ord("d"):
@@ -3767,6 +3893,67 @@ def do_show(id_, repos=None, state="open", max_age_min=15, refresh=False, transl
 
 
 # --------------------------------------------------------------------------
+# todo: marks made in the tui (m) -> todo.json (source) + a markdown file for the next session
+# --------------------------------------------------------------------------
+TODO_JSON = os.path.expanduser("~/.config/gitgraph/todo.json")
+
+
+def load_todo():
+    try:
+        with open(TODO_JSON) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def todo_md_path():
+    return os.path.expanduser(cfg("todo_file"))
+
+
+def render_todo_md(entries):
+    lines = ["# gg todo", "",
+             "Marks made in `gg tui` with `m` (source: ~/.config/gitgraph/todo.json; `gg todo` prints this file).",
+             "Each entry: the issue/PR, the comment it was marked on (if any) and my note. `[x]` = done.", ""]
+    by_repo = {}
+    for e in entries:
+        by_repo.setdefault(e["repo"], []).append(e)
+    for repo, es in by_repo.items():
+        lines += [f"## {repo}", ""]
+        for e in sorted(es, key=lambda e: (e.get("done", False), e["created"]), reverse=False):
+            box = "[x]" if e.get("done") else "[ ]"
+            lines.append(f"- {box} {e['created'][:10]} {e['item_num']} {e['title']} — {e['url']}")
+            if e.get("comment_url"):
+                lines.append(f"  - comment by @{e['comment_author']} {e['comment_when']}: {e['comment_text']} — {e['comment_url']}")
+            if e.get("note"):
+                lines.append(f"  - note: {e['note']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def save_todo(entries):
+    os.makedirs(os.path.dirname(TODO_JSON), exist_ok=True)
+    with open(TODO_JSON, "w") as f:
+        json.dump(entries, f, ensure_ascii=False, indent=1)
+    p = todo_md_path()
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    with open(p, "w") as f:
+        f.write(render_todo_md(entries))
+    return p
+
+
+def todo_entry(g, nid, note):
+    n = g.nodes[nid]
+    item = g.nodes[n.parent] if n.kind == "comment" else n
+    e = {"id": f"{int(time.time() * 1000)}", "created": datetime.now().isoformat(timespec="minutes"),
+         "repo": item.repo, "item": item.id, "item_num": g.label_num(item), "title": item.title or "",
+         "url": item.url or "", "note": note, "done": False}
+    if n.kind == "comment":
+        e.update({"comment": n.id, "comment_url": n.url or "", "comment_author": n.author, "comment_when": rel_days(n, g),
+                  "comment_text": n.summary or excerpt(n.body, 160)})
+    return e
+
+
+# --------------------------------------------------------------------------
 # self-update
 # --------------------------------------------------------------------------
 def _run(cmd, **kw):
@@ -3829,7 +4016,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?", default="graph",
                     help="graph (default) | ROOT (777 / #777 / owner/repo#777 / @login) | tui [ROOT] | show ID | "
-                         "ask ID \"question\" | update | config [KEY [VALUE]]")
+                         "ask ID \"question\" | update | config [KEY [VALUE]] | todo")
     ap.add_argument("arg", nargs="?", help="ID for show|ask / initial root for tui")
     ap.add_argument("question", nargs="?", help="ask: the question")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
@@ -3866,12 +4053,20 @@ def main(argv=None):
         THEME = a.theme
     if a.user:
         ME[:] = [a.user.lstrip("@").lower()]
-    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config") and ROOT_RE.match(a.cmd):
+    if a.cmd not in ("graph", "tui", "show", "ask", "update", "config", "todo") and ROOT_RE.match(a.cmd):
         a.root, a.cmd = a.cmd, "graph"   # `gg 777`
     if a.cmd == "update":
         return update()
     if a.cmd == "config":
         return config_cmd([x for x in (a.arg, a.question) if x is not None] + (a.extra or []))
+    if a.cmd == "todo":
+        entries = load_todo()
+        if not entries:
+            print(f"nothing marked yet (press m in gg tui). file: {todo_md_path()}")
+            return 0
+        print(render_todo_md(entries), end="")
+        print(f"\n<!-- {todo_md_path()} -->")
+        return 0
     if a.cmd == "tui":
         try:
             repos = resolve_repos(a.repo, interactive=True)
