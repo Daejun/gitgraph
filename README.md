@@ -58,7 +58,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `tr_model` · `ask_model` | `GITGRAPH_TR_MODEL` · `GITGRAPH_ASK_MODEL` | `haiku` · `sonnet` | models (real `claude` only) |
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
-| `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.33` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
+| `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
 | `theme` | `GITGRAPH_THEME` | `dark` | colour theme, like vim's `bg=`: `dark` (256 colours), `light` (darker tones for a light background), `basic` (8 colours, no dim, no dark blue — PuTTY and other plain terminals). `--theme` for one run, `T` in the TUI to cycle |
 
 ## Line format
@@ -117,13 +117,13 @@ lazygit-style layout: a side column of panels (Repo · Item · Home · Links · 
 |---|---|---|
 | 1 Repo | repo, open count, fetch time, "me", toggles, token usage | – |
 | 2 Item | the current item: title, metadata, `» one-line summary` (or the first line of its body), comment/link counts, URL | read it in main |
-| 3 Home | one section at a time (`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — same rules as before ("my turn" = items I am in where someone else spoke last, `--days N` window, "me" = gh accounts / `-u` / `u`). In my turn / active / waiting / PRs rows the cursor previews the **latest comment** (that is why main shows a comment there) | make it the **current item** — Item, Links, Comments and People follow |
-| 4 Links | every edge of the current item and its comments: `→ refs`, `← cited-by`, `→ closes`, `← closed-by` (via which comment). Under each link a `↳` note says **why**: the sentence in which the reference was made, or — when there is no such text (references recorded only by GitHub's timeline, closed items) — a one-line summary of that issue/PR (`» …`, made by the same summarizer as comments once its body has been fetched; `» summarizing…` while pending) | go to that item; on a comment row: its item, with the cursor on that comment (back with `b`/Esc) |
-| 5 Comments | the current item's comments `+Nd o @who » summary` | read it in main |
-| 6 People | author, commenters and mentioned people of the current item | view Home as that person |
+| 3 Home | one section at a time (`[` `]`): my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — same rules as before ("my turn" = items I am in where someone else spoke last, `--days N` window, "me" = gh accounts / `-u` / `u`). In my turn / active / waiting / PRs rows the cursor previews the **latest comment** (that is why main shows a comment there); my turn rows say why it is on me: `⟵ @who mentioned me +5d ·`, `commented on my PR`, `replied after me` | make it the **current item** — Item, Links, Comments and People follow |
+| 4 Links | every edge of the current item and its comments: `→ refs`, `← cited-by`, `→ closes`, `← closed-by` (via which comment). Under each link a `↳` note says **why**, briefly: a one-line reason written by the summarizer from the sentence that made the reference (e.g. `충돌 여부를 확인한 관련 PR`; a short quote around `#N` until it arrives, or when summaries are off), or — when there is no such text (references recorded only by GitHub's timeline, closed items) — a one-line summary of that issue/PR (`» …`, made by the same summarizer as comments once its body has been fetched; `» summarizing…` while pending) | go to that item; on a comment row: its item, with the cursor on that comment (back with `b`/Esc) |
+| 5 Comments | the current item's comments `+Nd o @who » summary`, newest on top | read it in main |
+| 6 People | author, commenters and mentioned people of the current item, most recently active first | view Home as that person |
 | 0 Main | tabs (`[` `]`): **content** = full text of the row under the cursor in the focused side panel (URL first, underlined; body + metadata, or a comment) — it stays put while main itself is focused; **answer** = the last `a` question | – |
 
-Layout: side column `side_width` (0.33) of the screen; the focused side panel is taller (`expand_focused`, `expanded_weight`) and stays that way while main is focused, so the next pick is easy; `+`/`_` cycle screen modes normal → half (the focused panel fills its column) → full (only that panel); narrow terminals (≤ 84 columns) stack the focused side panel above the main panel; borders `border` (rounded · single · double · bold · hidden). Translation and summaries run in the background for the visible rows first (`batch` per call); `» summarizing…` marks a pending one.
+Layout: side column `side_width` (0.4) of the screen; titles are truncated to what fits and re-fitted whenever the widths change (drag, resize, screen mode); the focused side panel is taller (`expand_focused`, `expanded_weight`) and stays that way while main is focused, so the next pick is easy; `+`/`_` cycle screen modes normal → half (the focused panel fills its column) → full (only that panel); narrow terminals (≤ 84 columns) stack the focused side panel above the main panel; borders `border` (rounded · single · double · bold · hidden). Translation and summaries run in the background for the visible rows first (`batch` per call); `» summarizing…` marks a pending one.
 
 | key | action |
 |---|---|
@@ -140,7 +140,7 @@ Layout: side column `side_width` (0.33) of the screen; the focused side panel is
 | `c` `t` `s` `p` `h` | comments mode · translation · summaries · people nodes · hops 1/2/3 |
 | `/` `n` `N` · `T` · `$` · `q` | search in the focused panel · colour theme · token usage · quit |
 | `?` · `O` · F1 | key menu for the focused panel (Enter runs the action) · options menu (comments / translation / summaries / people / hops / theme / screen) · full help text |
-| mouse | click = focus + select; double-click = Enter (on `▾/▸` in the tree: fold); wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
+| mouse | click = focus + select; click a URL line = open it in the browser; double-click = Enter; wheel = scroll that panel without moving the cursor; back/forward buttons; drag the border between the side column and main to resize (`gg config side_width` keeps it) |
 
 Prompts (`a`, `/`, `u`), menus (`?`, `O`), confirmations (`r`) and text (`d`, `$`, F1) open as centred popups; Esc closes them.
 

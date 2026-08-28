@@ -23,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.6.2"
+VERSION = "0.6.4"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -41,7 +41,7 @@ CONFIG_KEYS = {
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
-    "side_width": ("GITGRAPH_SIDE_WIDTH", "0.33", "tui: fraction of the width for the side column"),
+    "side_width": ("GITGRAPH_SIDE_WIDTH", "0.4", "tui: fraction of the width for the side column"),
     "expand_focused": ("GITGRAPH_EXPAND_FOCUSED", "true", "tui: give the focused side panel more height (accordion)"),
     "expanded_weight": ("GITGRAPH_EXPANDED_WEIGHT", "2", "tui: how much taller the focused side panel is"),
     "screen_mode": ("GITGRAPH_SCREEN_MODE", "normal", "tui: normal | half | full (+ / _ cycle at runtime)"),
@@ -934,6 +934,79 @@ def translate_body(n, g, lang=TR_LANG):
     return out
 
 
+WHY_PROMPT = """Each entry below is a sentence from a GitHub issue, pull request or comment that mentions another item, \
+given as "ref" (like #748). For each entry write, in {lang}, a phrase of at most 40 characters that says WHY that item \
+is mentioned — e.g. "충돌 여부를 확인한 관련 PR", "이 버그를 고치는 PR", "같은 증상을 보고한 issue", "재현 절차 출처". \
+Keep #numbers, identifiers and technical terms in English; never use Chinese characters. \
+Output ONLY a JSON array of strings, same length and order as the input, no code fence.
+
+{payload}"""
+
+
+def around(ctx, ref, n=40):
+    """The part of ctx within n characters of the first occurrence of ref (a short quote for narrow panels)."""
+    i = ctx.find(ref)
+    if i < 0:
+        return trunc(ctx, 2 * n)
+    a, b = max(0, i - n), min(len(ctx), i + len(ref) + n)
+    return ("…" if a else "") + ctx[a:b].strip() + ("…" if b < len(ctx) else "")
+
+
+def summarize_whys(entries, lang=TR_LANG):
+    """entries: [(key, {"ref":..., "sentence":...})] -> key -> phrase; cached in whys.json."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    p = os.path.join(CACHE_DIR, "whys.json")
+    cache = {}
+    if os.path.exists(p):
+        with open(p) as f:
+            cache = json.load(f)
+    out, need = {}, []
+    for k, d in entries:
+        if f"{lang}:{k}" in cache:
+            out[k] = cache[f"{lang}:{k}"]
+        else:
+            need.append((k, d))
+    for i in range(0, len(need), 40):
+        batch = need[i:i + 40]
+        log(f"explaining {len(batch)} links in {lang} via {model_label(TR_MODEL)}")
+        progress("summarize", i, len(need), f"link reasons, batch of {len(batch)}")
+        try:
+            arr = claude_json(WHY_PROMPT.format(lang=lang, payload=json.dumps([d for _, d in batch], ensure_ascii=False)),
+                              len(batch), phase="summarize")
+        except Exception as e:  # noqa: BLE001
+            log(f"link reasons failed: {e}")
+            break
+        for (k, _), txt in zip(batch, arr):
+            if isinstance(txt, str) and txt.strip():
+                cache[f"{lang}:{k}"] = txt.strip()
+                out[k] = txt.strip()
+        with open(p, "w") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    return out
+
+
+def prepare_whys(g, pairs):
+    """pairs: [(src id, dst id)] with a sentence in g.ctx -> fill g.why. Returns the number explained."""
+    entries, keys = [], {}
+    for src, dst in pairs:
+        ctx = g.ctx.get((src, dst))
+        if not ctx or (src, dst) in g.why:
+            continue
+        dn = g.nodes.get(dst)
+        ref = g.label_num(dn) if dn else dst
+        k = hashlib.sha1(f"{ref}|{ctx}".encode("utf-8")).hexdigest()
+        keys.setdefault(k, []).append((src, dst))
+        if len(entries) < len(keys):
+            entries.append((k, {"ref": ref, "sentence": ctx}))
+    if not entries:
+        return 0
+    res = summarize_whys(entries)
+    for k, txt in res.items():
+        for pair in keys[k]:
+            g.why[pair] = txt
+    return len(res)
+
+
 def prepare_summaries(g):
     """Attach a one-line summary to every comment and item node of g that has a body. Returns the count."""
     g.summarized = 0
@@ -1075,6 +1148,7 @@ class Graph:
         self.translated = 0
         self.summarized = 0
         self.ctx = {}            # (src node id, dst item id) -> sentence in which src references dst
+        self.why = {}            # (src node id, dst item id) -> one-line reason (claude), see prepare_whys
 
     def item_id(self, repo, number):
         return f"{repo}#{number}"
@@ -1216,7 +1290,7 @@ def apply_filters(g, comments="linked", people=True, closed_neighbors=True):
     h = Graph(g.primary)
     h.fetched_at = g.fetched_at
     h.show_linked = comments != "none"
-    h.ctx = g.ctx
+    h.ctx, h.why = g.ctx, g.why
     keep = set(g.nodes)
     if not people:
         keep -= {i for i, n in g.nodes.items() if n.kind == "person"}
@@ -1291,7 +1365,7 @@ def focus(g, root, hops):
 
 def subgraph(g, ids):
     h = Graph(g.primary)
-    h.fetched_at, h.show_linked, h.ctx = g.fetched_at, g.show_linked, g.ctx
+    h.fetched_at, h.show_linked, h.ctx, h.why = g.fetched_at, g.show_linked, g.ctx, g.why
     h.nodes = {i: g.nodes[i] for i in ids}
     h.edges = {e for e in g.edges if e[0] in ids and e[1] in ids}
     h.finalize()
@@ -1542,6 +1616,9 @@ def segments(row, g):
         if m3:
             segs.append((m3.group(0), style))
             t = t[m3.end():]
+        if t.startswith("⟵ ") and " · " in t:
+            why, t = t.split(" · ", 1)
+            segs.append((why + " · ", "in"))
         i = t.find("  ")
         if i >= 0:
             segs.append((t[:i], "stub" if n.stub else ""))
@@ -2031,7 +2108,7 @@ HELP = """gg tui — lazygit style layout
   u               view Home as another person       r  refetch from GitHub
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
-  mouse           click = focus panel + select; double-click = Enter;
+  mouse           click = focus panel + select; double-click = Enter; click a URL line = open it in the browser;
                   wheel = scroll that panel without moving the cursor; back/forward buttons;
                   drag the border between the side column and main to resize (gg config side_width keeps it)
   O               options menu (comments / translation / summaries / people / hops / theme / screen)
@@ -2135,7 +2212,7 @@ class Tui:
         self.tr_thread, self.tr_pending = None, None
         self.collapsed = set()
         self.focus, self.screen = "home", cfg("screen_mode") if cfg("screen_mode") in ("normal", "half", "full") else "normal"
-        self.side_width = float(cfg("side_width") or 0.33)
+        self.side_width = float(cfg("side_width") or 0.4)
         self.expand_focused = cfg("expand_focused").lower() not in ("false", "0", "no", "")
         self.expanded_weight = float(cfg("expanded_weight") or 2)
         self.border = BORDERS.get(cfg("border"), BORDERS["rounded"])
@@ -2261,7 +2338,13 @@ class Tui:
         self.cg = apply_filters(self.g, self.o["comments"], self.o["people"], self.o["closed_neighbors"])
 
     # ------------------------------------------------------------------ rows for each panel
+    def label_w(self):
+        """Title/excerpt width for side-panel rows: what fits after date, number, tags and author."""
+        w = self.panels["home"].rect[3] or int(self.scr.getmaxyx()[1] * self.side_width) - 2
+        return max(24, w - 24)
+
     def refresh_all(self, keep=True):
+        self.o["width"] = self.label_w()
         self.panels["repo"].rows = self.repo_rows()
         self.panels["home"].set_rows(self.home_rows(), keep)
         self.panels["links"].set_rows(self.links_rows(), keep)
@@ -2321,9 +2404,26 @@ class Tui:
             return (n.author or "").lower() in me or any((c.author or "").lower() in me for c in g.comments_of(n.id)) \
                 or mentions_me(n) is not None
 
-        def item_row(n, src=None):
+        def my_turn_reason(n, lc):
+            """Why this item is on me: what the last comment did relative to me."""
+            who, when = f"@{lc.author}", rel_days(lc, g)
+            if any(t == "mention" and o and m[1:].lower() in me for m, t, o in g.adj[lc.id]):
+                return f"{who} mentioned me {when}"
+            if (n.author or "").lower() in me:
+                return f"{who} commented on my {'PR' if n.is_pr else 'issue'} {when}"
+            if any((c.author or "").lower() in me for c in g.comments_of(n.id)):
+                return f"{who} replied after me {when}"
+            return f"{who} commented (I was mentioned) {when}"
+
+        def item_row(n, src=None, reason=None):
             deg = item_degree(cg, n.id) if n.id in cg.nodes else 0
-            r = Row(item_label(g, n, w) + (f"  ⇢ {deg}" if deg else ""), n.id)
+            if reason:
+                head = item_label(g, n, w, with_meta=False).split(" ", 1)
+                label = f"{head[0]} {head[1].split(' ', 2)[0]} {head[1].split(' ', 2)[1]} ⟵ {reason} · " + \
+                        trunc(n.tr_title or n.title, w)
+            else:
+                label = item_label(g, n, w)
+            r = Row(label + (f"  ⇢ {deg}" if deg else ""), n.id)
             if src is not None and src.kind == "comment":
                 what = (("» " + trunc(src.summary, w)) if src.summary else
                         ("\"" + (trunc(src.tr_excerpt, w) if src.tr_excerpt else excerpt(src.body, w)) + "\""))
@@ -2349,7 +2449,7 @@ class Tui:
         waiting.sort(key=lambda x: -(x[1].time if x[1] else x[0].time))
         mentioned = sorted(((n, mentions_me(n)) for n in items if mentions_me(n)), key=lambda x: -x[1].time)
         return {
-            "turn": [item_row(n, lc) for n, lc in my_turn],
+            "turn": [item_row(n, lc, my_turn_reason(n, lc)) for n, lc in my_turn],
             "mention": [item_row(n, src) for n, src in mentioned],
             "opened": [item_row(n) for n in opened],
             "active": [item_row(n, last_comment(n)) for n in active],
@@ -2381,24 +2481,35 @@ class Tui:
                 if (m, t, o) in seen:
                     continue
                 seen.add((m, t, o))
-                edges.append((order[t], not o, g.nodes[m].time, src, m, t, o))
+                edges.append((order[t], not o, -g.nodes[m].time, src, m, t, o))   # newest first within a type
+        self.link_pairs = []
         for _, _, _, src, m, t, o in sorted(edges):
             n = g.nodes[m]
             via = "" if src.kind == "item" else f" (via {rel_days(src, g)} comment)"
             rows.append(Row(EDGE_LABEL[(t, o)] + node_label(g, n, w) + via, m))
             rows.append(Row("   ↳ " + self.link_note(src, n, t, o), m, kind="note"))
+            if t != "closes":
+                self.link_pairs.append(self.link_pair(src, n, o))
         return rows or [Row("(no links)", kind="head")]
 
+    def link_pair(self, src, n, o):
+        """(src, dst) key of the sentence behind a link row: outgoing = src references n, incoming = n references us."""
+        return (src.id, n.id) if o else (n.id, self.item)
+
     def link_note(self, src, n, t, o):
-        """Why this link exists: the sentence that made the reference, else a one-line summary of the other item."""
+        """Why this link exists, briefly: claude's one-line reason, else a short quote around the reference,
+        else a one-line summary of the other item."""
         g = self.g
         if t == "closes":
-            return "PR closes the issue (closingIssuesReferences)" if o else "closed by this PR"
-        ctx = g.ctx.get((src.id, n.id)) if o else None
-        if not o:      # incoming: the other side (n, an item or a comment) references our item
-            ctx = g.ctx.get((n.id, self.item))
+            return "PR closes the issue" if o else "closed by this PR"
+        pair = self.link_pair(src, n, o)
+        ctx = g.ctx.get(pair)
         if ctx:
-            return f"\"{ctx}\""
+            why = g.why.get(pair)
+            if why:
+                return why
+            ref = g.label_num(g.nodes[pair[1]]) if pair[1] in g.nodes else ""
+            return f"\"{around(ctx, ref)}\"" + ("  (» …)" if self.o["summary"] and pair in getattr(self, "why_pending", set()) else "")
         if n.kind == "comment":
             return "» " + n.summary if n.summary else ("» " + PENDING_TEXT if n.summary_pending else excerpt(n.body, 120))
         if n.summary:
@@ -2411,7 +2522,7 @@ class Tui:
         if not self.item:
             return [Row("(no current item)", kind="head")]
         g, w = self.g, self.o["width"]
-        cs = g.comments_of(self.item)
+        cs = list(reversed(g.comments_of(self.item)))     # newest on top
         rows = [Row(comment_label(g, c, w, show_item=False), c.id) for c in cs]
         return rows or [Row("(no comments)", kind="head")]
 
@@ -2436,8 +2547,11 @@ class Tui:
             for m, t, o in g.adj[src.id]:
                 if t == "mention" and o:
                     add(m[1:], "mentioned")
+        last = {}
+        for c in g.comments_of(self.item):
+            last[c.author] = max(last.get(c.author, 0), c.time)
         rows = []
-        for login, rs in roles.items():
+        for login, rs in sorted(roles.items(), key=lambda kv: -last.get(kv[0], n.time if kv[0] == n.author else 0)):
             pid = next((k for k in g.nodes if k.lower() == "@" + login.lower()), None)
             rows.append(Row(f"@{login}  {', '.join(rs)}", pid or f"@{login}"))
         return rows
@@ -2650,7 +2764,10 @@ class Tui:
             for r in p.rows:
                 add(r.nid)
         ids = set(ids[:ENRICH_BATCH])
-        if not ids:
+        whys = [pr for pr in getattr(self, "link_pairs", []) if pr in self.g.ctx and pr not in self.g.why
+                and pr not in self.enriched] if want_sum else []
+        whys = whys[:ENRICH_BATCH]
+        if not ids and not whys:
             return
         parents = {self.g.nodes[i].parent for i in ids if self.g.nodes[i].kind == "comment"} - {None}
         sub = subgraph(self.g, ids | parents)
@@ -2660,18 +2777,23 @@ class Tui:
         for n in pending:
             n.summary_pending = True
 
+        self.why_pending = set(whys)
+
         def work():
             try:
                 prepare_translations(sub, mode)
                 if want_sum:
                     prepare_summaries(sub)
+                if whys:
+                    prepare_whys(self.g, whys)
             finally:
                 for n in pending:
                     n.summary_pending = False
+                self.why_pending = set()
 
-        self.enriched |= ids
+        self.enriched |= ids | set(whys)
         self.worker = self.run_bg(work)
-        if pending:
+        if pending or whys:
             self.refresh_all()
 
     # ------------------------------------------------------------------ actions
@@ -3176,6 +3298,11 @@ class Tui:
         scr.erase()
         h, w = scr.getmaxyx()
         self.layout()
+        widths = tuple(self.panels[k].rect[3] for k in self.SIDE + ["main"])
+        if widths != getattr(self, "_widths", None):
+            self._widths = widths
+            self.refresh_all()          # "…" truncation follows the new panel widths
+            self.layout()
         for key in self.visible:
             self.draw_box(key)
         for key in self.SIDE:                         # collapsed title bars in the tiny layout
@@ -3294,6 +3421,17 @@ class Tui:
         self.focus = key
         idx = self.click_row(key, y)
         self.update_subject()
+        p = self.panels[key]
+        ridx = p.top + (y - p.rect[0])
+        if 0 <= y - p.rect[0] < p.rect[2] and ridx < len(p.rows) and p.rows[ridx].kind == "url":
+            url = p.rows[ridx].text.strip()
+            if url.startswith("http"):
+                try:
+                    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self.msg = f"opened {url}"
+                except OSError as e:
+                    self.msg = f"cannot open browser: {e}"
+                return
         now = time.time()
         if now - self.last_click[0] < 0.4 and self.last_click[1] == idx and self.last_click[2] == key:
             self.last_click = (0.0, -1, "")
