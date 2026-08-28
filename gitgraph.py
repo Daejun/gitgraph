@@ -29,7 +29,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.11.3"
+VERSION = "0.12.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2453,7 +2453,9 @@ HELP = """gg tui — lazygit style layout
                   Home has a "todo" section, and ~/gitgraph-todo.md (gg config todo_file) is rewritten for the
                   next session (also `gg todo`). m again on a marked row: edit the note / mark done / remove
   Esc / b         back (previous item and perspective)     f  forward
-  u               view Inbox as another person      r  refetch from GitHub
+  u               view Inbox as another person
+  r / R           refresh from GitHub in the background: r = only what changed (also automatic every --max-age
+                  minutes), R = everything
   F2              guided tour of the screen (also: gg tutorial)
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
@@ -2611,6 +2613,7 @@ class Tui:
         self.title_zones = {}              # panel -> [(x0, x1, action)] clickable parts of its title bar
         self.msg, self.answer = "", None
         self.progress, self.worker, self.t0, self.bg_error = None, None, time.time(), None
+        self.last_refresh, self._new_g = time.time(), None
         self.enriched = set()
         self.ask_thread, self.ask_state = None, None
         self.mouse_ev, self.last_click = None, (0.0, -1, "")
@@ -2726,6 +2729,35 @@ class Tui:
                 save_config()
         if self.o.get("start_tour"):
             self.tutorial()
+
+    def refresh_bg(self, full=False):
+        """r: fetch what changed on GitHub in the background and swap the graph in when done (R: everything)."""
+        if self.busy():
+            self.msg = "busy — try again in a moment"
+            return
+        repos, state, max_age = self.o["repos"], self.o["state"], self.o["max_age_min"]
+
+        def work():
+            changed = 0
+            for repo in repos:
+                if full or state != "open":
+                    load_items(repo, state, 0, refresh=True)
+                else:
+                    p = _cache_path("items", repo, state)
+                    d = read_json(p)
+                    if d is None:
+                        load_items(repo, state, 0, refresh=True)
+                        continue
+                    items, n_changed, n_dropped = refresh_items(repo, d["items"])
+                    write_json(p, {"fetched_at": time.time(), "repo": repo, "state": state, "items": items})
+                    changed += n_changed + n_dropped
+            self._new_g = build_graph(repos, state, max_age)
+            self._refresh_note = "full refetch done" if full else f"refreshed: {changed} changed"
+
+        self._new_g = None
+        self.progress = {"phase": "fetch", "done": 0, "total": None, "detail": "checking GitHub for changes"}
+        self.worker = self.run_bg(work)
+        self.last_refresh = time.time()
 
     def rebuild_graph(self):
         self.cg = apply_filters(self.g, self.o["comments"], self.o["people"], self.o["closed_neighbors"])
@@ -3918,7 +3950,7 @@ class Tui:
         "comments": "⏎ read in main  m mark  / search  a ask  o browser",
         "people": "⏎ view as this person  a ask  o browser",
         "main": "[ ] content / answer  i translate  a ask  K J scroll  o browser",
-        "repo": "r refetch  c t s p h toggles  T theme  $ tokens",
+        "repo": "r refresh (changed only)  R refetch all  c t s p h toggles  T theme  $ tokens",
         "item": "⏎ read in main  m mark  i translate  a ask  o browser  d details",
     }
 
@@ -4272,7 +4304,8 @@ class Tui:
         ("*", "b f", "back / forward", ord("b")), ("*", "u", "view Inbox as another person", ord("u")),
         ("*", "F2", "guided tour of the screen", 0),
         ("*", "/", "search in this panel", ord("/")), ("*", "O", "options menu (toggles)", ord("O")),
-        ("*", "r", "refetch from GitHub", ord("r")), ("*", "T", "colour theme", ord("T")),
+        ("*", "r", "refresh what changed on GitHub (background)", ord("r")),
+        ("*", "R", "refetch everything", ord("R")), ("*", "T", "colour theme", ord("T")),
         ("*", "$", "token usage", ord("$")), ("*", "q", "quit", ord("q")),
         ("main", "K J", "scroll", ord("J")),
     ]
@@ -4293,7 +4326,7 @@ class Tui:
                  (f"theme: {THEME}  (cycle)", ord("T")),
                  (f"screen mode: {self.screen}  (cycle)", ord("+")),
                  (f"side width: {self.side_width:.2f}  (drag the border with the mouse; gg config side_width)", None),
-                 ("refetch from GitHub", ord("r"))]
+                 ("refresh what changed on GitHub", ord("r")), ("refetch everything", ord("R"))]
         code = self.popup_menu("options", items)
         if code is not None:
             self.handle_key(code)
@@ -4303,7 +4336,14 @@ class Tui:
         while True:
             if self.worker is not None and not self.worker.is_alive():
                 self.worker, self.progress = None, None
+                if getattr(self, "_new_g", None) is not None:      # a background refresh finished: swap the graph in
+                    self.g, self._new_g = self._new_g, None
+                    self.enriched = set()
+                    self.rebuild_graph()
+                    self.msg = getattr(self, "_refresh_note", "refreshed")
                 self.refresh_all()
+            if not self.busy() and time.time() - getattr(self, "last_refresh", self.t0) > self.o["max_age_min"] * 60:
+                self.refresh_bg()                                   # auto: every max-age minutes, incrementally
             if self.ask_thread is not None and not self.ask_thread.is_alive():
                 self.ask_thread = None
                 self.refresh_main()
@@ -4421,7 +4461,9 @@ class Tui:
             who = self.prompt_line("view as @login (empty = my gh accounts): ").lstrip("@")
             self.view_as([who] if who else (ME or [a.lower() for a in gh_accounts()]))
         elif k == ord("r"):
-            if self.confirm("Refetch everything from GitHub?"):
+            self.refresh_bg()
+        elif k == ord("R"):
+            if self.confirm("Refetch everything from GitHub (full, slow)?"):
                 self.load(refresh=True)
         elif k == ord("O"):
             self.options_menu()
