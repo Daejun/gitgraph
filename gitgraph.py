@@ -30,7 +30,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.20.0"
+VERSION = "0.20.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -48,7 +48,7 @@ CONFIG_KEYS = {
     "batch": ("GITGRAPH_BATCH", "10", "tui: nodes per translate/summary call"),
     "ai_parallel": ("GITGRAPH_AI_PARALLEL", "3", "tui: how many AI CLI calls may run at the same time"),
     "retries": ("GITGRAPH_RETRIES", "3", "gh api retries on transient network errors"),
-    "fetch_parallel": ("GITGRAPH_FETCH_PARALLEL", "6", "how many gh queries run at the same time when filling the cache"),
+    "fetch_parallel": ("GITGRAPH_FETCH_PARALLEL", "8", "how many gh queries run at the same time when filling the cache"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
     "todo_file": ("GITGRAPH_TODO", "~/gitgraph-todo.md", "markdown written from the marks made with m in the tui (for the next session)"),
     "side_width": ("GITGRAPH_SIDE_WIDTH", "0.4", "tui: fraction of the width for the side column"),
@@ -471,8 +471,11 @@ def gh_token(user, host=DEFAULT_HOST):
     return tok
 
 
+# Bare "502|503|504" used to be in here, which made any error mentioning such a number transient —
+# "Could not resolve to an issue or pull request with the number of 4503" then cost 2+4+8s of retries.
 TRANSIENT_RE = re.compile(r"TLS handshake timeout|connection reset|i/o timeout|timeout|EOF|"
-                          r"temporarily unavailable|no such host|HTTP 5\d\d|502|503|504", re.I)
+                          r"temporarily unavailable|no such host|HTTP 5\d\d|"
+                          r"bad gateway|service unavailable|server error", re.I)
 GH_RETRIES = int(cfg("retries"))
 
 
@@ -672,7 +675,7 @@ query($owner:String!,$name:String!,$after:String,$states:[PullRequestState!]) {
 """
 ITEM_BATCH = 10             # numbers per query when only a few items changed
 MAX_ITEM_BATCH = 25         # cold start: how many may share one query (bigger = fewer `gh` processes)
-FETCH_PARALLEL = max(1, int(cfg("fetch_parallel") or 6))   # concurrent `gh api graphql` queries
+FETCH_PARALLEL = max(1, int(cfg("fetch_parallel") or 8))   # concurrent `gh api graphql` queries
 
 
 def list_open(repo):

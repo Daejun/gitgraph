@@ -292,6 +292,38 @@ class TestGitAccountHint(FetchCase):
         self.assertNotIn("test/repo", gg._pref_map().get("github.com", {}))
 
 
+class TestTransientDetection(unittest.TestCase):
+    """What counts as "worth retrying". Getting this wrong is expensive in both directions: a missed
+    transient error fails the fetch, and a false positive sleeps 2+4+8s for nothing."""
+
+    TRANSIENT = [
+        'Post "https://api.github.com/graphql": net/http: TLS handshake timeout',
+        "HTTP 502: Bad gateway (https://api.github.com/graphql)",
+        "HTTP 503: Service unavailable",
+        "read tcp 10.0.0.1:443: connection reset by peer",
+        "dial tcp: lookup api.github.com: no such host",
+        "unexpected EOF",
+        "The service is temporarily unavailable",
+    ]
+    NOT_TRANSIENT = [
+        # the one that started this: an issue number containing 502/503/504 is not a server error
+        "Could not resolve to an issue or pull request with the number of 4503.",
+        "Could not resolve to an issue or pull request with the number of 9017.",
+        "Could not resolve to a Repository with the name 'owner/name'.",
+        "GraphQL: Resource not accessible by integration",
+        "gh: Not Found (HTTP 404)",
+    ]
+
+    def test_real_network_trouble_is_retried(self):
+        for msg in self.TRANSIENT:
+            self.assertTrue(gg.TRANSIENT_RE.search(msg), msg)
+
+    def test_ordinary_api_errors_are_not_retried(self):
+        for msg in self.NOT_TRANSIENT:
+            m = gg.TRANSIENT_RE.search(msg)
+            self.assertIsNone(m, f"{msg!r} matched {m.group(0)!r}" if m else msg)
+
+
 class TestRetries(FetchCase):
     def setUp(self):
         super().setUp()

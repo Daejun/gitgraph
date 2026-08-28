@@ -66,7 +66,7 @@ Options: `-r owner/name` · `-u LOGIN` (view as that person in the TUI home; onl
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: nodes per translate/summary call (split in halves across jobs) |
 | `ai_parallel` | `GITGRAPH_AI_PARALLEL` | `3` | TUI: how many AI CLI calls run at the same time (summaries, title translations, link reasons; long bodies are translated in parallel chunks) |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` retries on transient network errors |
-| `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `6` | how many `gh` queries run at the same time while filling the cache (first run, refresh). Each query is a `gh` process (~0.4s before any network), so this is what makes a cold start fast |
+| `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | how many `gh` queries run at the same time while filling the cache (first run, refresh). A round trip to GitHub costs ~0.4s whatever it asks for, so this is what makes a cold start fast; on a repo with hundreds of open items raising it to 12 is measurably quicker still |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (see below) |
 | `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | markdown written from the marks made with `m` |
 | `theme` | `GITGRAPH_THEME` | `dark` | colour theme, like vim's `bg=`: `dark` (256 colours), `light` (darker tones for a light background), `basic` (8 colours, no dim, no dark blue — PuTTY and other plain terminals). `--theme` for one run, `T` in the TUI to cycle |

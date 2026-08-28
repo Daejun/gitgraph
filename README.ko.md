@@ -66,7 +66,7 @@ gg update                 # 설치 갱신
 | `batch` | `GITGRAPH_BATCH` | `10` | TUI: 번역/요약 호출당 노드 수(job마다 절반씩) |
 | `ai_parallel` | `GITGRAPH_AI_PARALLEL` | `3` | TUI: 동시에 돌리는 AI CLI 호출 수(요약·제목 번역·링크 이유; 긴 본문 번역은 덩어리로 나눠 병렬) |
 | `retries` | `GITGRAPH_RETRIES` | `3` | `gh api` 일시 네트워크 오류 재시도 횟수 |
-| `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `6` | 캐시를 채울 때(첫 실행·갱신) 동시에 도는 `gh` 쿼리 수. 쿼리 하나가 `gh` 프로세스 하나(네트워크 전에 이미 ~0.4s)라 첫 실행 속도를 좌우한다 |
+| `fetch_parallel` | `GITGRAPH_FETCH_PARALLEL` | `8` | 캐시를 채울 때(첫 실행·갱신) 동시에 도는 `gh` 쿼리 수. GitHub 왕복 한 번이 무엇을 묻든 ~0.4s라 첫 실행 속도를 좌우한다. open 항목이 수백 개인 repo에서는 12로 올리면 더 빨라진다 |
 | `side_width` · `expand_focused` · `expanded_weight` · `screen_mode` · `border` | `GITGRAPH_SIDE_WIDTH` … | `0.4` · `true` · `2` · `normal` · `rounded` | TUI layout (아래 참조) |
 | `todo_file` | `GITGRAPH_TODO` | `~/gitgraph-todo.md` | `m`으로 표시한 것으로 만드는 markdown |
 | `theme` | `GITGRAPH_THEME` | `dark` | 색 테마, vim의 `bg=`처럼: `dark`(256색), `light`(밝은 배경용 진한 색), `basic`(8색, dim·진한 파랑 없음 — PuTTY 등). 한 번만 바꾸려면 `--theme`, TUI에서는 `T`로 순환 |
