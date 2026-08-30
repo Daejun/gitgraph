@@ -333,5 +333,36 @@ class TestGenericBackend(AiCase):
         self.assertEqual(gg.USAGE["input"], 0, "only claude reports tokens")
 
 
+
+class TestMcpSuppression(unittest.TestCase):
+    """A translation call must not boot the user's MCP servers; a review call must keep them."""
+
+    def argv_of(self, tools):
+        calls = []
+        orig = gg.subprocess.run
+
+        def spy(cmd, **kw):
+            calls.append(cmd)
+            raise FileNotFoundError()          # stop before any real spawn
+
+        gg.subprocess.run = spy
+        try:
+            gg._ai_call("p", "haiku", "translate", tools=tools)
+        except Exception:
+            pass
+        finally:
+            gg.subprocess.run = orig
+        return calls[0]
+
+    def test_a_text_only_call_shuts_mcp_off(self):
+        argv = self.argv_of(())
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn('{"mcpServers":{}}', argv)
+
+    def test_a_review_call_keeps_the_users_mcp(self):
+        argv = self.argv_of(("Read", "Grep"))
+        self.assertNotIn("--strict-mcp-config", argv)
+        self.assertIn("--allowedTools", argv)
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.27.1"
+VERSION = "0.27.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1212,15 +1212,18 @@ def _ai_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
         cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json", "--model", model]
         if tools:
             cmd += ["--allowedTools"] + list(tools)
+        else:
+            # a text-only call (translate / summarise / ask) needs no tools, but without this every one
+            # of them still spawns the user's MCP servers — a translation should not boot semcode.
+            # The review passes keep them on purpose: claude -p inheriting the user's MCP is what lets
+            # a kernel skill use semcode inside the worktree.
+            cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
         if cwd:
             cmd += ["--add-dir", cwd]
-        if tools or cwd:
-            # --allowedTools and --add-dir are variadic, so a prompt after them is swallowed as one of
-            # their values ("Input must be provided either through stdin or as a prompt argument").
-            # stdin also keeps a review prompt — a whole diff — clear of ARG_MAX.
-            stdin_text = prompt
-        else:
-            cmd.append(prompt)
+        # every variant of this command now ends in a variadic option (--allowedTools, --add-dir or
+        # --mcp-config), which would swallow a trailing prompt argument as one of its values — so the
+        # prompt always travels on stdin. That also keeps a review prompt (a whole diff) clear of ARG_MAX.
+        stdin_text = prompt
     elif kind == "codex":
         os.makedirs(CACHE_DIR, exist_ok=True)
         outfile = os.path.join(CACHE_DIR, f"codex_last_{os.getpid()}_{int(time.time() * 1000)}.txt")
@@ -5192,14 +5195,26 @@ class Tui:
                 return
             key = (f.fid, "tr")
             if key not in self.rv_tr:
-                self.msg = f"translating to {TR_LANG}…"
-                self.draw()
-                src = f"{f.title}\n\n{f.body}" + (f"\n\n{f.verdict_reason}" if f.verdict_reason else "")
-                try:
-                    self.rv_tr[key] = translate_text(src, "pull request")
-                except Exception as e:  # noqa: BLE001
-                    self.msg = f"translation failed: {str(e)[:120]}"
+                # in the background, like the browse-mode i: one call takes ~8s even warm (a whole
+                # claude -p process per call), and a blocked main loop shows no spinner and eats no keys
+                if key in getattr(self, "_tr_busy", set()):
+                    self.msg = f"still translating to {TR_LANG}…"
                     return
+                self._tr_busy = getattr(self, "_tr_busy", set()) | {key}
+                src = f"{f.title}\n\n{f.body}" + (f"\n\n{f.verdict_reason}" if f.verdict_reason else "")
+
+                def job():
+                    try:
+                        self.rv_tr[key] = translate_text(src, "pull request")
+                        self.msg = f"translation ready — i shows it"
+                    except Exception as e:  # noqa: BLE001
+                        self.msg = f"translation failed: {str(e)[:120]}"
+                    finally:
+                        self._tr_busy.discard(key)
+
+                self.run_bg(job, "translate")
+                self.msg = f"translating to {TR_LANG} in the background — i again when it is ready"
+                return
             self.msg = ""                    # do not leave "translating…" under a finished popup
             title, _, rest = self.rv_tr[key].partition("\n\n")
             body, _, verdict_tr = rest.partition("\n\n") if f.verdict_reason else (rest, "", "")
