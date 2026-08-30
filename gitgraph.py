@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.27.4"
+VERSION = "0.27.5"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -4736,6 +4736,7 @@ class Tui:
         self.rv, self.rv_path, self._new_rv = None, None, None
         self._told_review = False
         self.rv_folded, self.rv_checked, self.rv_tr = set(), set(), {}
+        self._tr_busy, self._tr_pop = set(), None
         self.mode_focus = {"browse": "home", "review": "rfiles"}
         self.review_files_width = float(cfg("review_files_width") or 0.22)
         self.review_findings_width = float(cfg("review_findings_width") or 0.30)
@@ -4989,9 +4990,10 @@ class Tui:
         pf = self.panels["rfind"]
         pf.set_rows(findings_rows(rv, FIND_TABS[pf.tab][0], vw, self.rv_checked), keep)
         pf.tabs = [t for _, t in FIND_TABS]
-        if rv.engine and not rv.verify:
+        if rv.engine and not rv.verify and FIND_TABS[pf.tab][0] in ("open", "posted", "ignored", "dropped"):
             # the disprove pass is the reason to trust a finding, so its absence is said where the
-            # decision is made — inside the current tab's brackets, not in a header read once
+            # decision is made — on the tab being read. Only on the findings tabs: changes and the
+            # GitHub threads are not findings and the label on them is noise.
             pf.tabs[pf.tab] += " · unverified"
         self.panels["rdiff"].title = "Diff  " + short_path(self.rv_path or "-", max(dwid - 12, 8))
 
@@ -5123,7 +5125,7 @@ class Tui:
         if k == ord("P"):
             self.post_findings_ui()
             return True
-        if k in (ord("d"), ord("i")) and self.focus in ("rfind", "rdiff") and self.review_finding():
+        if k in (ord("d"), ord("i")) and self.focus in ("rfind", "rdiff"):
             self.review_details(translate=k == ord("i"))
             return True
         if k == ord("V") and self.focus == "rfind":
@@ -5159,6 +5161,12 @@ class Tui:
             if url:
                 self.msg = f"copied {url} ({', '.join(copy_to_clipboard(url)) or 'no clipboard tool'})"
             return True
+        if k in (ord("a"), ord("m"), ord("b"), ord("f"), ord("u"), ord("c"), ord("p"), ord("h"),
+                 ord("t"), ord("s"), ord("O"), self.curses.KEY_DC):
+            # these act on the graph behind this screen — marking, asking, re-rooting something the
+            # user cannot even see right now. Silence is worse than a refusal.
+            self.msg = "that is a graph-mode key — v goes back to the graph"
+            return True
         return None
 
     def post_findings_ui(self):
@@ -5192,48 +5200,85 @@ class Tui:
             self.msg = f"posted {len(picked)} comment(s): {url or 'done'}"
         self.refresh_review(keep=False)
 
-    def review_details(self, translate=False):
-        """d / i on a finding: the whole thing — the panel only has room for its title.
-        i shows it in `lang`; what would be posted is always the original (see P)."""
+    def review_texts(self):
+        """(key, header, [(label, text), …]) for whatever the Findings cursor is on — a finding, one
+        of the changes, or a review thread already on GitHub. What d shows and i translates."""
+        r = self.panels["rfind"].current()
+        nid = (r.nid or "") if r else ""
         f = self.review_finding()
-        if f is None:
-            self.msg = "no finding under the cursor"
+        if f is not None:
+            parts = [("", f.title), ("", f.body)]
+            if f.verdict:
+                parts.append((f"verdict: {f.verdict}", f.verdict_reason or ""))
+            return f, f"[{f.severity}]", parts
+        if nid.startswith("change:") and self.rv:
+            c = next((c for c in self.rv.changes if c.cid == nid[7:]), None)
+            if c:
+                parts = [("", f"{c.cid}  {c.kind}  {c.symbol or c.path}"), ("", c.summary)]
+                if self.rv.reachability:
+                    parts.append((f"reachability: {self.rv.reachability.get('verdict')}",
+                                  self.rv.reachability.get("reason", "")))
+                return nid, "[change]", parts
+        if nid.startswith("thread:") and self.rv:
+            t = next((t for t in self.rv.threads if f"thread:{t.get('id')}" == nid), None)
+            if t:
+                parts = [("", f"{t.get('path')}:{t.get('line')}"
+                             + (" (resolved)" if t.get("resolved") else ""))]
+                parts += [(f"@{c.get('author', '?')}", c.get("body", "")) for c in t.get("comments", [])]
+                return nid, "[thread]", parts
+        return None, "", []
+
+    def review_details(self, translate=False):
+        """d: the whole of what the Findings cursor is on — the panel only has room for a title.
+        i: the same in `lang`, translated in the background; what P posts is always the original."""
+        key, tag, parts = self.review_texts()
+        if key is None:
+            self.msg = "nothing under the cursor to read"
             return
-        title, body, verdict_tr = f.title, f.body, ""
+        f = key if isinstance(key, Finding) else None
+        cache_key = (f.fid if f else key, "tr")
         if translate:
             if not ai_available():
                 self.msg = f"{CLAUDE_BIN} is not installed — cannot translate"
                 return
-            key = (f.fid, "tr")
-            if key not in self.rv_tr:
-                # in the background, like the browse-mode i: one call takes ~8s even warm (a whole
-                # claude -p process per call), and a blocked main loop shows no spinner and eats no keys
-                if key in getattr(self, "_tr_busy", set()):
+            if cache_key not in self.rv_tr:
+                if cache_key in self._tr_busy:
                     self.msg = f"still translating to {TR_LANG}…"
                     return
-                self._tr_busy = getattr(self, "_tr_busy", set()) | {key}
-                src = f"{f.title}\n\n{f.body}" + (f"\n\n{f.verdict_reason}" if f.verdict_reason else "")
+                self._tr_busy.add(cache_key)
+                texts = [t for _, t in parts]
 
                 def job():
+                    from concurrent.futures import ThreadPoolExecutor
                     try:
-                        self.rv_tr[key] = translate_text(src, "pull request")
+                        with ThreadPoolExecutor(max_workers=min(AI_PARALLEL, len(texts))) as ex:
+                            self.rv_tr[cache_key] = list(
+                                ex.map(lambda t: translate_text(t, "pull request") if t.strip() else t,
+                                       texts))
+                        self._tr_pop = cache_key   # the main loop reopens the popup, translated
                         self.msg = f"translation ready — i shows it"
                     except Exception as e:  # noqa: BLE001
                         self.msg = f"translation failed: {str(e)[:120]}"
                     finally:
-                        self._tr_busy.discard(key)
+                        self._tr_busy.discard(cache_key)
 
                 self.run_bg(job, "translate")
-                self.msg = f"translating to {TR_LANG} in the background — i again when it is ready"
+                self.msg = f"translating to {TR_LANG}…"
                 return
             self.msg = ""                    # do not leave "translating…" under a finished popup
-            title, _, rest = self.rv_tr[key].partition("\n\n")
-            body, _, verdict_tr = rest.partition("\n\n") if f.verdict_reason else (rest, "", "")
+            done = self.rv_tr[cache_key]
+            parts = [(lab, done[i] if i < len(done) else txt) for i, (lab, txt) in enumerate(parts)]
         w = max(self.panels["rfind"].rect[3] * 2, 60)
-        lines = [f"[{f.severity}] {title}", ""]
-        lines += wrap(body, w) or [""]
-        if f.verdict:
-            lines += ["", f"verdict: {f.verdict}"] + wrap(verdict_tr or f.verdict_reason or "", w)
+        first_lab, first_txt = parts[0]
+        lines = [f"{tag} {first_txt}" if not first_lab else f"{tag} {first_lab}: {first_txt}", ""]
+        for lab, txt in parts[1:]:
+            if lab:
+                lines += ["", lab] if not txt else ["", lab] + wrap(txt, w)
+            else:
+                lines += wrap(txt, w) or [""]
+        if f is None:
+            self.popup_text(f"{tag} details" + (f" — {TR_LANG}" if translate else ""), lines)
+            return
         where = (f"{f.path}:{f.claimed_line}→{f.line}" if f.anchor == "moved" and f.claimed_line
                  else f"{f.path}:{f.line}")
         lines += ["", f"{where} ({f.side})"
@@ -6928,7 +6973,7 @@ class Tui:
                     if act[0] == "translate":
                         self.translate_content()
                     else:
-                        self.switch_tab(key, act, relative=(key == "home"))
+                        self.switch_tab(key, act, relative=(key in ("home", "rfind")))
                     return
             self.focus = key
             return
@@ -7109,6 +7154,12 @@ class Tui:
                 if self._new_rv is not None:                        # the worktree and diff are ready
                     self.rv, self._new_rv = self._new_rv, None
                     self.rv_path = None
+                if self._tr_pop is not None and self.mode == "review":
+                    pop, self._tr_pop = self._tr_pop, None
+                    key, _, _ = self.review_texts()
+                    cur = (key.fid if isinstance(key, Finding) else key, "tr")
+                    if cur == pop and pop in self.rv_tr:
+                        self.review_details(translate=True)
                 if self.rv is not None and self.rv.status == "done" and self.rv.t1 and not self._told_review:
                     self._told_review = True
                     self.rv_checked = {f.fid for f in postable_findings(self.rv)

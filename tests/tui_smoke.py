@@ -826,6 +826,22 @@ def review_with_a_clone():
 
         s.key("x", 1.0)                       # ignore it
         check("x ignores a finding", "ignored" in s.text(), s.text()[:300])
+
+        for _ in range(6):                    # to the changes tab (compact strip: ‹ changes ›)
+            if "‹ changes" in s.text():
+                break
+            s.key("]", 0.6)
+        check("the changes tab was reached", "‹ changes" in s.text(), s.text()[:400])
+        s.key("j", 0.4)
+        s.key("d", 1.2)                       # d on a change row opens the change, not browse details
+        check("d on a change row shows the change", "[change]" in s.text(), s.text()[:700])
+        s.key("\x1b", 0.8)                    # Esc closes the popup (q would quit from an empty tab)
+        s.key("m", 0.8)                       # a browse-content key must refuse, not act invisibly
+        check("browse keys are refused in review mode", "graph-mode key" in s.text(), s.text()[:300])
+        for _ in range(6):
+            if "‹ open" in s.text():
+                break
+            s.key("]", 0.6)
         check("no traceback with a real worktree", "Traceback" not in s.log(),
               "\n".join(l for l in s.log().splitlines() if "Traceback" in l or "Error" in l)[:600])
     finally:

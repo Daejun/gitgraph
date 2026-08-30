@@ -208,8 +208,9 @@ The screen adapts: three columns while the diff can keep 56 of them, otherwise F
 | Enter | see the table above |
 | `space` · `P` | pick a finding for posting / unpick it · post the picked ones (or the one under the cursor) — the text first, then yes or no |
 | `x` | ignore this finding, or take the ignore back (remembered per PR, across new commits) |
+| graph keys (`a` `m` `b` `f` `u` …) | refused with a message — they act on the graph behind this screen; `v` goes back to it |
 | `R` · `r` | run the review (it asks first) · reload the PR and its diff, keeping the cached findings |
-| `d` · `i` | read the whole finding — body, evidence, suggested fix · the same in your `lang`. What `P` posts is always the original |
+| `d` · `i` | read the whole of what the Findings cursor is on — a finding (body, evidence, suggested fix), one of the changes, or a GitHub thread · the same in your `lang`: the translation runs in the background and the popup opens itself when it is ready. What `P` posts is always the original |
 | `V` | check this finding again: a fresh call that tries to disprove it |
 | `o` · `y` | open the PR — or the exact file and line under the cursor — in the browser · copy that URL |
 | `/` `n` `N` · `?` | search the focused panel · key menu for it |
