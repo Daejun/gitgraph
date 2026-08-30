@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.27.2"
+VERSION = "0.27.3"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1206,7 +1206,7 @@ def claude_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
 def _ai_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
     kind = ai_backend()
     outfile = None
-    stdin_text = None
+    stdin_text, env = None, None
     if kind == "claude":
         # no --bare: bare mode skips the stored login and answers "Not logged in"
         cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "json", "--model", model]
@@ -1218,6 +1218,11 @@ def _ai_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
             # The review passes keep them on purpose: claude -p inheriting the user's MCP is what lets
             # a kernel skill use semcode inside the worktree.
             cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+            # and it does not need to think: the model was spending 500-1,200 thinking tokens before
+            # translating one sentence, which is where the 8-56s per call went. Measured on one
+            # sentence: 8-12s -> 2.4-4s, output 1,250 -> 60 tokens. The review and verify passes keep
+            # thinking — there it is the analysis.
+            env = dict(os.environ, MAX_THINKING_TOKENS="0")
         if cwd:
             cmd += ["--add-dir", cwd]
         # every variant of this command now ends in a variadic option (--allowedTools, --add-dir or
@@ -1234,7 +1239,7 @@ def _ai_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
     try:
         r = subprocess.run(cmd, input=stdin_text,
                            stdin=None if stdin_text is not None else subprocess.DEVNULL,
-                           capture_output=True, text=True, timeout=timeout,
+                           capture_output=True, text=True, timeout=timeout, env=env,
                            cwd=cwd or None, start_new_session=True)   # no controlling terminal: the child cannot touch our screen
     except FileNotFoundError:
         raise ValueError(f"{CLAUDE_BIN} not found (gg ai to pick an AI CLI)") from None

@@ -335,14 +335,15 @@ class TestGenericBackend(AiCase):
 
 
 class TestMcpSuppression(unittest.TestCase):
-    """A translation call must not boot the user's MCP servers; a review call must keep them."""
+    """A translation call must not boot the user's MCP servers or spend thinking tokens; a review
+    call must keep both — inherited MCP and thinking are what its analysis runs on."""
 
-    def argv_of(self, tools):
+    def call_of(self, tools):
         calls = []
         orig = gg.subprocess.run
 
         def spy(cmd, **kw):
-            calls.append(cmd)
+            calls.append((cmd, kw))
             raise FileNotFoundError()          # stop before any real spawn
 
         gg.subprocess.run = spy
@@ -354,6 +355,9 @@ class TestMcpSuppression(unittest.TestCase):
             gg.subprocess.run = orig
         return calls[0]
 
+    def argv_of(self, tools):
+        return self.call_of(tools)[0]
+
     def test_a_text_only_call_shuts_mcp_off(self):
         argv = self.argv_of(())
         self.assertIn("--strict-mcp-config", argv)
@@ -363,6 +367,14 @@ class TestMcpSuppression(unittest.TestCase):
         argv = self.argv_of(("Read", "Grep"))
         self.assertNotIn("--strict-mcp-config", argv)
         self.assertIn("--allowedTools", argv)
+
+    def test_a_text_only_call_does_not_think(self):
+        _, kw = self.call_of(())
+        self.assertEqual((kw.get("env") or {}).get("MAX_THINKING_TOKENS"), "0")
+
+    def test_a_review_call_keeps_thinking(self):
+        _, kw = self.call_of(("Read",))
+        self.assertIsNone(kw.get("env"))
 
 if __name__ == "__main__":
     unittest.main()
