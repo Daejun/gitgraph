@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.27.3"
+VERSION = "0.27.4"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1218,11 +1218,13 @@ def _ai_call(prompt, model, phase, timeout=300, cwd=None, tools=()):
             # The review passes keep them on purpose: claude -p inheriting the user's MCP is what lets
             # a kernel skill use semcode inside the worktree.
             cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
-            # and it does not need to think: the model was spending 500-1,200 thinking tokens before
-            # translating one sentence, which is where the 8-56s per call went. Measured on one
-            # sentence: 8-12s -> 2.4-4s, output 1,250 -> 60 tokens. The review and verify passes keep
-            # thinking — there it is the analysis.
-            env = dict(os.environ, MAX_THINKING_TOKENS="0")
+            # and, except for a real question (a: the answer is the reasoning), it does not need to
+            # think: the model was spending 500-1,200 thinking tokens before translating one sentence,
+            # which is where the 8-56s per call went. Measured on one sentence: 8-12s -> 2.4-4s,
+            # output 1,250 -> 60 tokens. The review and verify passes keep thinking too — there it is
+            # the analysis.
+            if phase != "ask":
+                env = dict(os.environ, MAX_THINKING_TOKENS="0")
         if cwd:
             cmd += ["--add-dir", cwd]
         # every variant of this command now ends in a variadic option (--allowedTools, --add-dir or
@@ -1333,9 +1335,13 @@ SUM_PROMPT = """Summarize each GitHub text in the JSON array below (kind = issue
 of {lang}, at most 70 characters. For an issue/PR say what it is about (the problem or the change); for a comment say \
 what it does: a finding, a question, a request, a decision, a status update, a measurement, an ack. \
 Keep identifiers, #numbers, file names, function names and technical terms in English. Never use Chinese characters. \
-Output ONLY a JSON array of strings, same length and same order as the input, no code fence, no commentary.
+Output ONLY a JSON array of strings, same length and same order as the input, no code fence, no commentary. \
+Every string must be written in {lang} — an English summary is a wrong answer even when accurate; only identifiers, \
+file names and technical terms stay in English.
 
 {payload}"""
+# that last sentence is load-bearing: with thinking off (see _ai_call) haiku drifted into English
+# summaries about one time in two, and with it went 4/4 Korean at the same 4-5s per batch of ten
 
 
 def summarize_comments(entries, lang=TR_LANG):

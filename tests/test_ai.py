@@ -338,7 +338,7 @@ class TestMcpSuppression(unittest.TestCase):
     """A translation call must not boot the user's MCP servers or spend thinking tokens; a review
     call must keep both — inherited MCP and thinking are what its analysis runs on."""
 
-    def call_of(self, tools):
+    def call_of(self, tools, phase="translate"):
         calls = []
         orig = gg.subprocess.run
 
@@ -348,7 +348,7 @@ class TestMcpSuppression(unittest.TestCase):
 
         gg.subprocess.run = spy
         try:
-            gg._ai_call("p", "haiku", "translate", tools=tools)
+            gg._ai_call("p", "haiku", phase, tools=tools)
         except Exception:
             pass
         finally:
@@ -375,6 +375,13 @@ class TestMcpSuppression(unittest.TestCase):
     def test_a_review_call_keeps_thinking(self):
         _, kw = self.call_of(("Read",))
         self.assertIsNone(kw.get("env"))
+
+    def test_a_question_keeps_thinking_too(self):
+        """a / gg ask: the answer is the reasoning, so the latency is the price of the product."""
+        _, kw = self.call_of((), phase="ask")
+        self.assertIsNone(kw.get("env"))
+        cmd = self.call_of((), phase="ask")[0]
+        self.assertIn("--strict-mcp-config", cmd)   # but it still must not boot the MCP servers
 
 if __name__ == "__main__":
     unittest.main()
