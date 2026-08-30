@@ -853,7 +853,7 @@ def review_mode():
         check("a missing local clone is explained, not a traceback", "no local clone" in txt, txt[:700])
         s.key("3")
         s.key("]", 0.8)
-        check("the Findings tabs switch", "[posted]" in s.text(), s.line(0))
+        check("the Findings tabs switch", "‹ posted ›" in s.text(), s.line(0))
         for _ in range(4):
             s.key("]", 0.4)
         check("the github tab lists the PR's threads even though the worktree failed",
@@ -868,7 +868,10 @@ def review_mode():
 
 
 def review_mode_narrow():
-    """80 columns: the three columns stack instead of being squeezed into nothing."""
+    """80 columns: the three columns stack instead of being squeezed into nothing, and switching
+    focus (which resizes the stacked panels) leaves no half-drawn frame behind. The latter pinned a
+    long hunt: ncurses shifts the resized blocks with DECSTBM + CSI S/T, which tests/vt.py used to
+    drop — the "corruption" was the emulator's, never the terminal's."""
     s = Session(["--no-summary", "-t", "none", "5"], rows=30, cols=80)
     try:
         s.wait_for("6 People", 30)
@@ -878,6 +881,15 @@ def review_mode_narrow():
         txt = s.text()
         check("narrow review stacks the panels",
               all(t in txt for t in ("1 Files", "2 Diff", "3 Findings")), txt[:500])
+        for k in ("3", "2", "1", "3"):
+            s.key(k, 1.0)
+        txt = s.text()
+        check("focus changes leave exactly one border per panel",
+              txt.count("╭") == 3 and txt.count("╰") == 3,
+              f"corners {txt.count('╭')}/{txt.count('╰')}\n" + txt[:600])
+        check("no stale title fragments inside the panels",
+              txt.count("1 Files") == 1 and txt.count("2 Diff") == 1 and txt.count("3 Findings") == 1,
+              txt[:600])
         check("no traceback when narrow", "Traceback" not in s.log())
     finally:
         s.kill()

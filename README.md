@@ -195,9 +195,9 @@ The code comes from **your own checkout, not the API**: gg fetches `refs/pull/N/
 
 | panel | shows | Enter |
 |---|---|---|
-| 1 Files | the PR, then one row per changed file: `+added -deleted` and the worst finding on it (`⚠` defect, `ℹ` remark). The last line is what the worktree costs on disk | show that file's diff in Diff |
+| 1 Files | the PR, then one row per changed file: `+added -deleted` and the worst finding on it (`⚠` defect — reach/bug/regression/logic, `ℹ` remark — style/design). The last line is what the worktree costs on disk | show that file's diff in Diff |
 | 2 Diff | the file's unified diff, five lines of context, hunks foldable. The gutter is the line number in the new file (the old one for removed lines) and a marker when a finding sits there. Tabs expand to four columns | fold / unfold the hunk |
-| 3 Findings | tabs (`[` `]`): **open** · **posted** · **ignored** · **dropped** (disproved) · **changes** (how the review split the diff up, and whether the changed code is reachable at all) · **github** (the review threads already on the PR, so you do not repeat a human). Each finding shows its verdict — `✓` confirmed, `?` plausible — its file and line, and `⚠` when gg had to pull it onto the nearest changed line (GitHub refuses a comment anywhere else) | jump the Diff panel to that line |
+| 3 Findings | one tab at a time (`[` `]`, shown as `‹ open ›`): **open** · **posted** · **ignored** · **dropped** (disproved) · **changes** (how the review split the diff up, and whether the changed code is reachable at all) · **github** (the review threads already on the PR, so you do not repeat a human). Each finding shows its verdict — `✓` confirmed, `?` plausible, `-` when the review ran with `review_verify off` (the current tab then reads `‹ open · unverified ›`) — and its file and line. GitHub takes a comment on any line of a hunk in the new file (context included) and on deleted lines on the old side; only a finding outside every hunk is pulled to the nearest such line, shown as `1093→1094`, and its posted comment opens by saying where the finding actually points | jump the Diff panel to that line |
 
 The screen adapts: three columns while the diff can keep 56 of them, otherwise Findings folds into a strip under the diff, and at ≤ 84 columns the three stack. `+`/`_` and the panel keys work as everywhere else.
 

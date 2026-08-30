@@ -1,8 +1,11 @@
 """tiny VT100 screen emulator good enough for curses output: returns the final screen as text lines.
 
-Includes the scrolling region (DECSTBM, CSI r) with IND / RI / NEL and CSI L / M: ncurses deletes and
-inserts lines by setting a one-panel scrolling region and scrolling inside it, so without these a
-deleted row leaves a phantom duplicate on this screen that a real terminal never shows.
+Includes the scrolling region (DECSTBM, CSI r) with IND / RI / NEL, CSI L / M and CSI S / T: ncurses
+deletes and inserts lines by setting a one-panel scrolling region and scrolling inside it, so without
+these a deleted row leaves a phantom duplicate on this screen that a real terminal never shows. S / T
+matter as soon as panel heights change between frames (the review layout's accordion): ncurses then
+shifts whole line blocks with DECSTBM + SU/SD, and an emulator that drops those — pyte does too —
+renders a "corrupted" screen that a real terminal never displays.
 """
 import re, unicodedata
 def cw(ch): return 2 if unicodedata.east_asian_width(ch) in "WF" else (0 if unicodedata.combining(ch) else 1)
@@ -55,6 +58,10 @@ class Screen:
                         self.scroll_up((nums[0] or 1 if nums else 1), top=self.y)
                     elif cmd=="L":                     # insert lines inside the region, from the cursor
                         self.scroll_down((nums[0] or 1 if nums else 1), top=self.y)
+                    elif cmd=="S":                     # SU: scroll the whole region up (cursor stays)
+                        self.scroll_up(nums[0] or 1 if nums else 1)
+                    elif cmd=="T":                     # SD: scroll the whole region down
+                        self.scroll_down(nums[0] or 1 if nums else 1)
                     continue
                 nxt = data[i+1] if i+1 < n else ""
                 if nxt=="D":                           # IND: down, scrolling the region at the bottom

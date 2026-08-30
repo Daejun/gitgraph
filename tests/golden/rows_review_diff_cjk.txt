@@ -1,5 +1,5 @@
 ▾ @@ -88,2 +88,2 @@ gc_thread_func
      88 -     unsigned int segno = 0;   /* 시작 segment 
 ⚠    88 +     unsigned int start_segment_number = 0;
-     89       wait_event(sbi->gc_wait, kthread_should_st
+⚠    89       wait_event(sbi->gc_wait, kthread_should_st
 

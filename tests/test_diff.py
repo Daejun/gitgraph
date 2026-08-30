@@ -70,6 +70,14 @@ class TestParseUnifiedDiff(unittest.TestCase):
         self.assertEqual(f.touched("RIGHT"), {221, 222})
         self.assertEqual(f.touched("LEFT"), {221})
 
+    def test_commentable_covers_the_context_lines_on_the_right(self):
+        """GitHub takes an inline comment on any hunk line of the new file — unchanged context
+        included — and on the LEFT only on deletions. The best finding of the first real review sat
+        on a context line and was pushed off it because gg thought otherwise."""
+        f = gg.parse_unified_diff(SIMPLE)[0]
+        self.assertEqual(f.commentable("RIGHT"), {220, 221, 222, 223, 224, 225, 226})
+        self.assertEqual(f.commentable("LEFT"), {221})
+
     def test_multiple_hunks_and_files(self):
         text = SIMPLE + """\
 diff --git a/fs/f2fs/gc.c b/fs/f2fs/gc.c
@@ -229,10 +237,20 @@ class TestAnchoring(unittest.TestCase):
         self.review([f])
         self.assertEqual((f.anchor, f.line), ("ok", 222))
 
-    def test_a_line_outside_the_hunk_is_pulled_to_the_nearest_changed_one(self):
-        f = gg.Finding(path="fs/f2fs/data.c", line=226, side="RIGHT", title="t")
+    def test_a_context_line_inside_the_hunk_anchors_as_is(self):
+        f = gg.Finding(path="fs/f2fs/data.c", line=224, side="RIGHT", title="t")
         self.review([f])
-        self.assertEqual((f.anchor, f.line), ("moved", 222))
+        self.assertEqual((f.anchor, f.line), ("ok", 224))
+
+    def test_a_line_outside_the_hunk_is_pulled_to_the_nearest_commentable_one(self):
+        f = gg.Finding(path="fs/f2fs/data.c", line=300, side="RIGHT", title="t")
+        self.review([f])
+        self.assertEqual((f.anchor, f.line), ("moved", 226))
+
+    def test_a_context_line_on_the_left_is_still_moved(self):
+        f = gg.Finding(path="fs/f2fs/data.c", line=224, side="LEFT", title="t")
+        self.review([f])
+        self.assertEqual((f.anchor, f.line), ("moved", 221))
 
     def test_a_path_not_in_the_diff_is_unanchored(self):
         f = gg.Finding(path="fs/f2fs/nowhere.c", line=1, side="RIGHT", title="t")
@@ -257,7 +275,7 @@ class TestAnchoring(unittest.TestCase):
     def test_a_non_numeric_line_still_anchors(self):
         f = gg.Finding(path="fs/f2fs/data.c", line="not a number", side="RIGHT", title="t")
         self.review([f])
-        self.assertEqual((f.anchor, f.line), ("moved", 221))
+        self.assertEqual((f.anchor, f.line), ("moved", 220))
 
     def test_only_anchored_open_findings_are_postable(self):
         ok = gg.Finding(path="fs/f2fs/data.c", line=222, side="RIGHT", title="a")

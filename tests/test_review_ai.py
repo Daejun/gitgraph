@@ -209,7 +209,7 @@ class TestRunReview(RunReviewCase):
         rv = review()
         gg.run_review(rv)
         self.assertEqual(rv.findings[0].anchor, "moved")
-        self.assertIn(rv.findings[0].line, rv.file("fs/f2fs/data.c").touched("RIGHT"))
+        self.assertIn(rv.findings[0].line, rv.file("fs/f2fs/data.c").commentable("RIGHT"))
 
     def test_an_unusable_reply_fails_the_review_instead_of_pretending(self):
         self.answer("I could not do it.")
@@ -353,7 +353,7 @@ class TestVerifyPass(RunReviewCase):
         self.answer('<<<GG_VERDICT\n{"verdict": "CONFIRMED", "reason": "r", "line": 999}\nGG_VERDICT>>>')
         rv, f = self.one()
         gg.run_verify(rv)
-        self.assertIn(f.line, rv.file("fs/f2fs/data.c").touched("RIGHT"))
+        self.assertIn(f.line, rv.file("fs/f2fs/data.c").commentable("RIGHT"))
         self.assertEqual(f.anchor, "moved")
 
     def test_an_already_settled_finding_is_not_checked_again(self):

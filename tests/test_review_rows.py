@@ -159,12 +159,22 @@ class TestReviewRowContract(unittest.TestCase):
         self.assertTrue(any("already reported" in t for t in titles("dropped")))
         self.assertTrue(any("nothing ignored" in t for t in titles("ignored")))
 
-    def test_an_unanchored_finding_is_marked_and_not_postable(self):
+    def test_a_moved_finding_shows_both_line_numbers(self):
         rv = review(findings())
         bad = next(f for f in rv.findings if f.title.startswith("a finding the diff"))
-        self.assertEqual(bad.anchor, "moved")           # gc.c has a changed line, so it is pulled onto it
+        self.assertEqual(bad.anchor, "moved")           # gc.c has a commentable line, it is pulled onto it
+        self.assertEqual(bad.claimed_line, 999)         # where the reviewer actually pointed
         rows = gg.findings_rows(rv, "open", WIDTH_FIND)
-        self.assertTrue(any("⚠" in r.text for r in rows if r.kind == "note"))
+        self.assertTrue(any("999→" in r.text for r in rows if r.kind == "note"))
+        self.assertFalse(any("⚠" in r.text for r in rows if r.kind == "note"))   # ⚠ means severity
+
+    def test_a_moved_comment_says_where_the_finding_actually_points(self):
+        rv = review(findings())
+        bad = next(f for f in rv.findings if f.anchor == "moved")
+        self.assertIn(f"The code in question is at {bad.path}:{bad.claimed_line}",
+                      gg.comment_body(bad))
+        ok = next(f for f in rv.findings if f.anchor == "ok")
+        self.assertNotIn("The code in question", gg.comment_body(ok))
 
     def test_subjective_findings_are_held_while_a_confirmed_defect_stands(self):
         rv = review(findings())
@@ -203,6 +213,34 @@ class TestReviewRowContract(unittest.TestCase):
         th = gg.findings_rows(rv, "github", WIDTH_FIND)
         self.assertTrue(any("@bob" in r.text for r in th))
         self.assertEqual([r.nid for r in th if r.nid][0], "thread:T1")
+
+
+class TestVerifyVisibility(unittest.TestCase):
+    """#779 ran without the disprove pass and nothing on screen said so — the changes-tab header and
+    the verdict marks now do. A review that skipped verification is not the same product."""
+
+    def test_the_changes_tab_says_verify_off(self):
+        rv = review(findings())
+        rv.verify = False
+        head = gg.findings_rows(rv, "changes", 60)[0].text
+        self.assertIn("verify off", head)
+        rv.verify = True
+        self.assertNotIn("verify off", gg.findings_rows(rv, "changes", 60)[0].text)
+
+    def test_unverified_findings_carry_a_dash_not_a_blank(self):
+        rv = review(findings())
+        rv.verify = False
+        for f in rv.findings:
+            f.verdict = None
+        rows = [r.text for r in gg.findings_rows(rv, "open", 40) if r.kind.startswith("sev_")]
+        self.assertTrue(rows and all(" - " in t for t in rows), rows)
+
+    def test_a_verified_review_uses_the_verdict_marks(self):
+        rv = review(findings())
+        rv.verify = True
+        rows = [r.text for r in gg.findings_rows(rv, "open", 40) if r.kind.startswith("sev_")]
+        self.assertTrue(any(" ✓ " in t for t in rows))
+        self.assertFalse(any(" - " in t for t in rows))
 
 
 class TestReviewSegments(unittest.TestCase):

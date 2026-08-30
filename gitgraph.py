@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.27.0"
+VERSION = "0.27.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -171,6 +171,12 @@ def config_cmd(args):
             print(cfg(key))
             return 0
         CONFIG[key] = " ".join(args[1:])
+        if key == "review_cmd":
+            rules, default = parse_review_cmd(CONFIG[key])
+            odd = [c for _, c in rules + ([("", default)] if default else []) if c and not c.startswith("/")]
+            if odd:
+                print(f"note: {', '.join(odd)} does not start with '/' — a slash command would "
+                      f"(e.g. /kreview); gg will pass it to {CLAUDE_BIN} as typed", file=sys.stderr)
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(CONFIG, f, indent=2, ensure_ascii=False)
@@ -2053,10 +2059,18 @@ class Hunk:
         return self._old_left <= 0 and self._new_left <= 0
 
     def touched(self, side):
-        """Line numbers this hunk changed on one side — the only lines GitHub accepts a comment on."""
+        """Line numbers this hunk changed on one side."""
         want = "+" if side == "RIGHT" else "-"
         idx = 2 if side == "RIGHT" else 1
         return {ln[idx] for ln in self.lines if ln[0] == want and ln[idx] is not None}
+
+    def commentable(self, side):
+        """Line numbers GitHub accepts an inline comment on, which is more than the changed ones:
+        "Use LEFT for deletions … RIGHT for additions or unchanged lines shown for context". So RIGHT
+        covers every line of the hunk in the new file, LEFT only the deletions."""
+        if side == "LEFT":
+            return self.touched("LEFT")
+        return {ln[2] for ln in self.lines if ln[2] is not None}
 
 
 class DiffFile:
@@ -2073,9 +2087,15 @@ class DiffFile:
             out |= h.touched(side)
         return out
 
+    def commentable(self, side):
+        out = set()
+        for h in self.hunks:
+            out |= h.commentable(side)
+        return out
+
     def nearest(self, side, line):
-        """The changed line closest to `line` on `side`, or None when the file has none."""
-        cand = self.touched(side)
+        """The commentable line closest to `line` on `side`, or None when the file has none."""
+        cand = self.commentable(side)
         return min(cand, key=lambda n: (abs(n - line), n)) if cand else None
 
 
@@ -2195,8 +2215,8 @@ class Change:
 
 class Finding:
     FIELDS = ("fid", "cid", "severity", "path", "line", "end_line", "side", "title", "body",
-              "evidence", "diff", "verdict", "verdict_reason", "anchor", "state", "posted_at",
-              "thread_url", "digest", "error")
+              "evidence", "diff", "verdict", "verdict_reason", "anchor", "claimed_line", "state",
+              "posted_at", "thread_url", "digest", "error")
     __slots__ = FIELDS
 
     def __init__(self, **kw):
@@ -2492,7 +2512,7 @@ query($owner:String!,$name:String!,$number:Int!){
  repository(owner:$owner,name:$name){ pullRequest(number:$number){
   id number title state isDraft url body headRefName baseRefName headRefOid baseRefOid
   author{login} headRepository{ nameWithOwner }
-  reviewThreads(first:100){ nodes{ id isResolved isOutdated path line diffSide
+  reviewThreads(first:100){ nodes{ id isResolved isOutdated path line originalLine diffSide
    comments(first:10){ nodes{ author{login} body createdAt url } } } } } } }
 """
 
@@ -2507,7 +2527,8 @@ def pr_meta(repo, number):
     threads = []
     for t in ((pr.get("reviewThreads") or {}).get("nodes") or []):
         cs = ((t.get("comments") or {}).get("nodes") or [])
-        threads.append({"id": t.get("id"), "path": t.get("path"), "line": t.get("line"),
+        threads.append({"id": t.get("id"), "path": t.get("path"),
+                        "line": t.get("line") if t.get("line") is not None else t.get("originalLine"),
                         "side": t.get("diffSide"), "resolved": bool(t.get("isResolved")),
                         "outdated": bool(t.get("isOutdated")),
                         "comments": [{"author": ((c.get("author") or {}).get("login") or "?"),
@@ -2609,7 +2630,7 @@ def anchor_findings(rv):
             line = int(f.line)
         except (TypeError, ValueError):
             line = None
-        if line is not None and line in df.touched(f.side):
+        if line is not None and line in df.commentable(f.side):
             # "moved" is sticky: anchoring runs again after the verification pass, and a finding gg
             # once had to pull onto another line should not quietly read as if it never moved.
             f.anchor, f.line = ("moved" if f.anchor == "moved" else "ok"), line
@@ -2618,6 +2639,8 @@ def anchor_findings(rv):
             if near is None:
                 f.anchor = "unanchored"
             else:
+                if f.claimed_line is None and line is not None:
+                    f.claimed_line = line        # where the reviewer actually pointed — worth keeping
                 f.line, f.anchor = near, "moved"
         if f.end_line is not None and (f.anchor != "ok" or f.line is None or f.end_line < f.line):
             f.end_line = None
@@ -3239,6 +3262,9 @@ def comment_body(f):
     """What one finding looks like on the pull request. No tool signature: this goes out under the
     user's own account, and review_signature is theirs to set."""
     parts = [f.title.strip(), "", f.body.strip()]
+    if f.anchor == "moved" and f.claimed_line:
+        parts += ["", f"(The code in question is at {f.path}:{f.claimed_line}; this comment sits on "
+                      f"the nearest line the diff lets it attach to.)"]
     diff = (f.diff or "").strip()
     if diff:
         parts += ["", "```diff", diff, "```"]
@@ -4207,7 +4233,7 @@ def render_show(g, nid, width=100):
 # ("file:…", "line:…", "finding:…") are not in the graph.
 SEV_LABEL = {"reach": "unreachable", "bug": "bug", "regress": "regression",
              "logic": "logic", "style": "style", "design": "design"}
-SEV_MARK = {"reach": "⚠", "bug": "⚠", "regress": "⚠", "logic": "ℹ", "style": "ℹ", "design": "ℹ"}
+SEV_MARK = {"reach": "⚠", "bug": "⚠", "regress": "⚠", "logic": "⚠", "style": "ℹ", "design": "ℹ"}
 VERDICT_MARK = {"CONFIRMED": "✓", "PLAUSIBLE": "?", "FALSE": "·"}
 ANCHOR_MARK = {"moved": " ⚠", "unanchored": " ⊘"}
 DIFF_GUTTER = 10        # marker(2) + line number(5) + space + tag + space
@@ -4338,7 +4364,8 @@ def findings_rows(rv, tab, width, checked=frozenset()):
     if rv.error:
         return [Row("review failed", kind="head"), Row(trunc(rv.error, width * 3), kind="note")]
     if not rv.findings and not rv.engine:
-        return [Row("no review yet — R runs one" if ai_available() else
+        cmd = review_cmd_for(rv.repo)
+        return [Row(f"no review yet — R runs one ({cmd or 'built-in protocol'})" if ai_available() else
                     f"no AI CLI ({CLAUDE_BIN}) — diff only", kind="head")]
     picked = [f for f in rv.findings if _find_bucket(f) == tab]
     if not picked:
@@ -4355,11 +4382,13 @@ def findings_rows(rv, tab, width, checked=frozenset()):
             rows.append(Row(f"● {SEV_LABEL[f.severity]} "
                             f"{sum(1 for x in order if x.severity == f.severity)}", kind="head"))
         sel = "•" if f.fid in checked else " "
-        v = VERDICT_MARK.get(f.verdict, " ")
+        v = VERDICT_MARK.get(f.verdict, " " if rv.verify else "-")
         rows.append(Row(f"{sel}#{i} {v} {trunc(f.title, max(width - 6, 8))}",
                         f"finding:{f.fid}", f"line:{f.path}:{f.side}:{f.line}", f"sev_{f.severity}"))
-        rows.append(Row(f"   {short_path(f.path or '?', max(width - 12, 8))}:{f.line}"
-                        f"{ANCHOR_MARK.get(f.anchor, '')}", f"finding:{f.fid}", None, "note"))
+        where = (f"{f.claimed_line}→{f.line}" if f.anchor == "moved" and f.claimed_line else str(f.line))
+        rows.append(Row(f"   {short_path(f.path or '?', max(width - 12, 8))}:{where}"
+                        f"{ANCHOR_MARK.get(f.anchor, '') if f.anchor == 'unanchored' else ''}",
+                        f"finding:{f.fid}", None, "note"))
     if n_held:
         rows.append(Row(f"● {n_held} subjective held back (a confirmed defect stands)", kind="head"))
     return rows
@@ -4372,7 +4401,8 @@ def changes_rows(rv, width):
     rows, seen = [], None
     if rv.engine:
         rows.append(Row(trunc(f"reviewed by {rv.engine}"
-                              + (f" {rv.model}" if rv.model else ""), width * 3), kind="head"))
+                              + (f" {rv.model}" if rv.model else "")
+                              + ("" if rv.verify else " · verify off"), width * 3), kind="head"))
     if rv.reachability:
         v = rv.reachability.get("verdict", "?")
         rows.append(Row(f"reachability: {v}", kind="head"))
@@ -4395,8 +4425,9 @@ def threads_rows(rv, width):
     for t in rv.threads:
         state = " (resolved)" if t.get("resolved") else (" (outdated)" if t.get("outdated") else "")
         first = (t.get("comments") or [{}])[0]
+        at = f":{t['line']}" if t.get("line") is not None else ""
         rows.append(Row(f"@{first.get('author', '?')} "
-                        f"{short_path(t.get('path') or '?', max(width - 16, 8))}:{t.get('line')}{state}",
+                        f"{short_path(t.get('path') or '?', max(width - 16, 8))}{at}{state}",
                         f"thread:{t.get('id')}", f"line:{t.get('path')}:{t.get('side')}:{t.get('line')}"))
         rows.append(Row(f"   {trunc(first.get('body', ''), max(width - 4, 8))}",
                         f"thread:{t.get('id')}", None, "note"))
@@ -4941,8 +4972,13 @@ class Tui:
         vw = max(self.panels["rfind"].rect[3], 24)
         self.panels["rfiles"].set_rows(review_files_rows(rv, fw, self.rv_path), keep)
         self.panels["rdiff"].set_rows(diff_rows(rv, self.rv_path, dwid, self.rv_folded), keep)
-        self.panels["rfind"].set_rows(
-            findings_rows(rv, FIND_TABS[self.panels["rfind"].tab][0], vw, self.rv_checked), keep)
+        pf = self.panels["rfind"]
+        pf.set_rows(findings_rows(rv, FIND_TABS[pf.tab][0], vw, self.rv_checked), keep)
+        pf.tabs = [t for _, t in FIND_TABS]
+        if rv.engine and not rv.verify:
+            # the disprove pass is the reason to trust a finding, so its absence is said where the
+            # decision is made — inside the current tab's brackets, not in a header read once
+            pf.tabs[pf.tab] += " · unverified"
         self.panels["rdiff"].title = "Diff  " + short_path(self.rv_path or "-", max(dwid - 12, 8))
 
     def review_subject(self):
@@ -5031,9 +5067,11 @@ class Tui:
         what = (f"{len(plan['redo'])} of {len(rv.files)} files changed since {plan['prev_oid'][:7]}, "
                 f"{len(plan['carry'])} finding(s) kept"
                 if plan else f"all {len(rv.files)} file{'s' if len(rv.files) != 1 else ''}")
+        cmd = review_cmd_for(rv.repo)
         if self.popup_menu(
                 f"Review {rv.repo}#{rv.number}? {n} call{'s' if n != 1 else ''} to "
-                f"{os.path.basename(CLAUDE_BIN)} {REVIEW_MODEL}",
+                f"{os.path.basename(CLAUDE_BIN)} {REVIEW_MODEL}"
+                + (f" via {cmd}" if cmd else ""),
                 [(f"yes — {what}", True), ("no", False)], cur=1) is not True:
             return
         rv.status, rv.error, self._told_review = "running", None, False
@@ -5071,7 +5109,7 @@ class Tui:
         if k == ord("P"):
             self.post_findings_ui()
             return True
-        if k in (ord("d"), ord("i")) and self.focus == "rfind":
+        if k in (ord("d"), ord("i")) and self.focus in ("rfind", "rdiff") and self.review_finding():
             self.review_details(translate=k == ord("i"))
             return True
         if k == ord("V") and self.focus == "rfind":
@@ -5093,6 +5131,9 @@ class Tui:
             save_review(self.rv)
             self.msg = f"{'ignored' if f.state == 'ignored' else 'restored'}: {trunc(f.title, 50)}"
             self.refresh_review(keep=False)
+            return True
+        if k in (ord("J"), ord("K")):
+            self.panels["rdiff"].move(3 if k == ord("J") else -3)
             return True
         if k == ord("o"):
             url = self.review_url()
@@ -5144,7 +5185,7 @@ class Tui:
         if f is None:
             self.msg = "no finding under the cursor"
             return
-        title, body = f.title, f.body
+        title, body, verdict_tr = f.title, f.body, ""
         if translate:
             if not ai_available():
                 self.msg = f"{CLAUDE_BIN} is not installed — cannot translate"
@@ -5153,19 +5194,24 @@ class Tui:
             if key not in self.rv_tr:
                 self.msg = f"translating to {TR_LANG}…"
                 self.draw()
+                src = f"{f.title}\n\n{f.body}" + (f"\n\n{f.verdict_reason}" if f.verdict_reason else "")
                 try:
-                    self.rv_tr[key] = translate_text(f"{f.title}\n\n{f.body}", "pull request")
+                    self.rv_tr[key] = translate_text(src, "pull request")
                 except Exception as e:  # noqa: BLE001
                     self.msg = f"translation failed: {str(e)[:120]}"
                     return
-            title, _, body = self.rv_tr[key].partition("\n\n")
+            self.msg = ""                    # do not leave "translating…" under a finished popup
+            title, _, rest = self.rv_tr[key].partition("\n\n")
+            body, _, verdict_tr = rest.partition("\n\n") if f.verdict_reason else (rest, "", "")
         w = max(self.panels["rfind"].rect[3] * 2, 60)
         lines = [f"[{f.severity}] {title}", ""]
         lines += wrap(body, w) or [""]
         if f.verdict:
-            lines += ["", f"verdict: {f.verdict}"] + wrap(f.verdict_reason or "", w)
-        lines += ["", f"{f.path}:{f.line} ({f.side})"
-                      + {"moved": "  ⚠ moved onto the nearest changed line",
+            lines += ["", f"verdict: {f.verdict}"] + wrap(verdict_tr or f.verdict_reason or "", w)
+        where = (f"{f.path}:{f.claimed_line}→{f.line}" if f.anchor == "moved" and f.claimed_line
+                 else f"{f.path}:{f.line}")
+        lines += ["", f"{where} ({f.side})"
+                      + {"moved": "  moved onto the nearest line GitHub accepts",
                          "unanchored": "  ⊘ not on a line of this diff — cannot be posted"}.get(f.anchor, "")]
         if f.evidence:
             lines += ["", "evidence:"] + wrap(f.evidence, w)
@@ -5468,7 +5514,8 @@ class Tui:
             if st.startswith("```"):
                 flush(); out.append(ln); in_code = not in_code; continue
             special = in_code or not st or st.startswith(("#", "|", ">", "- ", "* ", "+ ", "```")) or \
-                re.match(r"^\d+[.)] ", st) or ln.startswith(("    ", "\t"))
+                re.match(r"^\d+[.)] ", st) or ln.startswith(("    ", "\t")) or \
+                NOISE_LINE_RE.match(st)   # a pasted kernel log keeps its hard newlines even unfenced
             if special:
                 flush(); out.append(ln)
             else:
@@ -6321,6 +6368,10 @@ class Tui:
         return 0 if THEME == "basic" else self.curses.A_DIM
 
     def put(self, y, x, text, attr=0, fill=0):
+        # curses expands a literal tab to the next tab stop while clip()/dw() count it as one column,
+        # so a tab that survives to addstr walks the line past whatever box it was clipped for —
+        # kernel diffs in the d / P popups are full of them
+        text = expand_tabs(text)
         h, w = self.scr.getmaxyx()
         if y < 0 or y >= h or x >= w:
             return
@@ -6336,6 +6387,7 @@ class Tui:
         """hl = (c0, c1): display columns (before hs) drawn reversed, for the drag selection."""
         col, cx = 0, x
         for text, st in colorize_people(segments(row, self.g)):
+            text = expand_tabs(text)          # same tab-vs-addstr mismatch as put()
             attr = self.style_attr(st) | extra
             buf = []
             for ch in text:
@@ -6418,6 +6470,14 @@ class Tui:
                 title += " "
                 zones.append((dw(title), dw(title) + 1, ("tab", -1)))
                 title += f"‹ {t_} {cnt.get(k_, 0)} "
+                zones.append((dw(title), dw(title) + 1, ("tab", +1)))
+                title += f"› {p.tab + 1}/{len(p.tabs)}"
+            elif key == "rfind":
+                # six tab names never fit the Findings column, and a strip cut mid-word hides which
+                # tab is even current — so this panel gets the Inbox's compact ‹ current › form
+                title += " "
+                zones.append((dw(title), dw(title) + 1, ("tab", -1)))
+                title += f"‹ {p.tabs[p.tab]} "
                 zones.append((dw(title), dw(title) + 1, ("tab", +1)))
                 title += f"› {p.tab + 1}/{len(p.tabs)}"
             else:
@@ -8013,7 +8073,7 @@ def main(argv=None):
                 ap.error('review needs a PR: gg review 123 (also #123, owner/name#123, a pull request URL)')
             return do_review(a.arg, a.repo, refresh=a.refresh, as_json=a.json, no_ai=a.no_ai,
                              verify=not a.no_verify, post=a.post, yes=a.yes, dry_run=a.dry_run,
-                             to_tui=not (a.print_ or a.json), opts=a,
+                             to_tui=not (a.print_ or a.json or a.post), opts=a,
                              color=a.color == "always" or (a.color == "auto" and sys.stdout.isatty()))
         elif a.cmd == "show":
             if not a.arg:
