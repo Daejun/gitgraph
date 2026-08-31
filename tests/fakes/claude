@@ -140,6 +140,17 @@ def main():
                   "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5},
         "total_cost_usd": 0.001,
     }
+    if "stream-json" in argv:
+        # the streamed form gitgraph's review passes read: an init line, two tool uses (so the live
+        # progress path is exercised), then the same result object as the final line
+        for ev in ({"type": "system", "subtype": "init"},
+                   {"type": "assistant", "message": {"content": [
+                       {"type": "tool_use", "name": "Read", "input": {"file_path": "data.c"}}]}},
+                   {"type": "assistant", "message": {"content": [
+                       {"type": "tool_use", "name": "Grep", "input": {"pattern": "spin_lock"}}]}},
+                   reply):
+            sys.stdout.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        return 0
     sys.stdout.write(json.dumps(reply, ensure_ascii=False))
     return 0
 

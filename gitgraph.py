@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.28.1"
+VERSION = "0.29.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -2945,6 +2945,86 @@ def review_cmd_for(repo):
     return default
 
 
+def _tool_line(content):
+    """One short line for a tool_use block: 'Read gc.c', 'Grep first_fatal_err', 'git log --oneline'."""
+    name = content.get("name", "?")
+    inp = content.get("input") or {}
+    arg = (os.path.basename(str(inp.get("file_path", ""))) or inp.get("pattern")
+           or inp.get("command") or inp.get("query") or "")
+    return trunc(f"{name} {arg}".strip(), 48)
+
+
+def claude_stream(prompt, model, phase, timeout=300, cwd=None, tools=(), on_event=None):
+    """claude_call for the claude backend, watched live: the same call with --output-format
+    stream-json, each tool use reported through on_event(text) as it happens. A 7-minute review that
+    shows a frozen screen reads as a hang; one that says 'Read gc.c · 14 tool calls' reads as work."""
+    cmd = [CLAUDE_BIN, "-p", "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+           "--model", model]
+    if tools:
+        cmd += ["--allowedTools"] + list(tools)
+    if cwd:
+        cmd += ["--add-dir", cwd]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=cwd or None, start_new_session=True)
+    result, n_tools, deadline = None, 0, time.time() + timeout
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+        for line in proc.stdout:
+            if time.time() > deadline:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "assistant":
+                for c in ((ev.get("message") or {}).get("content") or []):
+                    if isinstance(c, dict) and c.get("type") == "tool_use":
+                        n_tools += 1
+                        if on_event:
+                            on_event(f"{_tool_line(c)} · {n_tools} tool calls")
+            elif ev.get("type") == "result":
+                result = ev
+        proc.wait(timeout=max(deadline - time.time(), 5))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        err = f"{CLAUDE_BIN} took more than {timeout}s (review_timeout)"
+        AI_FAILURES.append({"bin": CLAUDE_BIN, "msg": err, "t": time.time()})
+        raise ValueError(err) from None
+    if result is None or proc.returncode:
+        err = (proc.stderr.read() or "").strip().splitlines()
+        msg = (err[-1] if err else f"{CLAUDE_BIN} exited {proc.returncode}")[:300]
+        if "unknown option" in msg.lower() or "unrecognized" in msg.lower():
+            # an older claude CLI without stream-json in -p: same call, without the live view
+            return claude_call(prompt, model, phase, timeout=timeout, cwd=cwd, tools=tools)
+        AI_FAILURES.append({"bin": CLAUDE_BIN, "msg": msg, "t": time.time()})
+        raise ValueError(msg)
+    u = result.get("usage") or {}
+    rec = USAGE["by"].setdefault(phase, {"calls": 0, "input": 0, "cache_read": 0, "cache_create": 0,
+                                         "output": 0, "cost_usd": 0.0})
+    for tgt in (USAGE, rec):
+        tgt["calls"] += 1
+        tgt["input"] += u.get("input_tokens", 0)
+        tgt["cache_read"] += u.get("cache_read_input_tokens", 0)
+        tgt["cache_create"] += u.get("cache_creation_input_tokens", 0)
+        tgt["output"] += u.get("output_tokens", 0)
+        tgt["cost_usd"] += result.get("total_cost_usd") or 0.0
+    if result.get("is_error"):
+        raise ValueError(str(result.get("result", "claude reported an error"))[:300])
+    return result.get("result") or ""
+
+
+def review_call(prompt, model, phase, timeout, cwd, tools, on_event=None):
+    """The review passes' call: streamed with live events on the claude backend, plain elsewhere."""
+    if ai_backend() == "claude":
+        return claude_stream(prompt, model, phase, timeout=timeout, cwd=cwd, tools=tools,
+                             on_event=on_event)
+    return claude_call(prompt, model, phase, timeout=timeout, cwd=cwd, tools=tools)
+
+
 def review_prompt(rv, paths, body="", cmd=""):
     """The built-in protocol, or `cmd` handed the range and the diff. The contract is appended either
     way — that is what keeps a borrowed skill's findings drawable in the same panel."""
@@ -2977,14 +3057,22 @@ def run_review(rv, body="", on_step=None, verify=None, plan=None):
     changes = list(plan["changes"]) if plan else []
     findings, reach, errors = list(carried), (plan or {}).get("reachability"), []
 
+    seen = {"n": 0}
+
+    def live(what):
+        seen["n"] += 1
+        progress("review", seen.get("done", 0), len(chunks), what)
+        if PROGRESS is None and seen["n"] % 15 == 0:
+            log(f"review: {what}")            # `gg review --print` would otherwise sit silent for minutes
+
     def one(paths):
-        return claude_call(review_prompt(rv, paths, body, cmd), REVIEW_MODEL, "review",
-                           timeout=REVIEW_TIMEOUT, cwd=rv.worktree,
-                           tools=REVIEW_CMD_TOOLS if cmd else REVIEW_TOOLS)
+        return review_call(review_prompt(rv, paths, body, cmd), REVIEW_MODEL, "review",
+                           REVIEW_TIMEOUT, rv.worktree,
+                           REVIEW_CMD_TOOLS if cmd else REVIEW_TOOLS, on_event=live)
 
     def one_builtin(paths):
-        return claude_call(review_prompt(rv, paths, body), REVIEW_MODEL, "review",
-                           timeout=REVIEW_TIMEOUT, cwd=rv.worktree, tools=REVIEW_TOOLS)
+        return review_call(review_prompt(rv, paths, body), REVIEW_MODEL, "review",
+                           REVIEW_TIMEOUT, rv.worktree, REVIEW_TOOLS, on_event=live)
 
     from concurrent.futures import ThreadPoolExecutor
     done = 0
@@ -2992,6 +3080,7 @@ def run_review(rv, body="", on_step=None, verify=None, plan=None):
     with ThreadPoolExecutor(max_workers=max(1, min(AI_PARALLEL, len(chunks)))) as pool:
         for paths, out in zip(chunks, pool.map(_safe, ((one, c) for c in chunks))):
             done += 1
+            seen["done"] = done
             progress("review", done, len(chunks), "reviewing")
             if on_step:
                 on_step(done, len(chunks))
@@ -3148,12 +3237,12 @@ def verify_prompt(rv, f):
         title=f.title, body=f.body, evidence=f.evidence or "(none given)") + VERIFY_CONTRACT
 
 
-def verify_finding(rv, f):
+def verify_finding(rv, f, on_event=None):
     """One adversarial call. Sets verdict / verdict_reason on f; leaves it PLAUSIBLE when the check
     itself fails — an unusable answer is not evidence that the finding is wrong."""
     try:
-        out = claude_call(verify_prompt(rv, f), VERIFY_MODEL, "verify",
-                          timeout=REVIEW_TIMEOUT, cwd=rv.worktree, tools=REVIEW_TOOLS)
+        out = review_call(verify_prompt(rv, f), VERIFY_MODEL, "verify",
+                          REVIEW_TIMEOUT, rv.worktree, REVIEW_TOOLS, on_event=on_event)
     except Exception as e:  # noqa: BLE001
         f.verdict, f.verdict_reason = "PLAUSIBLE", f"could not be checked: {str(e)[:120]}"
         return f
@@ -3179,9 +3268,15 @@ def run_verify(rv, findings=None, on_step=None):
     done = 0
     progress("verify", 0, len(todo), "checking findings")
     from concurrent.futures import ThreadPoolExecutor
+    state = {"done": 0}
+
+    def live(what):
+        progress("verify", state["done"], len(todo), what)
+
     with ThreadPoolExecutor(max_workers=max(1, min(AI_PARALLEL, len(todo)))) as pool:
-        for _ in pool.map(lambda f: verify_finding(rv, f), todo):
+        for _ in pool.map(lambda f: verify_finding(rv, f, on_event=live), todo):
             done += 1
+            state["done"] = done
             progress("verify", done, len(todo), "checking findings")
             if on_step:
                 on_step(done, len(todo))
@@ -4839,6 +4934,8 @@ class Tui:
         el = int(time.time() - self.t0)
         els = f"{el // 60}m{el % 60:02d}s" if el >= 60 else f"{el}s"
         names = {"fetch": "fetching issues/PRs", "stubs": "resolving referenced items",
+                 "review": f"reviewing ({model_label(REVIEW_MODEL)})",
+                 "verify": f"checking findings ({model_label(VERIFY_MODEL)})",
                  "translate": f"translating ({model_label(TR_MODEL)})", "summarize": f"summarizing ({model_label(TR_MODEL)})",
                  "error": "error"}
         phase, done, total = p.get("phase", "starting"), p.get("done", 0), p.get("total")

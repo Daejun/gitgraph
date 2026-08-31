@@ -155,7 +155,7 @@ class RunReviewCase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="gg-review-ai-")
-        self._old = (gg.CACHE_DIR, gg.claude_call, gg.ai_available)
+        self._old = (gg.CACHE_DIR, gg.claude_call, gg.review_call, gg.ai_available)
         gg.CACHE_DIR = os.path.join(self.tmp, ".cache", "gitgraph")
         os.makedirs(gg.CACHE_DIR)
         gg.ai_available = lambda: True
@@ -164,7 +164,7 @@ class RunReviewCase(unittest.TestCase):
         self.assertTrue(gg.CACHE_DIR.startswith(tempfile.gettempdir()))
 
     def _restore(self):
-        gg.CACHE_DIR, gg.claude_call, gg.ai_available = self._old
+        gg.CACHE_DIR, gg.claude_call, gg.review_call, gg.ai_available = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def answer(self, *replies):
@@ -180,6 +180,9 @@ class RunReviewCase(unittest.TestCase):
             return out
 
         gg.claude_call = fake
+        # the review passes stream on the claude backend; both routes land on the same fake
+        gg.review_call = (lambda prompt, model, phase, timeout, cwd, tools, on_event=None:
+                          fake(prompt, model, phase, timeout=timeout, cwd=cwd, tools=tools))
 
 
 class TestRunReview(RunReviewCase):
