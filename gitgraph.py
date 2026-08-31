@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.27.5"
+VERSION = "0.28.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -5417,12 +5417,18 @@ class Tui:
     def mark_prefix(self, nid):
         return "✎ " if self.marked(nid) else ""
 
+    def todo_visible(self):
+        """The marks this session shows: this session's repos, plus anything the loaded graph knows
+        (an item of another repo referenced from here can be marked, and must not then vanish).
+        Marks made in sessions on other repos stay theirs — todo.json and `gg todo` keep everything."""
+        repos = set(self.o.get("repos") or [])
+        return [e for e in self.todo if not e.get("done")
+                and (not e.get("repo") or e["repo"] in repos or e.get("item") in self.g.nodes)]
+
     def todo_rows(self):
         g, w = self.g, self.o["width"]
         rows = []
-        for e in sorted(self.todo, key=lambda e: e["created"], reverse=True):
-            if e.get("done"):
-                continue
+        for e in sorted(self.todo_visible(), key=lambda e: e["created"], reverse=True):
             n = g.nodes.get(e["item"])
             head = item_label(g, n, w, with_meta=False) if n else f"{e['item_num']} {trunc(e['title'], w)}"
             text = f"✎ {head}"
@@ -5438,11 +5444,11 @@ class Tui:
     def home_rows(self):
         if self.HOME_TABS[self.panels["home"].tab][0] == "todo":
             self.home_counts = getattr(self, "home_counts", {})
-            self.home_counts["todo"] = sum(1 for e in self.todo if not e.get("done"))
+            self.home_counts["todo"] = len(self.todo_visible())
             return self.todo_rows()
         secs = self.home_sections()
         self.home_counts = {k: len(v) for k, v in secs.items()}
-        self.home_counts["todo"] = sum(1 for e in self.todo if not e.get("done"))
+        self.home_counts["todo"] = len(self.todo_visible())
         key = self.HOME_TABS[self.panels["home"].tab][0]
         return secs[key] or [Row("(nothing here)", kind="head")]
 
@@ -6708,7 +6714,7 @@ class Tui:
                 "item": node_info(self.item), "subject": node_info(self.subject),
                 "review": self.review_info(),
                 "cursor_row": r.text.strip() if r else "", "answer": (self.answer or "")[:4000],
-                "todo_open": sum(1 for e in self.todo if not e.get("done"))}
+                "todo_open": len(self.todo_visible())}
 
     def review_info(self):
         """The review half of the snapshot: null in browse mode, so old readers see no change."""

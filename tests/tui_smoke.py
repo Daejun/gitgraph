@@ -623,16 +623,20 @@ def cold_start_paints_early():
 
 
 def cross_repo_mark():
-    """A mark on an item this graph does not hold (another repo, a closed item) must still be editable
-    and deletable from the Inbox todo section. Reported bug: its row carries no node id, so Del acted
-    on whatever was selected before it and the entry stayed."""
+    """The Inbox todo section is scoped to this session: a mark from an unrelated repo stays out of
+    the list (todo.json and `gg todo` keep it), while a mark on an item the loaded graph knows — a
+    referenced item of another repo — is shown, editable and deletable. The graph-referenced case
+    also pins an old bug: its row carried no node id, so Del acted on whatever was selected before."""
     home = testenv.make_home()
     todo_path = os.path.join(home, ".config", "gitgraph", "todo.json")
     os.makedirs(os.path.dirname(todo_path), exist_ok=True)
     entries = [
-        {"id": "aaa-other-repo", "created": "2026-08-28T12:00", "repo": "elsewhere/repo",
-         "item": "elsewhere/repo#7", "item_num": "repo#7", "title": "a mark from another repo",
-         "url": "https://github.com/elsewhere/repo/issues/7", "note": "not in this graph", "done": False},
+        {"id": "aaa-unrelated", "created": "2026-08-29T12:00", "repo": "elsewhere/repo",
+         "item": "elsewhere/repo#7", "item_num": "repo#7", "title": "a mark from another session",
+         "url": "https://github.com/elsewhere/repo/issues/7", "note": "different repo", "done": False},
+        {"id": "ccc-referenced", "created": "2026-08-28T12:00", "repo": "other/lib",
+         "item": "other/lib#42", "item_num": "lib#42", "title": "a referenced item of another repo",
+         "url": "https://github.com/other/lib/issues/42", "note": "in this graph as a stub", "done": False},
         {"id": "bbb-this-repo", "created": "2026-08-27T12:00", "repo": testenv.FIXTURE_REPO,
          "item": f"{testenv.FIXTURE_REPO}#5", "item_num": "#5", "title": "a mark from this repo",
          "url": "", "note": "keep me", "done": False},
@@ -648,19 +652,24 @@ def cross_repo_mark():
             if "todo" in s.line(s.find_line("3 Inbox")):
                 break
             s.key("[", 0.5)
-        # the row for an item in this graph shows its live label, the one from elsewhere its stored title
-        check("both marks are listed", "repo#7" in s.text() and "#5" in s.text(), s.text()[:600])
-        s.key("g", 0.6)                           # the newest mark: the one from the other repo
+        check("this repo's mark and the referenced one are listed",
+              "lib#42" in s.text() and "#5" in s.text(), s.text()[:700])
+        check("a mark from an unrelated repo is not",
+              "repo#7" not in s.text() and "another session" not in s.text(), s.text()[:700])
+        s.key("g", 0.6)                           # the newest visible mark: the referenced one
         s.key("\x1b[3~", 1.5)                     # Del
         with open(todo_path, encoding="utf-8") as f:
             left = json.load(f)
-        check("Del removes the mark of an item outside this graph",
-              [e["id"] for e in left if not e.get("done")] == ["bbb-this-repo"],
+        check("Del removes the mark of the graph-referenced item",
+              sorted(e["id"] for e in left if not e.get("done")) == ["aaa-unrelated", "bbb-this-repo"],
               json.dumps(left, ensure_ascii=False)[:400])
         i = s.find_line("3 Inbox")
         panel = "\n".join(s.text().splitlines()[i:i + 6])
         check("the other mark survives in the list", "#5" in panel, panel)
-        check("its row is gone from the list", "repo#7" not in panel, panel)
+        check("its row is gone from the list", "lib#42" not in panel, panel)
+        check("the unrelated mark is untouched in todo.json",
+              any(e["id"] == "aaa-unrelated" and not e.get("done") for e in left),
+              json.dumps(left)[:300])
         check("the message names what was removed", "mark removed" in s.text(), s.text()[-200:])
         check("no traceback", "Traceback" not in s.log())
     finally:

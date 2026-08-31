@@ -136,7 +136,7 @@ lazygit 식 layout: 왼쪽 side column의 panel들(Repo · Item · Inbox · Comm
 |---|---|---|
 | 1 Repo | repo, open 수, fetch 시각, "나", 토글 상태, 토큰 사용량 | – |
 | 2 Item | 현재 item: 제목, 메타, `» 한 줄 요약`(없으면 본문 첫 줄), 코멘트/링크 수, URL | main에서 읽기 |
-| 3 Inbox | 한 번에 한 섹션(`[` `]`): todo · my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`). my turn / active / waiting / PRs 행에서는 커서가 **마지막 코멘트**를 미리 보여줌(main에 코멘트가 뜨는 이유); my turn 행 끝에 왜 내 차례인지 표시: `⟵ @who mentioned +5d`, `@who on my PR +14d`, `@who replied +2d` | **현재 item**으로 설정 — Item, Links, Comments, People이 따라옴 |
+| 3 Inbox | 한 번에 한 섹션(`[` `]`): todo (이 세션의 repo 것만 — 이 그래프가 참조하는 항목의 마크는 포함; `gg todo`는 여전히 전체를 출력) · my turn · mentions · opened · active · waiting · mine · PRs by others · stale · all — 규칙은 전과 같음("my turn" = 내가 관여한 항목 중 남이 마지막으로 말한 것, `--days N`, "나" = gh 계정 / `-u` / `u`). my turn / active / waiting / PRs 행에서는 커서가 **마지막 코멘트**를 미리 보여줌(main에 코멘트가 뜨는 이유); my turn 행 끝에 왜 내 차례인지 표시: `⟵ @who mentioned +5d`, `@who on my PR +14d`, `@who replied +2d` | **현재 item**으로 설정 — Item, Links, Comments, People이 따라옴 |
 | 5 Links | 현재 item과 그 코멘트의 모든 edge: `→ refs`, `← cited-by`, `→ closes`, `← closed-by`(어느 코멘트 경유인지). 각 링크 아래 `↳` 줄(최대 두 줄)에 **이유**: 참조가 나온 문장을 요약기가 40자 이내 한 줄로 바꾼 것(예: `충돌 여부를 확인한 관련 PR`; 오기 전이거나 요약이 꺼져 있으면 `#N` 주변 짧은 인용), 그런 원문이 없으면(GitHub timeline에만 기록된 참조, 닫힌 항목) 그 issue/PR의 한 줄 요약(`» …`, 본문을 받아온 뒤 코멘트와 같은 요약기로; 대기 중엔 `» 요약 중…`) | 그 item으로 이동; 코멘트 행이면 그 item으로 가고 커서는 그 코멘트에(`b`/Esc로 복귀) |
 | 4 Comments | 현재 item의 코멘트 `+Nd o @who » 요약`, 최신이 위 | main에서 읽기 |
 | 6 People | 현재 item의 작성자·코멘트 작성자·mention된 사람, 최근 활동 순 | 그 사람 관점으로 Inbox 보기 |
