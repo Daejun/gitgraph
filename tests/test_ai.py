@@ -334,6 +334,20 @@ class TestGenericBackend(AiCase):
 
 
 
+class TestShortLineTranslation(unittest.TestCase):
+    """A short single line rides the JSON-locked title-batch path: free-form translation of a
+    one-liner made a thinking-free haiku answer "I'll translate this for you" half the time, and
+    that chatty line — the only unwrapped one — once pushed the finding popup to 203 columns."""
+
+    def test_a_title_goes_through_the_batch_path(self):
+        self.assertEqual(gg.translate_text("Batched drain treats -ENOMEM as fatal", "pull request"),
+                         "TR:Batched drain treats -ENOMEM as fatal")   # the fake claude's batch shape
+
+    def test_prose_still_takes_the_full_text_path(self):
+        body = "First paragraph about the drain.\n\nSecond paragraph about the caller."
+        self.assertTrue(gg.translate_text(body, "pull request").startswith("TRFULL:"))
+
+
 class TestMcpSuppression(unittest.TestCase):
     """A translation call must not boot the user's MCP servers or spend thinking tokens; a review
     call must keep both — inherited MCP and thinking are what its analysis runs on."""

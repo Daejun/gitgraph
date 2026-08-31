@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.28.0"
+VERSION = "0.28.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -1506,7 +1506,13 @@ def translate_body(n, g, lang=TR_LANG):
 
 def translate_text(text, kind="issue", lang=TR_LANG):
     """Prose only (code fences and log lines stay), long bodies split into ~1,200-character chunks
-    translated in parallel (AI_PARALLEL). Cached by text hash in translations_full.json."""
+    translated in parallel (AI_PARALLEL). Cached by text hash in translations_full.json.
+
+    A short single line takes the title-batch path instead: its JSON-array contract is what keeps a
+    thinking-free haiku from answering "I'll translate this for you" — which, on a one-line input,
+    it otherwise does about half the time."""
+    if text and "\n" not in text.strip() and len(text) <= 200:
+        return translate_texts([text.strip()], lang).get(text.strip(), text)
     body = (text or "")[:TR_FULL_CHARS]
     if not body.strip():
         return ""
@@ -5270,7 +5276,8 @@ class Tui:
             parts = [(lab, done[i] if i < len(done) else txt) for i, (lab, txt) in enumerate(parts)]
         w = max(self.panels["rfind"].rect[3] * 2, 60)
         first_lab, first_txt = parts[0]
-        lines = [f"{tag} {first_txt}" if not first_lab else f"{tag} {first_lab}: {first_txt}", ""]
+        first = f"{tag} {first_txt}" if not first_lab else f"{tag} {first_lab}: {first_txt}"
+        lines = wrap(first, w) + [""]
         for lab, txt in parts[1:]:
             if lab:
                 lines += ["", lab] if not txt else ["", lab] + wrap(txt, w)
