@@ -693,6 +693,41 @@ def portrait_and_theme():
         s.kill()
 
 
+def refetch_drops_current_item():
+    """R (full refetch) while the current item closed on GitHub in the meantime: the rebuilt graph no
+    longer holds it, and every panel renderer indexes g.nodes[item]. Crashed with a KeyError in
+    links_rows on a real repo (an item closed between two fetches); the item is now cleared with a
+    message instead."""
+    home = testenv.make_home()
+    fixture = gh_fixture(home)
+    s = Session(["--no-summary", "-t", "none", "2"], home=home, FAKE_GH_FIXTURE=fixture)
+    try:
+        s.wait_for("6 People", 30)
+        s.settle()
+        check("the tui starts on the item", (current_item(s) or "").endswith("#2"), str(current_item(s)))
+        with open(fixture, encoding="utf-8") as f:
+            d = json.load(f)
+        # 2 on purpose: nothing in the fixture references it, so the refetched graph holds no trace of
+        # it — an item that IS still referenced (say 1, named by 3's body) comes back as a stub instead,
+        # and staying on a stub is correct
+        del d["repos"][testenv.FIXTURE_REPO]["issues"]["2"]      # closed on GitHub since
+        with open(fixture, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        s.key("R", 0.8)
+        s.key("1", 1.0)                       # the confirmation: 1 = yes
+        s.settle(30)
+        check("the refetch survives the vanished item", "Traceback" not in s.log(),
+              "\n".join(l for l in s.log().splitlines() if "Error" in l or "KeyError" in l)[:400])
+        check("the item was cleared, with a reason",
+              current_item(s) is None and "closed on GitHub" in s.text(),
+              f"item={current_item(s)!r}\n" + s.text()[-300:])
+        s.key("j", 0.5)                       # the tui is still usable
+        s.key("\r", 1.0)
+        check("a new item can be opened afterwards", current_item(s) is not None, str(current_item(s)))
+    finally:
+        s.kill()
+
+
 def ai_failure_popup():
     """0.16.0: when the AI CLI fails, the TUI offers to switch / keep / turn off."""
     s = Session(FAKE_AI_FAIL="1")
@@ -952,6 +987,7 @@ def main():
     review_mode()
     review_mode_narrow()
     review_with_a_clone()
+    refetch_drops_current_item()
     cold_start_paints_early()
     cross_repo_mark()
     portrait_and_theme()

@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.29.0"
+VERSION = "0.29.1"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -5064,6 +5064,14 @@ class Tui:
         return max(24, w - 24)
 
     def refresh_all(self, keep=True):
+        # a refetch may have dropped the current item (closed since, another repo): every renderer
+        # below is allowed to index g.nodes[self.item], so it is cleared here, once, not guarded there.
+        # R on a busy repo crashed exactly like this — KeyError in links_rows on an item that had
+        # closed between two fetches.
+        if self.item is not None and self.item not in self.g.nodes:
+            self.item, self.msg = None, self.msg or "the item on screen was closed on GitHub — cleared"
+        if self.subject is not None and self.subject not in self.g.nodes:
+            self.subject = self.item
         self.o["width"] = self.label_w()
         self.panels["repo"].rows = self.repo_rows()
         self.panels["home"].set_rows(self.home_rows(), keep)
