@@ -197,6 +197,47 @@ class TodoQaInProcessTestCase(unittest.TestCase):
         self.gg.save_todo(kept)
         self.assertEqual(self.gg.load_todo(), [open_e])
 
+    # -- Tui.sync_todo: todo.json edited behind a running tui ----------------------------------------
+    def _screenless_tui(self):
+        """A Tui with just the fields sync_todo touches; refresh_all is counted instead of drawn."""
+        gg = self.gg
+        t = gg.Tui.__new__(gg.Tui)
+        t.todo, t._todo_stamp, t.msg = gg.load_todo(), gg.todo_stamp(), ""
+        t.refreshes = []
+        t.refresh_all = lambda: t.refreshes.append(1)
+        return t
+
+    def test_sync_todo_reloads_marks_removed_behind_the_tui(self):
+        """C opens claude full screen; its gg_todo_done finds no answering tui and rewrites todo.json
+        itself; the tui must pick that up on return instead of showing the marks until a restart."""
+        e = self.gg.todo_entry(self.g, "test/repo#1", "handled by claude")
+        self.gg.save_todo([e])
+        t = self._screenless_tui()
+        self.assertEqual(t.todo, [e])
+        self.gg.todo_finish("1", remove=True)          # what gg_todo_done's fallback does
+        t.sync_todo()
+        self.assertEqual(t.todo, [])
+        self.assertEqual(t.refreshes, [1])
+        self.assertIn("reloaded", t.msg)
+        t.sync_todo()                                  # nothing moved since: no second refresh
+        self.assertEqual(t.refreshes, [1])
+
+    def test_sync_todo_ignores_the_tuis_own_save(self):
+        t = self._screenless_tui()
+        t.todo.append(self.gg.todo_entry(self.g, "test/repo#2", ""))
+        self.gg.save_todo(t.todo)                      # m in the tui: the stamp moves, the content is ours
+        t.sync_todo()
+        self.assertEqual(t.refreshes, [])
+        self.assertEqual(t.msg, "")
+        self.assertEqual(t._todo_stamp, self.gg.todo_stamp())
+
+    def test_sync_todo_with_no_file_and_no_marks_is_quiet(self):
+        os.remove(self.gg.TODO_JSON)
+        t = self._screenless_tui()
+        self.assertIsNone(t._todo_stamp)
+        t.sync_todo()
+        self.assertEqual((t.todo, t.refreshes), ([], []))
+
     # -- qa.json -----------------------------------------------------------------------------------
     def test_qa_anchored_to_an_item_and_read_back(self):
         self.gg.save_qa("test/repo#1", "why does this crash?", "empty extent list")

@@ -671,6 +671,24 @@ def cross_repo_mark():
               any(e["id"] == "aaa-unrelated" and not e.get("done") for e in left),
               json.dumps(left)[:300])
         check("the message names what was removed", "mark removed" in s.text(), s.text()[-200:])
+        # 0.29.2: todo.json edited behind the running tui — claude opened full screen with C ticks a
+        # mark off through gg_todo_done, finds no answering tui and rewrites the file itself (also
+        # `gg todo done` in another shell). The tui used to show the mark until a restart.
+        with open(todo_path, "w", encoding="utf-8") as f:
+            json.dump([e for e in left if e["id"] != "bbb-this-repo"], f, ensure_ascii=False)
+        s.key("", 1.6)                            # two idle ticks
+        i = s.find_line("3 Inbox")
+        panel = "\n".join(s.text().splitlines()[i:i + 6])
+        check("a mark removed behind the tui leaves the list without a restart", "#5" not in panel, panel)
+        check("the reload is announced", "reloaded" in s.text(), s.text()[-300:])
+        # a command from `gg mcp` that its sender gave up on long ago (left behind while the tui was
+        # blocked behind a full-screen claude) is dropped, not run minutes later
+        cmd_path = os.path.join(home, ".cache", "gitgraph", "cmd.json")
+        with open(cmd_path, "w", encoding="utf-8") as f:
+            json.dump({"op": "open", "id": f"{testenv.FIXTURE_REPO}#1", "req": f"{time.time() - 120:.3f}"}, f)
+        s.key("", 1.6)
+        check("a stale gg mcp command is dropped", current_item(s) is None and not os.path.exists(cmd_path),
+              f"item={current_item(s)} cmd.json exists={os.path.exists(cmd_path)}")
         check("no traceback", "Traceback" not in s.log())
     finally:
         s.kill()

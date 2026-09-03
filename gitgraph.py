@@ -31,7 +31,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.29.1"
+VERSION = "0.29.2"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -4827,7 +4827,7 @@ class Tui:
         self.o.setdefault("summary", True)
         self.me = ME or [a.lower() for a in gh_accounts()]
         self.item, self.subject, self.hist, self.fwd = None, None, [], []
-        self.todo = load_todo()
+        self.todo, self._todo_stamp = load_todo(), todo_stamp()
         self.show_tr = False   # main content: the original until i (or the title button) asks for a translation
         self.last_side = "home"   # the side list panel that stays expanded while main is focused
         self.tr_thread, self.tr_pending = None, None
@@ -6853,8 +6853,26 @@ class Tui:
             except OSError:
                 pass
 
+    def sync_todo(self):
+        """todo.json changed behind the tui: claude running full screen (C) ticked marks off with
+        gg_todo_done while this loop was blocked — send_cmd got no answer and wrote the file itself —
+        or `gg todo done` ran in another shell, or another gg session marked something. Reload it,
+        so the marks do not come back to life until a restart."""
+        stamp = todo_stamp()
+        if stamp == self._todo_stamp:
+            return
+        entries = load_todo()
+        if todo_stamp() != stamp:                  # being written right now; the next tick sees it whole
+            return
+        self._todo_stamp = stamp
+        if entries != self.todo:
+            self.todo = entries
+            self.refresh_all()
+            self.msg = "marks changed outside gg (claude / gg todo) — reloaded"
+
     def poll_cmd(self):
         """Commands from `gg mcp` (Claude in another window): open an item, mark it."""
+        self.sync_todo()
         cmd = read_json(CMD_PATH)
         if not cmd:
             return
@@ -6862,6 +6880,16 @@ class Tui:
             os.remove(CMD_PATH)
         except OSError:
             pass
+        try:
+            age = time.time() - float(cmd.get("req") or 0)
+        except (TypeError, ValueError):
+            age = 0
+        if age > 10:
+            # send_cmd() gives up after 3s and does the work itself (todo_finish, save_todo); a command
+            # found long after that was left by a sender that no longer waits — the tui was blocked
+            # behind a full-screen claude — and running it now would double-apply or jump the screen
+            log(f"stale command from gg mcp dropped ({age:.0f}s old): {cmd}")
+            return
         msg = "unknown command"
         try:
             if cmd.get("op") == "open" and str(cmd.get("id", "")).startswith("finding:"):
@@ -6906,6 +6934,7 @@ class Tui:
             sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h")
             sys.stdout.flush()
             self.msg = "back from claude"
+            self.sync_todo()                 # marks it ticked off while this loop was blocked
 
     def draw(self):
         c = self.curses
@@ -7615,6 +7644,15 @@ def load_todo():
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return []
+
+
+def todo_stamp():
+    """Identity of todo.json on disk (mtime, size), None when absent — the tui reloads when it moves."""
+    try:
+        st = os.stat(TODO_JSON)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
 
 def todo_md_path():
