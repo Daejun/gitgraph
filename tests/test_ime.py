@@ -188,5 +188,63 @@ class TestShortcutCoverageInHangulMode(unittest.TestCase):
             self.assertEqual(gg.hangul_keys(jamo), key)
 
 
+class TestImeSwitch(unittest.TestCase):
+    """gg.ime_state()/ime_set(): the fcitx5-remote switch behind 0.30.0's 'shortcuts get an English
+    keyboard' — driven here against tests/fakes/fcitx5-remote (on PATH via env.load_module()), whose
+    state lives in $FAKE_IME_STATE_FILE and whose calls land in $FAKE_IME_LOG."""
+
+    def setUp(self):
+        home = os.environ["HOME"]
+        self.state = os.path.join(home, "ime-state")
+        self.log = os.path.join(home, "ime-log")
+        for p in (self.state, self.log):
+            if os.path.exists(p):
+                os.remove(p)
+        os.environ["FAKE_IME_STATE_FILE"] = self.state
+        os.environ["FAKE_IME_LOG"] = self.log
+        os.environ.pop("GITGRAPH_IME_SWITCH", None)
+
+    def tearDown(self):
+        for k in ("FAKE_IME_STATE_FILE", "FAKE_IME_LOG", "GITGRAPH_IME_SWITCH"):
+            os.environ.pop(k, None)
+
+    def calls(self):
+        with open(self.log, encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def test_state_and_set_round_trip(self):
+        self.assertEqual(gg.ime_state(), 2)          # the fake starts in Hangul mode
+        gg.ime_set(False)
+        self.assertEqual(gg.ime_state(), 1)
+        gg.ime_set(True)
+        self.assertEqual(gg.ime_state(), 2)
+        self.assertEqual(self.calls(), ["", "-c", "", "-o", ""])
+
+    def test_disabled_by_config_runs_nothing(self):
+        os.environ["GITGRAPH_IME_SWITCH"] = "false"
+        self.assertIsNone(gg.ime_tool())
+        self.assertIsNone(gg.ime_state())
+        gg.ime_set(False)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_without_fcitx5_remote_on_path_is_a_quiet_none(self):
+        path = os.environ["PATH"]
+        os.environ["PATH"] = os.path.join(os.environ["HOME"], "no-such-dir")
+        try:
+            self.assertIsNone(gg.ime_tool())
+            self.assertIsNone(gg.ime_state())
+            gg.ime_set(True)                          # no exception
+        finally:
+            os.environ["PATH"] = path
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_tui_ime_english_only_acts_on_hangul_mode(self):
+        t = gg.Tui.__new__(gg.Tui)
+        gg.Tui.ime_english(t)                         # state 2: switched
+        self.assertEqual(self.calls(), ["", "-c"])
+        gg.Tui.ime_english(t)                         # state 1 now: only the query
+        self.assertEqual(self.calls(), ["", "-c", ""])
+
+
 if __name__ == "__main__":
     unittest.main()

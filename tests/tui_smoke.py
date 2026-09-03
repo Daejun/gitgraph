@@ -422,6 +422,33 @@ def search_and_marks(s):
     check("Del on an unmarked row is harmless", "nothing marked" in s.text() or "Traceback" not in s.log())
 
 
+def ime_switching(s):
+    """0.30.0: with fcitx5 on this machine gg drives the IME itself (tests/fakes/fcitx5-remote here:
+    state in FAKE_IME_STATE_FILE, calls in FAKE_IME_LOG). The keyboard is English while gg has the
+    keys; a prompt typed in Hangul closes back to English and the next prompt reopens in Hangul; the
+    state found at start comes back at exit (checked in main() after q)."""
+    state, log = s.ime_state, s.ime_log
+
+    def read(p):
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+
+    check("start put the Hangul IME to English", read(state) == "1" and "-c" in read(log).splitlines(),
+          f"state={read(state)} log={read(log)!r}")
+    s.key("/", 0.5)                               # a prompt: the user flips to Hangul inside it
+    with open(state, "w", encoding="utf-8") as f:
+        f.write("2")
+    s.key("\x1b", 0.8)
+    check("a prompt closed in Hangul mode goes back to English", read(state) == "1", read(state))
+    n = len(read(log).splitlines())
+    s.key("/", 0.8)                               # the next prompt reopens in Hangul, as the last one was typed
+    check("the next prompt reopens in Hangul", read(state) == "2" and "-o" in read(log).splitlines()[n:],
+          f"state={read(state)} new calls={read(log).splitlines()[n:]}")
+    s.key("\x1b", 0.8)
+    check("and closes back to English again", read(state) == "1", read(state))
+    check("no traceback around the IME switch", "Traceback" not in s.log())
+
+
 def popups_and_menus(s):
     s.key("?", 1.0)
     check("key menu popup", "keys —" in s.text())
@@ -978,15 +1005,21 @@ def main():
     print(f"# temp HOME: {home}")
     assert home != os.path.expanduser("~"), "refusing to run against the real HOME"
     os.environ["FAKE_OPEN_LOG"] = os.path.join(home, "opened.txt")
+    ime_state, ime_log = os.path.join(home, "ime-state"), os.path.join(home, "ime-calls.log")
+    with open(ime_state, "w", encoding="utf-8") as f:
+        f.write("2")                              # the keyboard is in Hangul mode when gg starts
     s = Session(["--no-summary", "-t", "none"], home=home,
                 FAKE_OPEN_LOG=os.path.join(home, "opened.txt"),
-                FAKE_GH_LOG=os.path.join(home, "gh-calls.log"))
+                FAKE_GH_LOG=os.path.join(home, "gh-calls.log"),
+                FAKE_IME_STATE_FILE=ime_state, FAKE_IME_LOG=ime_log)
+    s.ime_state, s.ime_log = ime_state, ime_log
     try:
         panels_and_navigation(s)
         history_highlight(s)
         inbox_tabs(s)
         popups_and_menus(s)
         search_and_marks(s)
+        ime_switching(s)
         ai_flows(s)
         hangul_ime(s)
         mouse_and_border(s)
@@ -994,6 +1027,8 @@ def main():
         startup_refresh(s)
         live_state(s)
         check("clean exit", s.quit())
+        with open(ime_state, encoding="utf-8") as f:
+            check("the IME comes back as gg found it (Hangul) at exit", f.read().strip() == "2")
         log = s.log()
         check("no traceback", "Traceback" not in log,
               "\n".join(l for l in log.splitlines() if "Error" in l or "Traceback" in l)[:800])

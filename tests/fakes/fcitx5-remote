@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Fake `fcitx5-remote` for tests: the IME switch gg drives (gitgraph.py ime_state()/ime_set()) without a
+real fcitx5. It must exist here because tests/env.py puts tests/fakes ahead of /usr/bin — on a desktop
+with the real fcitx5 a smoke run would otherwise flip the developer's keyboard to English.
+
+  no args   print the state: 2 active (Hangul), 1 inactive (English), 0 closed
+  -c / -o   inactivate / activate (state 1 / 2)
+
+State lives in $FAKE_IME_STATE_FILE (created holding "2" when missing); with the variable unset the state
+is 2 and -c/-o change nothing. Every invocation's arguments are appended to $FAKE_IME_LOG when set.
+"""
+import os
+import sys
+
+args = sys.argv[1:]
+log = os.environ.get("FAKE_IME_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(" ".join(args) + "\n")
+path = os.environ.get("FAKE_IME_STATE_FILE")
+state = "2"
+if path and os.path.exists(path):
+    with open(path, encoding="utf-8") as f:
+        state = f.read().strip() or "2"
+if args in (["-c"], ["-o"]):
+    if path:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("1" if args == ["-c"] else "2")
+elif not args:
+    print(state)

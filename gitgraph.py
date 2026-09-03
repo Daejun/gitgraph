@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -31,7 +32,7 @@ import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
-VERSION = "0.29.2"
+VERSION = "0.30.0"
 REPO_URL = "https://github.com/Daejun/gitgraph"
 RAW_URL = "https://raw.githubusercontent.com/Daejun/gitgraph/main/gitgraph.py"
 CACHE_DIR = os.path.expanduser("~/.cache/gitgraph")
@@ -52,6 +53,8 @@ CONFIG_KEYS = {
     "fetch_parallel": ("GITGRAPH_FETCH_PARALLEL", "8", "how many gh queries run at the same time when filling the cache"),
     "theme": ("GITGRAPH_THEME", "dark", "colour theme: dark | light | basic (8 colours, no dim — e.g. PuTTY)"),
     "todo_file": ("GITGRAPH_TODO", "~/gitgraph-todo.md", "markdown written from the marks made with m in the tui (for the next session)"),
+    "ime_switch": ("GITGRAPH_IME_SWITCH", "true", "tui: put a local fcitx5 IME back to English when gg takes the keyboard "
+                                                  "(start, after C, after a text prompt) and restore it at exit"),
     "side_width": ("GITGRAPH_SIDE_WIDTH", "0.4", "tui: fraction of the width for the side column"),
     "expand_focused": ("GITGRAPH_EXPAND_FOCUSED", "true", "tui: give the focused side panel more height (accordion)"),
     "expanded_weight": ("GITGRAPH_EXPANDED_WEIGHT", "2", "tui: how much taller the focused side panel is"),
@@ -4691,8 +4694,11 @@ HELP = """gg tui — lazygit style layout
   F2              guided tour of the screen (also: gg tutorial)
   c t s p h       comments mode · translation · summaries · people nodes · hops (for the CLI tree / Links depth)
   / n N           search in the focused panel      T  colour theme      $  token usage      ?  this help     q  quit
-  Hangul IME      shortcuts still work while the keyboard is in Hangul mode (ㅓ = j, ㅏ = k, ㅁ = a …); the Enter/Space
-                  the IME needs to commit a lone consonant is ignored, so ㅁ⏎ opens the question box like a
+  Hangul IME      with fcitx5 on this machine gg switches the IME to English itself when it takes the keyboard
+                  (start, back from C, after a text prompt — a prompt typed in Hangul reopens in Hangul) and puts
+                  it back at exit (gg config ime_switch false turns this off). Elsewhere shortcuts still work in
+                  Hangul mode one key late (ㅓ = j, ㅏ = k, ㅁ = a …); the Enter/Space the IME needs to commit a lone
+                  consonant is ignored, so ㅁ⏎ opens the question box like a
   y               copy the URL of the selection to the clipboard
   mouse           drag in main = select text and copy it on release (OSC 52 + wl-copy/xclip/xsel/pbcopy; in tmux
                   turn on set-clipboard; Shift+drag still uses the terminal's own selection);
@@ -4737,6 +4743,40 @@ def hangul_keys(ch):
         parts = [_CHO[o // 588], _JUNG[(o % 588) // 28], _JONG[o % 28].strip()]
         return "".join(JAMO_KEY.get(j, "") for j in parts if j)
     return ""
+
+
+# The mapping above is the fallback, not the fix: an IME in Hangul mode keeps every letter as preedit
+# until the next key, so a shortcut typed that way reaches gg one key late whatever we do with it. The
+# real fix is to put the IME back to English whenever gg takes the keyboard for shortcuts — possible
+# when the IME daemon runs on this machine (fcitx5: `fcitx5-remote -c`); over ssh it is on the client
+# and out of reach, and nothing here runs. ime_state(): 2 = Hangul on, 1 = English, 0 = closed.
+def ime_tool():
+    if cfg("ime_switch").lower() in ("false", "0", "no", ""):
+        return None
+    return shutil.which("fcitx5-remote")
+
+
+def ime_state():
+    """The local IME's state (2 active/Hangul, 1 inactive/English, 0 closed), None when there is none."""
+    tool = ime_tool()
+    if not tool:
+        return None
+    try:
+        out = subprocess.run([tool], capture_output=True, text=True, timeout=1).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
+
+
+def ime_set(active):
+    """Switch the local IME on (Hangul) or off (English); a no-op without one."""
+    tool = ime_tool()
+    if not tool:
+        return
+    try:
+        subprocess.run([tool, "-o" if active else "-c"], capture_output=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        pass
 LIST_KINDS = ("", "link", "mention", "sec") + DIFF_KINDS + tuple(f"sev_{s}" for s in SEVERITIES)
 
 
@@ -6203,12 +6243,19 @@ class Tui:
                     else:
                         return None
 
+    def ime_english(self):
+        """Shortcuts again: an IME left in Hangul mode goes back to English (fcitx5 on this machine only)."""
+        if ime_state() == 2:
+            ime_set(False)
+
     def popup_prompt(self, label, initial=""):
         """Single-line input box. Returns the text, or "" when cancelled with Esc."""
         c = self.curses
         buf = list(initial)
         c.curs_set(1)
         first = True
+        if getattr(self, "ime_prompt", None) == 2:
+            ime_set(True)                    # the last prompt was typed in Hangul: this one starts there too
         try:
             while True:
                 y, x, hh, ww = self.popup_frame(label, 4, max(60, dw(label) + 4), first)
@@ -6249,6 +6296,11 @@ class Tui:
                     return text.strip()
         finally:
             c.curs_set(0)
+            st = ime_state()
+            if st is not None:
+                self.ime_prompt = st         # remembered for the next prompt
+                if st == 2:
+                    ime_set(False)           # back to shortcuts: English
 
     def prompt_line(self, label, maxlen=400):
         return self.popup_prompt(label) or ""
@@ -6935,6 +6987,7 @@ class Tui:
             sys.stdout.flush()
             self.msg = "back from claude"
             self.sync_todo()                 # marks it ticked off while this loop was blocked
+            self.ime_english()               # and the Hangul mode the conversation with it was typed in
 
     def draw(self):
         c = self.curses
@@ -7203,11 +7256,16 @@ class Tui:
 
     def run(self):
         c = self.curses
+        self.ime_start = ime_state()         # a local IME in Hangul mode goes to English while gg has the keys
+        if self.ime_start == 2:
+            ime_set(False)
         try:
             self._run()
         finally:
             sys.stdout.write("\033[?1006l\033[?1002l\033[?1000l")
             sys.stdout.flush()
+            if self.ime_start == 2:
+                ime_set(True)                # and comes back as it was found
 
     KEYMENU = [   # (context, keys, description, key code fed to handle_key)
         ("*", "⏎", "open / go to / re-root (see the panel hint)", 10),
